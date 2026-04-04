@@ -1,0 +1,35 @@
+{
+  "name": "@shorthand/core",
+  "version": "0.1.0",
+  "description": "Progressive context compaction for LLMs. Old computer science for new constraints.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "llm",
+    "context",
+    "compaction",
+    "lsm-tree",
+    "crdt",
+    "conversation",
+    "memory"
+  ],
+  "author": "Johnny Clem",
+  "license": "MIT",
+  "devDependencies": {
+    "vitest": "^3.1.1",
+    "typescript": "^5.8.3"
+  }
+}
