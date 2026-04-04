@@ -1,5 +1,5 @@
 {
-  "name": "@shorthand/core",
+  "name": "short-hand",
   "version": "0.1.0",
   "description": "Progressive context compaction for LLMs. Old computer science for new constraints.",
   "type": "module",
@@ -11,11 +11,17 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "llm",
@@ -24,10 +30,26 @@
     "lsm-tree",
     "crdt",
     "conversation",
-    "memory"
+    "memory",
+    "progressive",
+    "context-compaction",
+    "token",
+    "summarization"
   ],
   "author": "Johnny Clem",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/johnnyclem/short-hand.git"
+  },
+  "bugs": {
+    "url": "https://github.com/johnnyclem/short-hand/issues"
+  },
+  "homepage": "https://github.com/johnnyclem/short-hand#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
   "devDependencies": {
     "vitest": "^3.1.1",
     "typescript": "^5.8.3"

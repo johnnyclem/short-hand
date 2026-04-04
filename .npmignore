@@ -1,0 +1,7 @@
+src/
+*.test.ts
+*.tsbuildinfo
+vitest.config.ts
+tsconfig.json
+.DS_Store
+.github/
