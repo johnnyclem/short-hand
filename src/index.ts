@@ -1,5 +1,5 @@
 /**
- * @shorthand/core
+ * short-hand
  *
  * Progressive context compaction for LLMs.
  * Old computer science for new constraints.
