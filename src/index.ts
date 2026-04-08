@@ -29,12 +29,19 @@ export type {
   ImportanceWeights,
   VerificationResult,
   AgentProfile,
+  Source,
+  IngestionConfig,
+  IngestionEvent,
+  WikiPage,
+  WikiRenderConfig,
 } from './types.js';
 
 export {
   CompactionLevel as CompactionLevelEnum,
   DEFAULT_COMPACTION_CONFIG,
   DEFAULT_IMPORTANCE_WEIGHTS,
+  DEFAULT_INGESTION_CONFIG,
+  DEFAULT_WIKI_RENDER_CONFIG,
 } from './types.js';
 
 // Compaction engine
@@ -58,6 +65,12 @@ export { RecallTester } from './verification/recall-tester.js';
 // Embedding (stub)
 export { StubEmbedder } from './embedding/index.js';
 export type { Embedder, EmbeddingResult } from './embedding/index.js';
+
+// Source ingestion
+export { SourceIngester } from './ingestion/source-ingester.js';
+
+// Wiki rendering
+export { WikiRenderer } from './wiki/wiki-renderer.js';
 
 // Utilities
 export { estimateTokens, generateId } from './utils.js';
