@@ -34,6 +34,9 @@ export type {
   IngestionEvent,
   WikiPage,
   WikiRenderConfig,
+  QueryResult,
+  QueryConfig,
+  QueryResponse,
 } from './types.js';
 
 export {
@@ -42,6 +45,7 @@ export {
   DEFAULT_IMPORTANCE_WEIGHTS,
   DEFAULT_INGESTION_CONFIG,
   DEFAULT_WIKI_RENDER_CONFIG,
+  DEFAULT_QUERY_CONFIG,
 } from './types.js';
 
 // Compaction engine
@@ -62,8 +66,9 @@ export type { SerializedAgentMemory } from './crdt/agent-memory.js';
 export { InvariantChecker } from './verification/invariant-checker.js';
 export { RecallTester } from './verification/recall-tester.js';
 
-// Embedding (stub)
+// Embedding
 export { StubEmbedder } from './embedding/index.js';
+export { TfIdfEmbedder, cosineSimilarity } from './embedding/tfidf-embedder.js';
 export type { Embedder, EmbeddingResult } from './embedding/index.js';
 
 // Source ingestion
@@ -71,6 +76,9 @@ export { SourceIngester } from './ingestion/source-ingester.js';
 
 // Wiki rendering
 export { WikiRenderer } from './wiki/wiki-renderer.js';
+
+// Query engine
+export { KnowledgeBase } from './query/knowledge-base.js';
 
 // Utilities
 export { estimateTokens, generateId } from './utils.js';

@@ -399,3 +399,55 @@ export const DEFAULT_WIKI_RENDER_CONFIG: WikiRenderConfig = {
   includeBacklinks: true,
   generateLog: true,
 };
+
+// ---------------------------------------------------------------------------
+// Query interface (search across compacted knowledge)
+// ---------------------------------------------------------------------------
+
+/** A single scored result from a knowledge base query. */
+export interface QueryResult {
+  /** The text content of the match. */
+  content: string;
+  /** Relevance score (0.0 to 1.0). */
+  score: number;
+  /** Which compaction level this result came from. */
+  level: CompactionLevel;
+  /** The type of entry (entity, topic, invariant, etc.). */
+  entryType: 'message' | 'compacted' | 'summary' | 'entity' | 'invariant' | 'tombstone';
+  /** Entity name, topic label, or invariant key — if applicable. */
+  label?: string;
+  /** Source message ID, if traceable. */
+  sourceMessageId?: string;
+}
+
+/** Configuration for knowledge base queries. */
+export interface QueryConfig {
+  /** Maximum number of results to return (default: 10). */
+  maxResults: number;
+  /** Minimum relevance score to include (default: 0.1). */
+  minScore: number;
+  /** Weight given to keyword (BM25-style) matching vs. semantic similarity (default: 0.5). */
+  keywordWeight: number;
+  /** Which levels to search (default: all). */
+  levels?: CompactionLevel[];
+  /** Token budget for the returned context frame (default: 4000). */
+  contextBudget: number;
+}
+
+export const DEFAULT_QUERY_CONFIG: QueryConfig = {
+  maxResults: 10,
+  minScore: 0.1,
+  keywordWeight: 0.5,
+  levels: undefined,
+  contextBudget: 4000,
+};
+
+/** The response from a knowledge base query. */
+export interface QueryResponse {
+  /** The original query string. */
+  query: string;
+  /** Ranked results. */
+  results: QueryResult[];
+  /** A token-budgeted context frame biased toward the query results. */
+  contextFrame: ContextFrame;
+}
