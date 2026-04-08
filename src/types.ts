@@ -316,3 +316,86 @@ export interface AgentProfile {
   /** Regex patterns that demote importance. */
   demotePatterns: RegExp[];
 }
+
+// ---------------------------------------------------------------------------
+// Source ingestion (document → compaction pipeline)
+// ---------------------------------------------------------------------------
+
+/** A raw source document to be ingested into the knowledge base. */
+export interface Source {
+  /** Unique identifier for this source. */
+  id: string;
+  /** Human-readable title. */
+  title: string;
+  /** The raw text content of the source. */
+  content: string;
+  /** MIME-like content type hint. */
+  contentType?: 'text/plain' | 'text/markdown' | 'text/html';
+  /** When the source was created or published. */
+  createdAt?: number;
+  /** Origin URL or file path, if applicable. */
+  uri?: string;
+  /** Arbitrary metadata attached by the caller. */
+  metadata?: Record<string, unknown>;
+}
+
+/** Configuration for the source ingester. */
+export interface IngestionConfig {
+  /** Maximum number of tokens per chunk (default: 800). */
+  chunkSize: number;
+  /** Number of tokens of overlap between adjacent chunks (default: 100). */
+  chunkOverlap: number;
+  /** Whether to preserve markdown structure when splitting (default: true). */
+  respectMarkdownBoundaries: boolean;
+}
+
+export const DEFAULT_INGESTION_CONFIG: IngestionConfig = {
+  chunkSize: 800,
+  chunkOverlap: 100,
+  respectMarkdownBoundaries: true,
+};
+
+/** Record of a source ingestion event for the wiki log. */
+export interface IngestionEvent {
+  /** Timestamp of the ingestion. */
+  timestamp: number;
+  /** Source that was ingested. */
+  sourceId: string;
+  sourceTitle: string;
+  /** Number of chunks produced. */
+  chunkCount: number;
+  /** Entities discovered during ingestion. */
+  entitiesDiscovered: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Wiki rendering (compacted state → markdown pages)
+// ---------------------------------------------------------------------------
+
+/** A single rendered wiki page. */
+export interface WikiPage {
+  /** File path relative to wiki root (e.g., "entities/react.md"). */
+  path: string;
+  /** The rendered markdown content. */
+  content: string;
+  /** Page title. */
+  title: string;
+  /** Category for index grouping. */
+  category: 'entity' | 'topic' | 'invariant' | 'index' | 'log';
+}
+
+/** Configuration for the wiki renderer. */
+export interface WikiRenderConfig {
+  /** Title of the wiki (default: "Knowledge Base"). */
+  wikiTitle: string;
+  /** Whether to include backlinks on entity pages (default: true). */
+  includeBacklinks: boolean;
+  /** Whether to generate the log page (default: true). */
+  generateLog: boolean;
+}
+
+export const DEFAULT_WIKI_RENDER_CONFIG: WikiRenderConfig = {
+  wikiTitle: 'Knowledge Base',
+  includeBacklinks: true,
+  generateLog: true,
+};
