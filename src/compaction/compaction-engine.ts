@@ -18,11 +18,13 @@ import type {
 import { CompactionLevel as CL, DEFAULT_COMPACTION_CONFIG } from '../types.js';
 import { estimateTokens } from '../utils.js';
 import { RegexCompactor } from './regex-compactor.js';
+import type { ActiveEngramStore } from '../crdt/active-engram-store.js';
 
 export class CompactionEngine {
   private config: CompactionConfig;
   private compactor: Compactor;
   private state: CompactedState;
+  private activeEngramStore?: ActiveEngramStore;
 
   constructor(config: Partial<CompactionConfig> = {}) {
     this.config = { ...DEFAULT_COMPACTION_CONFIG, ...config };
@@ -159,6 +161,27 @@ export class CompactionEngine {
       used += l0Tokens;
     }
 
+    // Active engrams — interpreter step runs here, before injection
+    if (this.activeEngramStore) {
+      // Build a brief context string from the most recent L0 messages
+      const recentContext = this.state.l0_messages
+        .slice(-3)
+        .map((m) => m.content)
+        .join(' ');
+      const results = this.activeEngramStore.retrieve(recentContext);
+      if (results.length > 0) {
+        const lines = results.map(
+          (r) => `[memory] ${r.interpreted}`,
+        );
+        const content = lines.join('\n');
+        const tokens = estimateTokens(content);
+        if (used + tokens <= budget) {
+          sections.unshift({ level: CL.L4_INVARIANTS, content, tokenEstimate: tokens });
+          used += tokens;
+        }
+      }
+    }
+
     // Tombstone annotations
     if (this.state.tombstones.length > 0) {
       const tombstoneContent = this.state.tombstones
@@ -196,6 +219,11 @@ export class CompactionEngine {
   /** Replace the compactor (e.g., when upgrading from regex to host LLM). */
   setCompactor(compactor: Compactor): void {
     this.compactor = compactor;
+  }
+
+  /** Attach an ActiveEngramStore so agential memories participate in context frames. */
+  attachActiveEngrams(store: ActiveEngramStore): void {
+    this.activeEngramStore = store;
   }
 
   private resolveCompactor(): Compactor {
