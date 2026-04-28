@@ -34,6 +34,9 @@ export type {
   IngestionEvent,
   WikiPage,
   WikiRenderConfig,
+  ActiveEngram,
+  ActivationPolicy,
+  ActiveEngramResult,
 } from './types.js';
 
 export {
@@ -57,6 +60,8 @@ export { ORSet } from './crdt/or-set.js';
 export { GSet } from './crdt/g-set.js';
 export { AgentMemory } from './crdt/agent-memory.js';
 export type { SerializedAgentMemory } from './crdt/agent-memory.js';
+export { ActiveEngramStore } from './crdt/active-engram-store.js';
+export type { SerializedActiveEngramStore } from './crdt/active-engram-store.js';
 
 // Verification
 export { InvariantChecker } from './verification/invariant-checker.js';

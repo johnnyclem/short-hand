@@ -287,6 +287,89 @@ export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 };
 
 // ---------------------------------------------------------------------------
+// Active engrams (agential memory)
+// ---------------------------------------------------------------------------
+
+/**
+ * Declarative activation policy for an ActiveEngram.
+ *
+ * Evaluated by the host (ActiveEngramStore), never by itself — activation
+ * policies cannot write to their own importanceScore. That constraint must
+ * live in the schema, not in the agent's good intentions.
+ */
+export interface ActivationPolicy {
+  /**
+   * Surface this engram when the current context contains any of these
+   * topic strings (case-insensitive substring match).
+   * An empty array means "always eligible".
+   */
+  surfaceWhenTopics: string[];
+  /**
+   * Stop surfacing after this many retrievals. Undefined = no limit.
+   * Enables engrams that fade after use.
+   */
+  maxRetrievals?: number;
+  /**
+   * Hard expiry timestamp (ms since epoch). Undefined = immortal.
+   */
+  expiresAt?: number;
+  /**
+   * When set, the output of this engram's interpreter shadows (overrides)
+   * the output of the named engram ID. This is the correction mechanism —
+   * a correction is just an ActiveEngram whose policy shadows another.
+   */
+  shadowsEngramId?: string;
+}
+
+/**
+ * An agential memory entry: content + interpreter + activation policy.
+ *
+ * On recall the store calls interpret(context) before injection, giving the
+ * engram one turn to restate itself in light of the current task. The raw
+ * payload is never injected directly — salience over fidelity.
+ */
+export interface ActiveEngram {
+  id: string;
+  /** The compressed content — the engram proper. */
+  payload: string;
+  /**
+   * Interpreter template. Use {{payload}} and {{context}} as placeholders.
+   * At the regex tier this is resolved with simple string substitution.
+   * At the host/local tier the host can call an LM with this as a prompt.
+   *
+   * Example: "Given that we are now {{context}}, the earlier note
+   * '{{payload}}' means: "
+   */
+  interpreterTemplate: string;
+  /** Declarative rules for when/how to surface this engram. */
+  activationPolicy: ActivationPolicy;
+  /**
+   * Host-controlled importance score (0.0–1.0).
+   * Read-only from the perspective of the activation policy — only the host
+   * (AgentMemory / ActiveEngramStore) may set this.
+   */
+  importanceScore: number;
+  /** Creation timestamp (ms). */
+  createdAt: number;
+  /** How many times this engram has been retrieved (incremented by store). */
+  retrievalCount: number;
+  /** ID of the engram this was derived from, if any (for provenance chains). */
+  derivedFrom?: string;
+}
+
+/** The output of an interpret() call — contextualized form ready for injection. */
+export interface ActiveEngramResult {
+  engramId: string;
+  /** The interpreted (contextualized) text to inject into the context frame. */
+  interpreted: string;
+  /** The raw payload, retained for debugging / diff. */
+  payload: string;
+  importanceScore: number;
+  /** True when this result shadows another engram's output. */
+  shadows?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
 
