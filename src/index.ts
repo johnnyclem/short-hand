@@ -77,5 +77,35 @@ export { SourceIngester } from './ingestion/source-ingester.js';
 // Wiki rendering
 export { WikiRenderer } from './wiki/wiki-renderer.js';
 
+// Engram interpreter (LM-tier interpretation)
+export type {
+  EngramInterpreter,
+  InterpreterBound,
+  InterpreterTier,
+  InterpreterConfig,
+  LocalLMConfig,
+  HostLMConfig,
+  HostProvider,
+} from './crdt/engram-interpreter.js';
+export {
+  RegexInterpreter,
+  LocalLMInterpreter,
+  HostLMInterpreter,
+  createInterpreter,
+  DEFAULT_BOUND,
+} from './crdt/engram-interpreter.js';
+
+// Context-shift benchmark
+export type {
+  ContextShiftTask,
+  BenchmarkResult,
+  InterpreterBenchmarkResult,
+} from './benchmark/context-shift-benchmark.js';
+export {
+  KeywordCoverageScorer,
+  BenchmarkRunner,
+} from './benchmark/context-shift-benchmark.js';
+export { CONTEXT_SHIFT_TASKS } from './benchmark/tasks.js';
+
 // Utilities
 export { estimateTokens, generateId } from './utils.js';
