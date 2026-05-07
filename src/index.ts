@@ -61,7 +61,64 @@ export { GSet } from './crdt/g-set.js';
 export { AgentMemory } from './crdt/agent-memory.js';
 export type { SerializedAgentMemory } from './crdt/agent-memory.js';
 export { ActiveEngramStore } from './crdt/active-engram-store.js';
-export type { SerializedActiveEngramStore } from './crdt/active-engram-store.js';
+export type {
+  SerializedActiveEngramStore,
+  ActiveEngramStoreOptions,
+} from './crdt/active-engram-store.js';
+
+// Interpreter (bounded LM step at retrieval time)
+export type {
+  Interpreter,
+  InterpreterTier,
+  InterpretInput,
+  InterpretOptions,
+  InterpreterLogger,
+  InterpreterBudgetReason,
+} from './interpreter/index.js';
+export {
+  InterpreterBudgetError,
+  InterpreterUnavailableError,
+  silentLogger,
+  isFallbackEligible,
+  RegexInterpreter,
+  resolveTemplate,
+  HostInterpreter,
+  LocalInterpreter,
+  withFallback,
+} from './interpreter/index.js';
+export type {
+  HostInterpreterOptions,
+  AnthropicLikeClient,
+  AnthropicMessageRequest,
+  AnthropicMessageResponse,
+  LocalInterpreterOptions,
+  WithFallbackOptions,
+} from './interpreter/index.js';
+
+// Context-shift benchmark
+export {
+  ContextShiftBenchmark,
+  echoAnswerer,
+  wilson95,
+  KeywordJudge,
+  LMJudge,
+  STARTER_FIXTURES,
+} from './benchmark/index.js';
+export type {
+  BenchmarkFixture,
+  ShiftType,
+  ArmResult,
+  FixtureResult,
+  BenchmarkAggregate,
+  BenchmarkReport,
+  Answerer,
+  AnswererArgs,
+  ContextShiftBenchmarkOptions,
+  RunOptions,
+  Judge,
+  JudgeArgs,
+  LMJudgeOptions,
+} from './benchmark/index.js';
 
 // Verification
 export { InvariantChecker } from './verification/invariant-checker.js';
