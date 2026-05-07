@@ -12,6 +12,8 @@
 
 import type { ActiveEngram, ActiveEngramResult, ActivationPolicy } from '../types.js';
 import { generateId } from '../utils.js';
+import type { EngramInterpreter, InterpreterBound } from './engram-interpreter.js';
+import { DEFAULT_BOUND } from './engram-interpreter.js';
 
 // ---------------------------------------------------------------------------
 // Default interpreter template
@@ -195,6 +197,100 @@ export class ActiveEngramStore {
     return {
       engramId: id,
       interpreted: resolveTemplate(engram.interpreterTemplate, engram.payload, context),
+      payload: engram.payload,
+      importanceScore: engram.importanceScore,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Async read path (LM-tier interpretation)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Like retrieve(), but delegates interpretation to the provided EngramInterpreter.
+   * Eligible engrams are interpreted concurrently (Promise.all).
+   * Retrieval counts are bumped and shadow resolution is applied — same semantics as retrieve().
+   */
+  async retrieveAsync(
+    context: string,
+    interpreter: EngramInterpreter,
+    options: { bound?: InterpreterBound; now?: number } = {},
+  ): Promise<ActiveEngramResult[]> {
+    const now = options.now ?? Date.now();
+    const bound = options.bound ?? DEFAULT_BOUND;
+
+    const eligible = Array.from(this.engrams.values()).filter((e) =>
+      isEligible(e, context, now),
+    );
+
+    for (const e of eligible) {
+      e.retrievalCount += 1;
+    }
+
+    // Interpret all eligible engrams concurrently
+    const intermediate = await Promise.all(
+      eligible.map(async (e) => {
+        const text = await interpreter.interpret(
+          e.interpreterTemplate,
+          e.payload,
+          context,
+          bound,
+        );
+        return {
+          engramId: e.id,
+          interpreted: text,
+          payload: e.payload,
+          importanceScore: e.importanceScore,
+          _shadowsEngramId: e.activationPolicy.shadowsEngramId,
+        };
+      }),
+    );
+
+    // Shadow resolution (same logic as sync retrieve)
+    const resultsById = new Map(intermediate.map((r) => [r.engramId, r]));
+    for (const r of intermediate) {
+      const shadowTarget = r._shadowsEngramId;
+      if (shadowTarget && resultsById.has(shadowTarget)) {
+        const shadowingResult = resultsById.get(r.engramId)!;
+        resultsById.set(shadowTarget, {
+          ...shadowingResult,
+          engramId: shadowTarget,
+          _shadowsEngramId: undefined,
+          shadows: r.engramId,
+        });
+        resultsById.delete(r.engramId);
+      }
+    }
+
+    return Array.from(resultsById.values())
+      .map(({ _shadowsEngramId: _dropped, ...rest }) => rest)
+      .sort((a, b) => b.importanceScore - a.importanceScore);
+  }
+
+  /**
+   * Like interpret(), but uses the provided EngramInterpreter.
+   * Does NOT increment retrievalCount — preview semantics preserved.
+   */
+  async interpretAsync(
+    id: string,
+    context: string,
+    interpreter: EngramInterpreter,
+    options: { bound?: InterpreterBound } = {},
+  ): Promise<ActiveEngramResult | undefined> {
+    const engram = this.engrams.get(id);
+    if (!engram) return undefined;
+
+    const bound = options.bound ?? DEFAULT_BOUND;
+    const text = await interpreter.interpret(
+      engram.interpreterTemplate,
+      engram.payload,
+      context,
+      bound,
+    );
+
+    return {
+      engramId: id,
+      interpreted: text,
       payload: engram.payload,
       importanceScore: engram.importanceScore,
     };
