@@ -61,7 +61,64 @@ export { GSet } from './crdt/g-set.js';
 export { AgentMemory } from './crdt/agent-memory.js';
 export type { SerializedAgentMemory } from './crdt/agent-memory.js';
 export { ActiveEngramStore } from './crdt/active-engram-store.js';
-export type { SerializedActiveEngramStore } from './crdt/active-engram-store.js';
+export type {
+  SerializedActiveEngramStore,
+  ActiveEngramStoreOptions,
+} from './crdt/active-engram-store.js';
+
+// Interpreter (bounded LM step at retrieval time)
+export type {
+  Interpreter,
+  InterpreterTier,
+  InterpretInput,
+  InterpretOptions,
+  InterpreterLogger,
+  InterpreterBudgetReason,
+} from './interpreter/index.js';
+export {
+  InterpreterBudgetError,
+  InterpreterUnavailableError,
+  silentLogger,
+  isFallbackEligible,
+  RegexInterpreter,
+  resolveTemplate,
+  HostInterpreter,
+  LocalInterpreter,
+  withFallback,
+} from './interpreter/index.js';
+export type {
+  HostInterpreterOptions,
+  AnthropicLikeClient,
+  AnthropicMessageRequest,
+  AnthropicMessageResponse,
+  LocalInterpreterOptions,
+  WithFallbackOptions,
+} from './interpreter/index.js';
+
+// Context-shift benchmark
+export {
+  ContextShiftBenchmark,
+  echoAnswerer,
+  wilson95,
+  KeywordJudge,
+  LMJudge,
+  STARTER_FIXTURES,
+} from './benchmark/index.js';
+export type {
+  BenchmarkFixture,
+  ShiftType,
+  ArmResult,
+  FixtureResult,
+  BenchmarkAggregate,
+  BenchmarkReport,
+  Answerer,
+  AnswererArgs,
+  ContextShiftBenchmarkOptions,
+  RunOptions,
+  Judge,
+  JudgeArgs,
+  LMJudgeOptions,
+} from './benchmark/index.js';
 
 // Verification
 export { InvariantChecker } from './verification/invariant-checker.js';
@@ -76,36 +133,6 @@ export { SourceIngester } from './ingestion/source-ingester.js';
 
 // Wiki rendering
 export { WikiRenderer } from './wiki/wiki-renderer.js';
-
-// Engram interpreter (LM-tier interpretation)
-export type {
-  EngramInterpreter,
-  InterpreterBound,
-  InterpreterTier,
-  InterpreterConfig,
-  LocalLMConfig,
-  HostLMConfig,
-  HostProvider,
-} from './crdt/engram-interpreter.js';
-export {
-  RegexInterpreter,
-  LocalLMInterpreter,
-  HostLMInterpreter,
-  createInterpreter,
-  DEFAULT_BOUND,
-} from './crdt/engram-interpreter.js';
-
-// Context-shift benchmark
-export type {
-  ContextShiftTask,
-  BenchmarkResult,
-  InterpreterBenchmarkResult,
-} from './benchmark/context-shift-benchmark.js';
-export {
-  KeywordCoverageScorer,
-  BenchmarkRunner,
-} from './benchmark/context-shift-benchmark.js';
-export { CONTEXT_SHIFT_TASKS } from './benchmark/tasks.js';
 
 // Utilities
 export { estimateTokens, generateId } from './utils.js';

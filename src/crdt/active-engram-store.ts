@@ -12,8 +12,16 @@
 
 import type { ActiveEngram, ActiveEngramResult, ActivationPolicy } from '../types.js';
 import { generateId } from '../utils.js';
-import type { EngramInterpreter, InterpreterBound } from './engram-interpreter.js';
-import { DEFAULT_BOUND } from './engram-interpreter.js';
+import {
+  RegexInterpreter,
+  resolveTemplate,
+} from '../interpreter/regex-interpreter.js';
+import {
+  silentLogger,
+  type Interpreter,
+  type InterpretOptions,
+  type InterpreterLogger,
+} from '../interpreter/types.js';
 
 // ---------------------------------------------------------------------------
 // Default interpreter template
@@ -22,15 +30,12 @@ import { DEFAULT_BOUND } from './engram-interpreter.js';
 const DEFAULT_INTERPRETER_TEMPLATE =
   'In the context of {{context}}, the earlier note "{{payload}}" remains relevant as: {{payload}}';
 
-// ---------------------------------------------------------------------------
-// Template resolution (regex tier — no LM call)
-// ---------------------------------------------------------------------------
+const DEFAULT_INTERPRET_OPTIONS: InterpretOptions = {
+  maxOutputTokens: 120,
+  timeoutMs: 4_000,
+};
 
-function resolveTemplate(template: string, payload: string, context: string): string {
-  return template
-    .replace(/\{\{payload\}\}/g, payload)
-    .replace(/\{\{context\}\}/g, context);
-}
+const DEFAULT_FAILED_RETRIEVAL_WEIGHT = 0.25;
 
 // ---------------------------------------------------------------------------
 // Activation policy evaluation (pure function, no side-effects on the engram)
@@ -73,8 +78,37 @@ export interface SerializedActiveEngramStore {
   engrams: ActiveEngram[];
 }
 
+export interface ActiveEngramStoreOptions {
+  /**
+   * Interpreter used by retrieveAsync / interpretAsync.
+   * Defaults to RegexInterpreter (the regex tier).
+   * The synchronous retrieve / interpret methods always use the regex tier
+   * regardless of this setting — they are the zero-dep fast path.
+   */
+  interpreter?: Interpreter;
+  /**
+   * Cost (against maxRetrievals) of a failed interpretation in retrieveAsync.
+   * Default: 0.25 — four failures equal one successful surface.
+   * The engram is still dropped from the result set on failure; this only
+   * affects how aggressively a flaky LM burns through the retrieval budget.
+   */
+  failedRetrievalWeight?: number;
+  /** Logger for interpreter-failure warnings. */
+  logger?: InterpreterLogger;
+}
+
 export class ActiveEngramStore {
   private engrams = new Map<string, ActiveEngram>();
+  private readonly interpreter: Interpreter;
+  private readonly failedRetrievalWeight: number;
+  private readonly logger: InterpreterLogger;
+
+  constructor(opts: ActiveEngramStoreOptions = {}) {
+    this.interpreter = opts.interpreter ?? new RegexInterpreter();
+    this.failedRetrievalWeight =
+      opts.failedRetrievalWeight ?? DEFAULT_FAILED_RETRIEVAL_WEIGHT;
+    this.logger = opts.logger ?? silentLogger;
+  }
 
   // -----------------------------------------------------------------------
   // Write path (host-controlled)
@@ -203,94 +237,124 @@ export class ActiveEngramStore {
   }
 
   // -----------------------------------------------------------------------
-  // Async read path (LM-tier interpretation)
+  // Async read path (LM-tier interpreter)
   // -----------------------------------------------------------------------
 
   /**
-   * Like retrieve(), but delegates interpretation to the provided EngramInterpreter.
-   * Eligible engrams are interpreted concurrently (Promise.all).
-   * Retrieval counts are bumped and shadow resolution is applied — same semantics as retrieve().
+   * Retrieve all eligible engrams against the given context, calling the
+   * configured Interpreter for each. Same shadow + ordering semantics as
+   * retrieve(); the only difference is that interpretation is async and may
+   * fail per-engram.
+   *
+   * retrievalCount accounting:
+   *   - On success:  retrievalCount += 1
+   *   - On failure:  retrievalCount += failedRetrievalWeight (default 0.25)
+   *                  and the engram is dropped from the result set.
+   *
+   * Safety boundary: importanceScore is read-only here. The interpreter
+   * receives only { template, payload, context } — never importanceScore,
+   * activationPolicy, id, or retrievalCount.
    */
   async retrieveAsync(
     context: string,
-    interpreter: EngramInterpreter,
-    options: { bound?: InterpreterBound; now?: number } = {},
+    now: number = Date.now(),
+    opts: Partial<InterpretOptions> = {},
   ): Promise<ActiveEngramResult[]> {
-    const now = options.now ?? Date.now();
-    const bound = options.bound ?? DEFAULT_BOUND;
+    const interpretOpts: InterpretOptions = {
+      ...DEFAULT_INTERPRET_OPTIONS,
+      ...opts,
+    };
 
     const eligible = Array.from(this.engrams.values()).filter((e) =>
       isEligible(e, context, now),
     );
 
-    for (const e of eligible) {
-      e.retrievalCount += 1;
-    }
-
-    // Interpret all eligible engrams concurrently
-    const intermediate = await Promise.all(
-      eligible.map(async (e) => {
-        const text = await interpreter.interpret(
-          e.interpreterTemplate,
-          e.payload,
-          context,
-          bound,
-        );
-        return {
-          engramId: e.id,
-          interpreted: text,
-          payload: e.payload,
-          importanceScore: e.importanceScore,
-          _shadowsEngramId: e.activationPolicy.shadowsEngramId,
-        };
-      }),
+    const settled = await Promise.allSettled(
+      eligible.map((e) =>
+        this.interpreter.interpret(
+          { template: e.interpreterTemplate, payload: e.payload, context },
+          interpretOpts,
+        ),
+      ),
     );
 
-    // Shadow resolution (same logic as sync retrieve)
-    const resultsById = new Map(intermediate.map((r) => [r.engramId, r]));
-    for (const r of intermediate) {
-      const shadowTarget = r._shadowsEngramId;
-      if (shadowTarget && resultsById.has(shadowTarget)) {
-        const shadowingResult = resultsById.get(r.engramId)!;
-        resultsById.set(shadowTarget, {
-          ...shadowingResult,
-          engramId: shadowTarget,
-          _shadowsEngramId: undefined,
-          shadows: r.engramId,
+    const resultsById = new Map<string, ActiveEngramResult>();
+
+    for (let i = 0; i < eligible.length; i++) {
+      const e = eligible[i];
+      const outcome = settled[i];
+      if (outcome.status === 'fulfilled') {
+        e.retrievalCount += 1;
+        resultsById.set(e.id, {
+          engramId: e.id,
+          interpreted: outcome.value,
+          payload: e.payload,
+          importanceScore: e.importanceScore,
         });
-        resultsById.delete(r.engramId);
+      } else {
+        e.retrievalCount += this.failedRetrievalWeight;
+        this.logger.warn('interpret_failed', {
+          engramId: e.id,
+          error: outcome.reason instanceof Error
+            ? outcome.reason.message
+            : String(outcome.reason),
+        });
       }
     }
 
-    return Array.from(resultsById.values())
-      .map(({ _shadowsEngramId: _dropped, ...rest }) => rest)
-      .sort((a, b) => b.importanceScore - a.importanceScore);
+    // Shadow resolution — same semantics as the sync path. Operates on ids
+    // and importanceScore only; never reads or writes the interpreter output
+    // path through any policy callback (there is no such callback).
+    for (const e of eligible) {
+      const shadowTarget = e.activationPolicy.shadowsEngramId;
+      if (!shadowTarget) continue;
+      if (!resultsById.has(shadowTarget)) continue;
+      const shadowingResult = resultsById.get(e.id);
+      if (!shadowingResult) continue; // shadower itself failed — leave target as-is
+      resultsById.set(shadowTarget, {
+        ...shadowingResult,
+        engramId: shadowTarget,
+        shadows: e.id,
+      });
+      resultsById.delete(e.id);
+    }
+
+    return Array.from(resultsById.values()).sort(
+      (a, b) => b.importanceScore - a.importanceScore,
+    );
   }
 
   /**
-   * Like interpret(), but uses the provided EngramInterpreter.
-   * Does NOT increment retrievalCount — preview semantics preserved.
+   * Async preview: interpret one engram against the given context using the
+   * configured Interpreter, without modifying retrievalCount. Rethrows
+   * interpreter errors verbatim — preview should surface failure rather than
+   * silently fall back.
    */
   async interpretAsync(
     id: string,
     context: string,
-    interpreter: EngramInterpreter,
-    options: { bound?: InterpreterBound } = {},
+    opts: Partial<InterpretOptions> = {},
   ): Promise<ActiveEngramResult | undefined> {
     const engram = this.engrams.get(id);
     if (!engram) return undefined;
 
-    const bound = options.bound ?? DEFAULT_BOUND;
-    const text = await interpreter.interpret(
-      engram.interpreterTemplate,
-      engram.payload,
-      context,
-      bound,
+    const interpretOpts: InterpretOptions = {
+      ...DEFAULT_INTERPRET_OPTIONS,
+      ...opts,
+    };
+
+    const interpreted = await this.interpreter.interpret(
+      {
+        template: engram.interpreterTemplate,
+        payload: engram.payload,
+        context,
+      },
+      interpretOpts,
     );
 
     return {
       engramId: id,
-      interpreted: text,
+      interpreted,
       payload: engram.payload,
       importanceScore: engram.importanceScore,
     };
