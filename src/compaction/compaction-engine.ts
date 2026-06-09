@@ -13,7 +13,6 @@ import type {
   ConversationMessage,
   ContextFrame,
   ContextSection,
-  Entity,
 } from '../types.js';
 import { CompactionLevel as CL, DEFAULT_COMPACTION_CONFIG } from '../types.js';
 import { estimateTokens } from '../utils.js';
@@ -45,7 +44,7 @@ export class CompactionEngine {
     this.state.l0_messages.push(message);
 
     if (this.state.l0_messages.length > this.config.memtableSize) {
-      await this.flush();
+      await this.compactL0(this.state.l0_messages.length - this.config.memtableSize);
     }
   }
 
@@ -56,12 +55,13 @@ export class CompactionEngine {
     }
   }
 
-  /** Force a compaction pass, flushing L0 into L1+. */
+  /** Force a compaction pass, flushing all of L0 into L1+. */
   async flush(): Promise<void> {
-    const overflow = this.state.l0_messages.splice(
-      0,
-      this.state.l0_messages.length - this.config.memtableSize,
-    );
+    await this.compactL0(this.state.l0_messages.length);
+  }
+
+  private async compactL0(count: number): Promise<void> {
+    const overflow = this.state.l0_messages.splice(0, count);
 
     if (overflow.length > 0) {
       this.state = await this.compactor.compact(overflow, CL.L1_COMPACTED, this.state);
@@ -127,10 +127,10 @@ export class CompactionEngine {
       used += l2Tokens;
     }
 
-    // L1: Compacted history (most recent first, high importance first)
-    const sortedL1 = [...this.state.l1_compacted]
-      .sort((a, b) => b.importance - a.importance)
-      .reverse();
+    // L1: Compacted history — highest importance gets budget priority
+    const sortedL1 = [...this.state.l1_compacted].sort(
+      (a, b) => b.importance - a.importance,
+    );
     const l1Lines: string[] = [];
     let l1Tokens = 0;
     for (const entry of sortedL1) {

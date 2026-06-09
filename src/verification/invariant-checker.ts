@@ -143,25 +143,30 @@ export class InvariantChecker {
   // -----------------------------------------------------------------------
 
   private checkTombstoneConsistency(state: CompactedState): Check {
-    // Collect all known message IDs
-    const knownIds = new Set<string>();
-    for (const msg of state.l0_messages) knownIds.add(msg.id);
-    for (const entry of state.l1_compacted) knownIds.add(entry.originalMessageId);
-
+    // Referenced messages may legitimately be compacted away, so we do not
+    // require correctionMessageId to resolve. We do require each tombstone
+    // to be structurally complete: a correction provenance and a reason.
     const violations: string[] = [];
     for (const tombstone of state.tombstones) {
-      if (!knownIds.has(tombstone.correctionMessageId)) {
-        // The correction message might have been compacted away — this is OK
-        // but we note it as a warning
+      if (!tombstone.correctionMessageId) {
+        violations.push(
+          `Tombstone for "${tombstone.supersededContent}" has no correctionMessageId`,
+        );
       }
-      // The original message might also be gone — also OK after deep compaction
+      if (!tombstone.reason) {
+        violations.push(
+          `Tombstone for "${tombstone.supersededContent}" has no reason`,
+        );
+      }
     }
 
-    // For v0.1.0, tombstone consistency is a soft check
     return {
       name: 'tombstone-consistency',
-      passed: true,
-      message: `${state.tombstones.length} tombstone(s) tracked`,
+      passed: violations.length === 0,
+      message:
+        violations.length === 0
+          ? `${state.tombstones.length} tombstone(s) tracked, all structurally consistent`
+          : `${violations.length} violation(s): ${violations[0]}`,
     };
   }
 

@@ -106,6 +106,18 @@ describe('ORSet', () => {
     set.add('React');
     expect(set.values()).toHaveLength(1);
   });
+
+  it('does not reuse tags after a serialize/deserialize round-trip', () => {
+    const a = new ORSet<string>('agent-a');
+    a.add('React');
+    a.remove('React'); // tag agent-a:1 is now in the removed set
+
+    const b = ORSet.deserialize<string>('agent-a', a.serialize());
+    b.add('Vue'); // must not be issued the already-removed tag agent-a:1
+
+    expect(b.has('Vue')).toBe(true);
+    expect(b.size).toBe(1);
+  });
 });
 
 describe('GSet', () => {
@@ -188,5 +200,29 @@ describe('AgentMemory', () => {
 
     expect(b.getInvariant('project')).toBe('shorthand');
     expect(b.hasEntity('compactor')).toBe(true);
+  });
+
+  it('merges active engrams across agents', () => {
+    const a = new AgentMemory('agent-a');
+    const b = new AgentMemory('agent-b');
+
+    const idA = a.activeEngrams.add('user prefers CLI tools');
+    const idB = b.activeEngrams.add('deploys happen on Fridays');
+
+    a.mergeFrom(b.serialize());
+
+    expect(a.activeEngrams.get(idA)).toBeDefined();
+    expect(a.activeEngrams.get(idB)).toBeDefined();
+    expect(a.activeEngrams.all()).toHaveLength(2);
+  });
+
+  it('round-trips active engrams through deserialize', () => {
+    const a = new AgentMemory('agent-a');
+    const id = a.activeEngrams.add('payload', { importanceScore: 0.9 });
+
+    const b = AgentMemory.deserialize(a.serialize());
+
+    expect(b.activeEngrams.get(id)?.payload).toBe('payload');
+    expect(b.activeEngrams.get(id)?.importanceScore).toBe(0.9);
   });
 });

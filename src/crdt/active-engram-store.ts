@@ -368,6 +368,22 @@ export class ActiveEngramStore {
     return { engrams: Array.from(this.engrams.values()) };
   }
 
+  /**
+   * Merge serialized engrams into this store (union by id).
+   * For ids present on both sides, local fields win — importanceScore is
+   * host-controlled — except retrievalCount, which converges on the max.
+   */
+  mergeFrom(data: SerializedActiveEngramStore): void {
+    for (const engram of data.engrams) {
+      const existing = this.engrams.get(engram.id);
+      if (!existing) {
+        this.engrams.set(engram.id, { ...engram });
+      } else if (engram.retrievalCount > existing.retrievalCount) {
+        existing.retrievalCount = engram.retrievalCount;
+      }
+    }
+  }
+
   /** Populate this store from serialized data, replacing all current entries. */
   loadFrom(data: SerializedActiveEngramStore): void {
     this.engrams.clear();
