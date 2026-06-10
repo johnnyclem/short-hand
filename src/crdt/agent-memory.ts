@@ -9,13 +9,16 @@ import type { Entity, TopicSummary } from '../types.js';
 import { LWWRegister } from './lww-register.js';
 import { ORSet } from './or-set.js';
 import { GSet } from './g-set.js';
+import { ActiveEngramStore } from './active-engram-store.js';
 import { nextLamport, updateLamport } from '../utils.js';
+import type { SerializedActiveEngramStore } from './active-engram-store.js';
 
 export interface SerializedAgentMemory {
   agentId: string;
   invariants: Array<[string, { value: string; timestamp: number; agentId: string }]>;
   entities: { elements: Array<[string, { value: Entity; tag: string; agentId: string }]>; removed: string[] };
   summaries: Array<[string, TopicSummary]>;
+  activeEngrams?: SerializedActiveEngramStore;
 }
 
 export class AgentMemory {
@@ -25,11 +28,14 @@ export class AgentMemory {
   readonly entities: ORSet<Entity>;
   /** L2: Topic summaries — G-Set (grow-only). */
   readonly summaries: GSet<TopicSummary>;
+  /** Agential memory entries — interpret before inject. */
+  readonly activeEngrams: ActiveEngramStore;
 
   constructor(readonly agentId: string) {
     this.invariants = new LWWRegister<string>(agentId);
     this.entities = new ORSet<Entity>(agentId);
     this.summaries = new GSet<TopicSummary>();
+    this.activeEngrams = new ActiveEngramStore();
   }
 
   // -----------------------------------------------------------------------
@@ -93,6 +99,11 @@ export class AgentMemory {
     // Merge summaries
     const otherSummaries = GSet.deserialize<TopicSummary>(serialized.summaries);
     this.summaries.merge(otherSummaries);
+
+    // Merge active engrams (union by id)
+    if (serialized.activeEngrams) {
+      this.activeEngrams.mergeFrom(serialized.activeEngrams);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -105,6 +116,7 @@ export class AgentMemory {
       invariants: this.invariants.serialize(),
       entities: this.entities.serialize(),
       summaries: this.summaries.serialize(),
+      activeEngrams: this.activeEngrams.serialize(),
     };
   }
 

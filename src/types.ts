@@ -287,6 +287,89 @@ export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
 };
 
 // ---------------------------------------------------------------------------
+// Active engrams (agential memory)
+// ---------------------------------------------------------------------------
+
+/**
+ * Declarative activation policy for an ActiveEngram.
+ *
+ * Evaluated by the host (ActiveEngramStore), never by itself — activation
+ * policies cannot write to their own importanceScore. That constraint must
+ * live in the schema, not in the agent's good intentions.
+ */
+export interface ActivationPolicy {
+  /**
+   * Surface this engram when the current context contains any of these
+   * topic strings (case-insensitive substring match).
+   * An empty array means "always eligible".
+   */
+  surfaceWhenTopics: string[];
+  /**
+   * Stop surfacing after this many retrievals. Undefined = no limit.
+   * Enables engrams that fade after use.
+   */
+  maxRetrievals?: number;
+  /**
+   * Hard expiry timestamp (ms since epoch). Undefined = immortal.
+   */
+  expiresAt?: number;
+  /**
+   * When set, the output of this engram's interpreter shadows (overrides)
+   * the output of the named engram ID. This is the correction mechanism —
+   * a correction is just an ActiveEngram whose policy shadows another.
+   */
+  shadowsEngramId?: string;
+}
+
+/**
+ * An agential memory entry: content + interpreter + activation policy.
+ *
+ * On recall the store calls interpret(context) before injection, giving the
+ * engram one turn to restate itself in light of the current task. The raw
+ * payload is never injected directly — salience over fidelity.
+ */
+export interface ActiveEngram {
+  id: string;
+  /** The compressed content — the engram proper. */
+  payload: string;
+  /**
+   * Interpreter template. Use {{payload}} and {{context}} as placeholders.
+   * At the regex tier this is resolved with simple string substitution.
+   * At the host/local tier the host can call an LM with this as a prompt.
+   *
+   * Example: "Given that we are now {{context}}, the earlier note
+   * '{{payload}}' means: "
+   */
+  interpreterTemplate: string;
+  /** Declarative rules for when/how to surface this engram. */
+  activationPolicy: ActivationPolicy;
+  /**
+   * Host-controlled importance score (0.0–1.0).
+   * Read-only from the perspective of the activation policy — only the host
+   * (AgentMemory / ActiveEngramStore) may set this.
+   */
+  importanceScore: number;
+  /** Creation timestamp (ms). */
+  createdAt: number;
+  /** How many times this engram has been retrieved (incremented by store). */
+  retrievalCount: number;
+  /** ID of the engram this was derived from, if any (for provenance chains). */
+  derivedFrom?: string;
+}
+
+/** The output of an interpret() call — contextualized form ready for injection. */
+export interface ActiveEngramResult {
+  engramId: string;
+  /** The interpreted (contextualized) text to inject into the context frame. */
+  interpreted: string;
+  /** The raw payload, retained for debugging / diff. */
+  payload: string;
+  importanceScore: number;
+  /** True when this result shadows another engram's output. */
+  shadows?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
 
@@ -316,3 +399,86 @@ export interface AgentProfile {
   /** Regex patterns that demote importance. */
   demotePatterns: RegExp[];
 }
+
+// ---------------------------------------------------------------------------
+// Source ingestion (document → compaction pipeline)
+// ---------------------------------------------------------------------------
+
+/** A raw source document to be ingested into the knowledge base. */
+export interface Source {
+  /** Unique identifier for this source. */
+  id: string;
+  /** Human-readable title. */
+  title: string;
+  /** The raw text content of the source. */
+  content: string;
+  /** MIME-like content type hint. */
+  contentType?: 'text/plain' | 'text/markdown' | 'text/html';
+  /** When the source was created or published. */
+  createdAt?: number;
+  /** Origin URL or file path, if applicable. */
+  uri?: string;
+  /** Arbitrary metadata attached by the caller. */
+  metadata?: Record<string, unknown>;
+}
+
+/** Configuration for the source ingester. */
+export interface IngestionConfig {
+  /** Maximum number of tokens per chunk (default: 800). */
+  chunkSize: number;
+  /** Number of tokens of overlap between adjacent chunks (default: 100). */
+  chunkOverlap: number;
+  /** Whether to preserve markdown structure when splitting (default: true). */
+  respectMarkdownBoundaries: boolean;
+}
+
+export const DEFAULT_INGESTION_CONFIG: IngestionConfig = {
+  chunkSize: 800,
+  chunkOverlap: 100,
+  respectMarkdownBoundaries: true,
+};
+
+/** Record of a source ingestion event for the wiki log. */
+export interface IngestionEvent {
+  /** Timestamp of the ingestion. */
+  timestamp: number;
+  /** Source that was ingested. */
+  sourceId: string;
+  sourceTitle: string;
+  /** Number of chunks produced. */
+  chunkCount: number;
+  /** Entities discovered during ingestion. */
+  entitiesDiscovered: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Wiki rendering (compacted state → markdown pages)
+// ---------------------------------------------------------------------------
+
+/** A single rendered wiki page. */
+export interface WikiPage {
+  /** File path relative to wiki root (e.g., "entities/react.md"). */
+  path: string;
+  /** The rendered markdown content. */
+  content: string;
+  /** Page title. */
+  title: string;
+  /** Category for index grouping. */
+  category: 'entity' | 'topic' | 'invariant' | 'index' | 'log';
+}
+
+/** Configuration for the wiki renderer. */
+export interface WikiRenderConfig {
+  /** Title of the wiki (default: "Knowledge Base"). */
+  wikiTitle: string;
+  /** Whether to include backlinks on entity pages (default: true). */
+  includeBacklinks: boolean;
+  /** Whether to generate the log page (default: true). */
+  generateLog: boolean;
+}
+
+export const DEFAULT_WIKI_RENDER_CONFIG: WikiRenderConfig = {
+  wikiTitle: 'Knowledge Base',
+  includeBacklinks: true,
+  generateLog: true,
+};

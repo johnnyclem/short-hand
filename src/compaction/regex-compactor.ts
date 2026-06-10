@@ -13,7 +13,6 @@ import type {
   ConversationMessage,
   Decision,
   Entity,
-  Edge,
   Tombstone,
   TopicSummary,
   Invariant,
@@ -151,11 +150,8 @@ function isNoise(content: string): boolean {
 const CODE_BLOCK_RE = /```[\s\S]*?```/g;
 
 function containsCode(content: string): boolean {
-  return CODE_BLOCK_RE.test(content);
-}
-
-function extractCodeBlocks(content: string): string[] {
-  return content.match(CODE_BLOCK_RE) ?? [];
+  // A `g`-flagged regex is stateful under .test(); search() is not.
+  return content.search(CODE_BLOCK_RE) !== -1;
 }
 
 // ---------------------------------------------------------------------------

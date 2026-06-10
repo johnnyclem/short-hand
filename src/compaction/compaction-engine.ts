@@ -13,16 +13,17 @@ import type {
   ConversationMessage,
   ContextFrame,
   ContextSection,
-  Entity,
 } from '../types.js';
 import { CompactionLevel as CL, DEFAULT_COMPACTION_CONFIG } from '../types.js';
 import { estimateTokens } from '../utils.js';
 import { RegexCompactor } from './regex-compactor.js';
+import type { ActiveEngramStore } from '../crdt/active-engram-store.js';
 
 export class CompactionEngine {
   private config: CompactionConfig;
   private compactor: Compactor;
   private state: CompactedState;
+  private activeEngramStore?: ActiveEngramStore;
 
   constructor(config: Partial<CompactionConfig> = {}) {
     this.config = { ...DEFAULT_COMPACTION_CONFIG, ...config };
@@ -43,7 +44,7 @@ export class CompactionEngine {
     this.state.l0_messages.push(message);
 
     if (this.state.l0_messages.length > this.config.memtableSize) {
-      await this.flush();
+      await this.compactL0(this.state.l0_messages.length - this.config.memtableSize);
     }
   }
 
@@ -54,12 +55,13 @@ export class CompactionEngine {
     }
   }
 
-  /** Force a compaction pass, flushing L0 into L1+. */
+  /** Force a compaction pass, flushing all of L0 into L1+. */
   async flush(): Promise<void> {
-    const overflow = this.state.l0_messages.splice(
-      0,
-      this.state.l0_messages.length - this.config.memtableSize,
-    );
+    await this.compactL0(this.state.l0_messages.length);
+  }
+
+  private async compactL0(count: number): Promise<void> {
+    const overflow = this.state.l0_messages.splice(0, count);
 
     if (overflow.length > 0) {
       this.state = await this.compactor.compact(overflow, CL.L1_COMPACTED, this.state);
@@ -125,10 +127,10 @@ export class CompactionEngine {
       used += l2Tokens;
     }
 
-    // L1: Compacted history (most recent first, high importance first)
-    const sortedL1 = [...this.state.l1_compacted]
-      .sort((a, b) => b.importance - a.importance)
-      .reverse();
+    // L1: Compacted history — highest importance gets budget priority
+    const sortedL1 = [...this.state.l1_compacted].sort(
+      (a, b) => b.importance - a.importance,
+    );
     const l1Lines: string[] = [];
     let l1Tokens = 0;
     for (const entry of sortedL1) {
@@ -157,6 +159,27 @@ export class CompactionEngine {
       const content = l0Lines.join('\n');
       sections.push({ level: CL.L0_MEMTABLE, content, tokenEstimate: l0Tokens });
       used += l0Tokens;
+    }
+
+    // Active engrams — interpreter step runs here, before injection
+    if (this.activeEngramStore) {
+      // Build a brief context string from the most recent L0 messages
+      const recentContext = this.state.l0_messages
+        .slice(-3)
+        .map((m) => m.content)
+        .join(' ');
+      const results = this.activeEngramStore.retrieve(recentContext);
+      if (results.length > 0) {
+        const lines = results.map(
+          (r) => `[memory] ${r.interpreted}`,
+        );
+        const content = lines.join('\n');
+        const tokens = estimateTokens(content);
+        if (used + tokens <= budget) {
+          sections.unshift({ level: CL.L4_INVARIANTS, content, tokenEstimate: tokens });
+          used += tokens;
+        }
+      }
     }
 
     // Tombstone annotations
@@ -196,6 +219,11 @@ export class CompactionEngine {
   /** Replace the compactor (e.g., when upgrading from regex to host LLM). */
   setCompactor(compactor: Compactor): void {
     this.compactor = compactor;
+  }
+
+  /** Attach an ActiveEngramStore so agential memories participate in context frames. */
+  attachActiveEngrams(store: ActiveEngramStore): void {
+    this.activeEngramStore = store;
   }
 
   private resolveCompactor(): Compactor {

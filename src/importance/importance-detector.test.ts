@@ -54,11 +54,18 @@ describe('ImportanceDetector', () => {
     detector.score(msg('2', 'The color scheme should be blue.'));
     detector.score(msg('3', 'Going back to React, we need server-side rendering.'));
 
+    const incremental = detector.getScore('1')!;
     const recomputed = detector.recompute();
 
     // Message 1 introduced React, message 3 references it —
     // so message 1's reference frequency should be higher after recompute
     expect(recomputed.length).toBe(3);
+    expect(recomputed[0].referenceFrequency).toBeGreaterThan(
+      incremental.referenceFrequency,
+    );
+    expect(detector.getScore('1')!.referenceFrequency).toBe(
+      recomputed[0].referenceFrequency,
+    );
   });
 
   it('returns all scores', () => {
