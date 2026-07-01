@@ -222,6 +222,16 @@ npm test         # run tests (vitest)
 npm run lint     # type-check without emitting
 ```
 
+## Ecosystem
+
+Short-hand is one of four related projects by the same author — see
+[`docs/ecosystem/executive-summary.md`](./docs/ecosystem/executive-summary.md) and
+[`docs/ecosystem/engineering-guide.md`](./docs/ecosystem/engineering-guide.md) for an evaluation of
+how it relates to [AgentVault](https://github.com/johnnyclem/AgentVault),
+[SmallChat](https://github.com/johnnyclem/smallchat), and
+[Stenographer](https://github.com/johnnyclem/stenographer), including what's actually wired up today
+versus aspirational.
+
 ## License
 
 MIT
