@@ -101,6 +101,17 @@ export class ORSet<T> {
     for (const tag of data.removed) {
       set.removed.add(tag);
     }
+    // Restore the tag counter past any tags this agent already issued, so new
+    // adds after a round-trip cannot collide with existing (or removed) tags.
+    const prefix = `${agentId}:`;
+    for (const tag of [...set.elements.keys(), ...set.removed]) {
+      if (tag.startsWith(prefix)) {
+        const n = Number(tag.slice(prefix.length));
+        if (Number.isFinite(n) && n > set.tagCounter) {
+          set.tagCounter = n;
+        }
+      }
+    }
     return set;
   }
 }

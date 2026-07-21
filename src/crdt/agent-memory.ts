@@ -99,6 +99,11 @@ export class AgentMemory {
     // Merge summaries
     const otherSummaries = GSet.deserialize<TopicSummary>(serialized.summaries);
     this.summaries.merge(otherSummaries);
+
+    // Merge active engrams (union by id)
+    if (serialized.activeEngrams) {
+      this.activeEngrams.mergeFrom(serialized.activeEngrams);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -118,9 +123,6 @@ export class AgentMemory {
   static deserialize(data: SerializedAgentMemory): AgentMemory {
     const memory = new AgentMemory(data.agentId);
     memory.mergeFrom(data);
-    if (data.activeEngrams) {
-      memory.activeEngrams.loadFrom(data.activeEngrams);
-    }
     return memory;
   }
 }

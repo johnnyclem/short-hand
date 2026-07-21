@@ -17,7 +17,11 @@ export function resolveTemplate(
   payload: string,
   context: string,
 ): string {
-  return template.replace(/\{\{payload\}\}/g, payload).replace(/\{\{context\}\}/g, context);
+  // Function replacements: a payload containing `$&` / `$'` must be inserted
+  // literally, not expanded as a replacement pattern.
+  return template
+    .replace(/\{\{payload\}\}/g, () => payload)
+    .replace(/\{\{context\}\}/g, () => context);
 }
 
 export class RegexInterpreter implements Interpreter {

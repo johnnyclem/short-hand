@@ -13,7 +13,7 @@ import type {
   Source,
 } from '../types.js';
 import { DEFAULT_INGESTION_CONFIG } from '../types.js';
-import { estimateTokens, generateId } from '../utils.js';
+import { estimateTokens } from '../utils.js';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
 
 // ---------------------------------------------------------------------------

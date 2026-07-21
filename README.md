@@ -53,6 +53,8 @@ const frame = engine.buildContextFrame(2000);
 // frame.sections is ordered L4 invariants → L3 graph → L2 summaries → L1 compacted → L0 raw,
 // with any tombstone corrections and active-engram recalls surfaced first when present.
 // frame.tokenUsage stays within your budget.
+// frame.sections contains L4 invariants → L3 graph → L2 summaries → L1 compacted → L0 raw
+// frame.tokenUsage stays within your budget
 ```
 
 ## Architecture
@@ -266,6 +268,18 @@ const frame = engine.buildContextFrame(budget); // build context within token bu
 const state = engine.getState();               // inspect current compacted state
 engine.setCompactor(customCompactor);           // swap in a different Compactor
 engine.attachActiveEngrams(activeEngramStore);  // fold active engrams into context frames
+  memtableSize: 10,       // L0 capacity before auto-flush (default: 10)
+  contextBudget: 8000,    // token budget for context frames (default: 8000)
+  preferredTier: 'regex', // compaction strategy (default: 'regex')
+});
+
+await engine.addMessage(message);        // add one message
+await engine.addMessages(messages);      // add many
+await engine.flush();                    // force all of L0 through L1 compaction
+await engine.recompact(level);           // deeper recompaction (L1→L2, etc.)
+const frame = engine.buildContextFrame(budget); // build context within token budget
+const state = engine.getState();         // inspect current compacted state
+engine.attachActiveEngrams(store);       // surface agential memories in frames
 ```
 
 ### RegexCompactor
@@ -294,6 +308,11 @@ const score = detector.score(message);
 detector.recompute();      // retrospectively recompute all scores
 detector.getScore(msgId);  // look up a previously scored message
 detector.getAllScores();   // all { messageId, score } pairs
+const score = detector.score(message); // incremental — call once per message
+// { overall: 0.72, stateDelta: 0.85, referenceFrequency: 0.4, trajectoryDiscontinuity: 0.8 }
+
+// Retrospective pass: folds in how often later messages referenced each one
+const updated = detector.recompute();
 ```
 
 ### CRDT Primitives
@@ -318,6 +337,16 @@ memory.addEntity({
 const reg = new LWWRegister<string>('agent-1');
 reg.set('db', 'PostgreSQL', 1);
 reg.set('db', 'MySQL', 2); // newer Lamport timestamp wins
+// Per-agent memory combining all CRDT types
+const memory = new AgentMemory('agent-1');
+memory.setInvariant('db', 'PostgreSQL');
+memory.addEntity(entity);
+memory.addSummary(summary);
+
+// Last-Writer-Wins Register (L4 invariants)
+const reg = new LWWRegister<string>('agent-1');
+reg.set('db', 'PostgreSQL', 1);
+reg.set('db', 'MySQL', 2); // newer timestamp wins
 
 // Observed-Remove Set (L3 entities, add-wins)
 const orset = new ORSet<string>('agent-1');
@@ -330,6 +359,58 @@ gset.add('Session covered auth flow');
 
 // Merge another agent's serialized state into this one (mutates in place)
 memory.mergeFrom(otherMemory.serialize());
+// Merge another agent's serialized memory into this one
+memory.mergeFrom(otherMemory.serialize());
+```
+
+### ActiveEngramStore
+
+Agential memory entries: each engram carries its payload, an interpreter
+template, and a declarative activation policy. On retrieval, the engram is
+re-interpreted against the *current* context before injection — salience over
+fidelity.
+
+```typescript
+import { ActiveEngramStore } from 'short-hand';
+
+const store = new ActiveEngramStore();
+const id = store.add('user prefers CLI tools', {
+  activationPolicy: { surfaceWhenTopics: ['ux', 'interface'] },
+  importanceScore: 0.8,
+});
+
+// Sync retrieval (regex-tier template substitution)
+const results = store.retrieve('designing the settings interface');
+
+// Async retrieval through a configured LM-tier interpreter
+const lmStore = new ActiveEngramStore({ interpreter: hostInterpreter });
+const interpreted = await lmStore.retrieveAsync('designing the settings interface');
+
+// Plug into the engine so engrams surface in context frames
+engine.attachActiveEngrams(store);
+```
+
+### Interpreters
+
+Bounded LM step at engram-retrieval time, with three tiers and deterministic
+fallback. Every call carries a `maxOutputTokens` cap and a `timeoutMs`.
+
+```typescript
+import {
+  RegexInterpreter,   // zero-dep template substitution (terminal fallback)
+  LocalInterpreter,   // Ollama HTTP endpoint
+  HostInterpreter,    // Anthropic-shaped client (bring your own SDK instance)
+  withFallback,
+} from 'short-hand';
+
+const interpreter = withFallback(
+  new HostInterpreter({ client, model: 'claude-haiku-4-5-20251001' }),
+  new RegexInterpreter(),
+);
+const text = await interpreter.interpret(
+  { template: 'In {{context}}: {{payload}}', payload: '...', context: '...' },
+  { maxOutputTokens: 120, timeoutMs: 4000 },
+);
 ```
 
 ### Verification
@@ -350,6 +431,36 @@ const tester = new RecallTester();
 const questions = tester.generateQuestions(originalMessages);
 const recall = tester.evaluateRecall(questions, compactedState);
 // { passed: true, checks: [...], recallScore: 0.85 }
+// recall.recallScore → 0.85 (85% recall)
+```
+
+### Source Ingestion & Wiki Rendering
+
+Feed documents through the compaction pipeline, then materialize the
+compacted knowledge as interlinked markdown pages.
+
+```typescript
+import { SourceIngester, WikiRenderer } from 'short-hand';
+
+const ingester = new SourceIngester({ chunkSize: 800, chunkOverlap: 100 });
+const event = await ingester.ingest(
+  { id: 'doc-1', title: 'Design Doc', content: markdownText },
+  engine,
+);
+
+const renderer = new WikiRenderer({ wikiTitle: 'Project Knowledge' });
+const pages = renderer.render(engine.getState(), ingester.getEvents());
+// pages: entity pages, topic pages, index.md, log.md — persist however you like
+```
+
+### Context-Shift Benchmark
+
+Measures whether interpret-at-retrieval beats raw payload injection when the
+context has shifted since write time.
+
+```bash
+npm run benchmark        # offline: regex tier + keyword judge, deterministic
+npm run benchmark:live   # Anthropic-backed (needs ANTHROPIC_API_KEY + @anthropic-ai/sdk)
 ```
 
 ### Utilities
@@ -359,11 +470,15 @@ import { estimateTokens, generateId } from 'short-hand';
 
 estimateTokens('Hello world'); // ~3 (4 chars per token heuristic)
 generateId();                  // e.g. 'mdlk2h4c-9f2a1qz'
+generateId(); // 'lx2f3a9b-k1m2n3o' (timestamp + random, base36)
 ```
 
-## Compactor Tiers
+## Tiers
 
 Distinct from the [interpreter tiers](#interpreter-tiers) above — these govern **write-time** L0→L1 compaction inside `CompactionEngine`, not retrieval-time restatement.
+Short-hand uses a tiered strategy with automatic fallback in two places:
+
+**Compaction** (messages → compacted state):
 
 | Tier | Strategy | Status | Configuration |
 |------|----------|--------|----------------|
@@ -372,6 +487,20 @@ Distinct from the [interpreter tiers](#interpreter-tiers) above — these govern
 | **2** | Host LLM | Planned | `hostLLM: { provider: 'anthropic' \| 'openai' \| 'custom', ... }` |
 
 Today, `CompactionEngine` only implements the regex compactor. Requesting `preferredTier: 'local'` or `'host'` silently falls back to regex when `autoFallback: true` (the default); set `autoFallback: false` to get a hard error instead of silent degradation.
+| **1** | Local LM | Planned | Local model runtime |
+| **2** | Host LLM | Planned | LLM API access |
+
+The engine defaults to Tier 0 (regex) and falls back gracefully if a higher tier is unavailable.
+
+**Interpretation** (engram retrieval — implemented today):
+
+| Tier | Class | Backend |
+|------|-------|---------|
+| **regex** | `RegexInterpreter` | None (template substitution) |
+| **local** | `LocalInterpreter` | Ollama HTTP endpoint |
+| **host** | `HostInterpreter` | Any Anthropic-shaped client |
+
+Compose tiers with `withFallback(primary, fallback)` for deterministic degradation.
 
 ## Types
 

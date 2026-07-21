@@ -12,7 +12,6 @@ import type {
   ConversationMessage,
   ImportanceScore,
   ImportanceWeights,
-  Entity,
 } from '../types.js';
 import { DEFAULT_IMPORTANCE_WEIGHTS } from '../types.js';
 
@@ -156,14 +155,44 @@ export class ImportanceDetector {
     return scoreResult;
   }
 
-  /** Retrospectively recompute all scores (e.g., after reference counts change). */
+  /**
+   * Retrospectively recompute all scores. Unlike incremental score() calls,
+   * this folds in the reference-frequency signal: messages whose entities
+   * were re-mentioned by later messages get their referenceFrequency (and
+   * overall score) boosted.
+   */
   recompute(): ImportanceScore[] {
     const records = this.history;
     this.history = [];
     this.entityGraph.clear();
     this.referenceCounts.clear();
 
-    return records.map((r) => this.score(r.message));
+    // First pass: replay incrementally, rebuilding the entity graph and
+    // reference counts across the full history.
+    for (const record of records) {
+      this.score(record.message);
+    }
+
+    // Second pass: now that reference counts reflect the whole conversation,
+    // fold them into each message's reference-frequency signal.
+    for (const record of this.history) {
+      const refs = this.referenceCounts.get(record.message.id) ?? 0;
+      if (refs === 0) continue;
+
+      const referenceFrequency = Math.min(
+        1.0,
+        record.score.referenceFrequency + refs * 0.15,
+      );
+      const overall = Math.min(
+        1.0,
+        this.weights.stateDelta * record.score.stateDelta +
+          this.weights.referenceFrequency * referenceFrequency +
+          this.weights.trajectoryDiscontinuity * record.score.trajectoryDiscontinuity,
+      );
+      record.score = { ...record.score, referenceFrequency, overall };
+    }
+
+    return this.history.map((r) => r.score);
   }
 
   /** Get the current score for a message ID. */

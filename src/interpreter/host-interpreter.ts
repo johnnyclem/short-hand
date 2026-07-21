@@ -69,15 +69,22 @@ export class HostInterpreter implements Interpreter {
 
   private readonly client: AnthropicLikeClient;
   private readonly model: string;
+  private readonly defaultMaxOutputTokens: number;
+  private readonly defaultTimeoutMs: number;
   private readonly logger: InterpreterLogger;
 
   constructor(opts: HostInterpreterOptions) {
     this.client = opts.client;
     this.model = opts.model;
+    this.defaultMaxOutputTokens = opts.defaultMaxOutputTokens ?? 120;
+    this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 8_000;
     this.logger = opts.logger ?? silentLogger;
   }
 
-  async interpret(input: InterpretInput, opts: InterpretOptions): Promise<string> {
+  async interpret(input: InterpretInput, opts: Partial<InterpretOptions> = {}): Promise<string> {
+    const maxOutputTokens = opts.maxOutputTokens ?? this.defaultMaxOutputTokens;
+    const timeoutMs = opts.timeoutMs ?? this.defaultTimeoutMs;
+
     if (opts.signal?.aborted) throw makeAbortError();
 
     const internal = new AbortController();
@@ -88,14 +95,14 @@ export class HostInterpreter implements Interpreter {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         internal.abort();
-        reject(new InterpreterBudgetError('timeout', { ms: opts.timeoutMs }));
-      }, opts.timeoutMs);
+        reject(new InterpreterBudgetError('timeout', { ms: timeoutMs }));
+      }, timeoutMs);
     });
 
     const request: AnthropicMessageRequest = {
       model: this.model,
-      max_tokens: opts.maxOutputTokens,
-      system: SYSTEM_TEMPLATE(opts.maxOutputTokens),
+      max_tokens: maxOutputTokens,
+      system: SYSTEM_TEMPLATE(maxOutputTokens),
       messages: [{ role: 'user', content: buildUserMessage(input) }],
     };
 
@@ -111,10 +118,10 @@ export class HostInterpreter implements Interpreter {
         .trim();
 
       const tokens = estimateTokens(text);
-      if (tokens > Math.ceil(opts.maxOutputTokens * 1.1)) {
+      if (tokens > Math.ceil(maxOutputTokens * 1.1)) {
         throw new InterpreterBudgetError('output_too_long', {
           tokens,
-          cap: opts.maxOutputTokens,
+          cap: maxOutputTokens,
         });
       }
 
@@ -126,7 +133,7 @@ export class HostInterpreter implements Interpreter {
         if (opts.signal?.aborted) throw err;
         // Otherwise, our timeout fired and surfaced as AbortError before the
         // race rejected; rewrap as a budget error.
-        throw new InterpreterBudgetError('timeout', { ms: opts.timeoutMs });
+        throw new InterpreterBudgetError('timeout', { ms: timeoutMs });
       }
       this.logger.warn('host_interpreter_unavailable', {
         message: err instanceof Error ? err.message : String(err),
