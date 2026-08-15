@@ -27,6 +27,13 @@ type FetchLike = (
 
 export interface LocalInterpreterOptions {
   model: string;
+  /**
+   * Ollama-compatible endpoint to POST against. Defaults to the local
+   * Ollama daemon. Not validated — this is a host-controlled configuration
+   * value, not something to derive from untrusted user input, since it is
+   * fetched with no scheme/host allowlisting (a caller that threads
+   * attacker-controlled input into this option opens an SSRF vector).
+   */
   endpoint?: string;
   fetch?: FetchLike;
   logger?: InterpreterLogger;
