@@ -12,6 +12,12 @@ export function estimateTokens(text: string): number {
 
 /**
  * Generate a unique ID (simple, no external deps).
+ *
+ * Not cryptographically secure and not collision-proof — callers that key
+ * a Map/Set by this ID (e.g. ActiveEngramStore) can silently overwrite an
+ * existing entry on collision. Fine for the current use (message/engram/
+ * summary identifiers, not auth tokens or anything security-sensitive);
+ * swap for a stronger generator if collision resistance ever matters.
  */
 export function generateId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
