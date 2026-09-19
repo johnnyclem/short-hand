@@ -19,12 +19,20 @@ import { CompactionLevel as CL, DEFAULT_COMPACTION_CONFIG } from '../types.js';
 import { estimateTokens } from '../utils.js';
 import { RegexCompactor } from './regex-compactor.js';
 import type { ActiveEngramStore } from '../crdt/active-engram-store.js';
+import type { TruthLedgerLine, TruthLedgerView, TruthSyncResult } from '../truth/types.js';
+import {
+  buildTruthLedgerView,
+  displaceStaleInvariants,
+  parseTruthLedgerJsonl,
+  renderTruthSection,
+} from '../truth/ledger-sync.js';
 
 export class CompactionEngine {
   private config: CompactionConfig;
   private compactor: Compactor;
   private state: CompactedState;
   private activeEngramStore?: ActiveEngramStore;
+  private truthView?: TruthLedgerView;
 
   constructor(config: Partial<CompactionConfig> = {}) {
     this.config = { ...DEFAULT_COMPACTION_CONFIG, ...config };
@@ -73,11 +81,59 @@ export class CompactionEngine {
     this.state = await this.compactor.recompact(this.state, targetLevel);
   }
 
+  /**
+   * Sync a truth-ledger snapshot (stenographer TB/UV v2 JSONL export).
+   *
+   * The synced view lives beside the LSM levels, not inside them:
+   * recompaction can rewrite L4, but it can never rewrite ledger truth,
+   * and a UV must never compact into something that reads as proven.
+   * Syncing also displaces any L4 invariant projected from an entry that
+   * has since been overridden, refuted, or contested.
+   */
+  syncTruthLedger(input: string | string[] | TruthLedgerLine[]): TruthSyncResult {
+    let entries: TruthLedgerLine[];
+    let errors: TruthSyncResult['errors'] = [];
+
+    if (typeof input === 'string' || typeof input[0] === 'string' || input.length === 0) {
+      const parsed = parseTruthLedgerJsonl(input as string | string[]);
+      entries = parsed.entries;
+      errors = parsed.errors;
+    } else {
+      entries = input as TruthLedgerLine[];
+    }
+
+    const view = buildTruthLedgerView(entries);
+    const { kept, displacedKeys } = displaceStaleInvariants(this.state.l4_invariants, view);
+    this.state.l4_invariants = kept;
+    this.truthView = view;
+
+    return { view, displacedInvariantKeys: displacedKeys, errors };
+  }
+
+  /** The most recently synced truth-ledger view, if any. */
+  getTruthView(): TruthLedgerView | undefined {
+    return this.truthView;
+  }
+
   /** Build a context frame within the token budget. */
   buildContextFrame(tokenBudget?: number): ContextFrame {
     const budget = tokenBudget ?? this.config.contextBudget;
     const sections: ContextSection[] = [];
     let used = 0;
+
+    // Truth ledger: asserted truth outranks everything derived — it takes
+    // budget first, and contested entries always carry both sides.
+    if (this.truthView) {
+      const truthLines = renderTruthSection(this.truthView);
+      if (truthLines.length > 0) {
+        const content = truthLines.join('\n');
+        const tokens = estimateTokens(content);
+        if (used + tokens <= budget) {
+          sections.push({ level: CL.L4_INVARIANTS, content, tokenEstimate: tokens });
+          used += tokens;
+        }
+      }
+    }
 
     // L4: Core invariants (always included, minimal cost)
     if (this.state.l4_invariants.length > 0) {

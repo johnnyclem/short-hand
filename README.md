@@ -222,6 +222,23 @@ npm test         # run tests (vitest)
 npm run lint     # type-check without emitting
 ```
 
+## Truth-Ledger Interop
+
+Short-hand can sync [stenographer's](https://github.com/johnnyclem/stenographer) TB/UV v2 truth ledger at a JSONL seam — no code dependency in either direction:
+
+```typescript
+// Read: consume a ledger export as high-priority context input
+const result = engine.syncTruthLedger(jsonlLines);
+const frame = engine.buildContextFrame(); // asserted truth renders first
+
+// Write: emit L4 candidates back as proposal drafts (proposals only —
+// nothing becomes truth until an accountable author signs it over there)
+import { exportProposalDrafts } from 'short-hand';
+const draftLines = exportProposalDrafts(engine.getState());
+```
+
+Synced truth keeps its two axes — provenance and confidence type. Active TBs render as ground truth, contested TBs carry their disputing UVs visibly, open UVs are flagged but never read as proven, and overridden/refuted entries are displaced on the next sync. See [`docs/truth-ledger-integration.md`](./docs/truth-ledger-integration.md) for the design and the convergence decision it defers.
+
 ## Ecosystem
 
 Short-hand is one of four related projects by the same author — see
