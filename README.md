@@ -63,7 +63,7 @@ Short-hand models conversation memory as a five-level LSM-tree:
 | **L3** | Graph | Entity-relationship knowledge graph | Structural |
 | **L4** | Invariants | Core facts that must survive indefinitely | Minimal |
 
-Messages enter L0 and progressively compact into deeper levels as the conversation grows. When building a context frame, levels are prioritized L4 → L0 (invariants first, recent messages last) within your token budget.
+Messages enter L0 and progressively compact into deeper levels as the conversation grows. When building a context frame, levels are prioritized L4 → L0 (invariants first, recent messages last) within your token budget. Corrections (tombstones) are budgeted ahead of every derived level, and up to 25% of the budget is reserved for the most recent raw messages so compacted history can't crowd them out.
 
 ### Tombstones
 
