@@ -134,5 +134,26 @@ export { SourceIngester } from './ingestion/source-ingester.js';
 // Wiki rendering
 export { WikiRenderer } from './wiki/wiki-renderer.js';
 
+// Truth-ledger interop (stenographer TB/UV v2, JSONL seam)
+export type {
+  TruthConfidence,
+  TruthLedgerLine,
+  CitableTruth,
+  TruthLedgerView,
+  TruthSyncResult,
+  ProposalDraftLine,
+} from './truth/index.js';
+export {
+  TRUTH_SOURCE_PREFIX,
+  parseTruthLedgerJsonl,
+  buildTruthLedgerView,
+  renderTruthSection,
+  citableToInvariant,
+  displaceStaleInvariants,
+  invariantsToProposalDrafts,
+  tombstonesToProposalDrafts,
+  exportProposalDrafts,
+} from './truth/index.js';
+
 // Utilities
 export { estimateTokens, generateId } from './utils.js';

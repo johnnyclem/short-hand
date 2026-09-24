@@ -69,7 +69,7 @@ Short-hand models conversation memory as a five-level LSM-tree:
 | **L3** | Graph | Entity-relationship knowledge graph | Structural |
 | **L4** | Invariants | Core facts that must survive indefinitely | Minimal |
 
-Messages enter L0 and progressively compact into deeper levels as the conversation grows. When building a context frame, levels are prioritized L4 → L0 (invariants first, recent messages last) within your token budget.
+Messages enter L0 and progressively compact into deeper levels as the conversation grows. When building a context frame, levels are prioritized L4 → L0 (invariants first, recent messages last) within your token budget. Corrections (tombstones) are budgeted ahead of every derived level, and up to 25% of the budget is reserved for the most recent raw messages so compacted history can't crowd them out.
 
 ### Tombstones
 
@@ -545,6 +545,23 @@ npm run benchmark         # offline context-shift benchmark
 npm run benchmark:live    # host-tier benchmark against a real model (needs ANTHROPIC_API_KEY)
 ```
 
+## Truth-Ledger Interop
+
+Short-hand can sync [stenographer's](https://github.com/johnnyclem/stenographer) TB/UV v2 truth ledger at a JSONL seam — no code dependency in either direction:
+
+```typescript
+// Read: consume a ledger export as high-priority context input
+const result = engine.syncTruthLedger(jsonlLines);
+const frame = engine.buildContextFrame(); // asserted truth renders first
+
+// Write: emit L4 candidates back as proposal drafts (proposals only —
+// nothing becomes truth until an accountable author signs it over there)
+import { exportProposalDrafts } from 'short-hand';
+const draftLines = exportProposalDrafts(engine.getState());
+```
+
+Synced truth keeps its two axes — provenance and confidence type. Active TBs render as ground truth, contested TBs carry their disputing UVs visibly, open UVs are flagged but never read as proven, and overridden/refuted entries are displaced on the next sync. See [`docs/truth-ledger-integration.md`](./docs/truth-ledger-integration.md) for the design and the convergence decision it defers.
+
 ## Project Status
 
 short-hand is pre-1.0 (`0.1.0`) and single-maintainer. What's solid today: the five-level LSM compaction core, CRDT primitives, tombstones, and importance scoring, all running on the shipped regex tier with 150+ passing tests; the active-engram subsystem and its three interpreter tiers, each behind the same bounded, fallback-safe contract; source ingestion and wiki rendering; and the context-shift benchmark that backs the claims above.
@@ -553,7 +570,6 @@ What's still aspirational:
 
 - **Compactor tiers** — `local`/`host` for L0→L1 write-time compaction accept configuration but currently fall back to `regex` (see [Compactor Tiers](#compactor-tiers)).
 - **Embeddings** — there's no embedding model wired in yet; `ImportanceDetector`'s reference-frequency and trajectory-discontinuity signals use lexical (Jaccard) approximations, and `StubEmbedder` is an explicit placeholder returning zero vectors.
-- **CI** — no workflow is configured in this repo yet; `npm test` and `npm run lint` are the gate for now.
 
 ## Ecosystem
 

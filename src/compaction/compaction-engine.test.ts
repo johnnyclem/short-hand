@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { CompactionEngine } from './compaction-engine.js';
-import type { ConversationMessage } from '../types.js';
+import { CompactionLevel, type ConversationMessage } from '../types.js';
+import { ActiveEngramStore } from '../crdt/active-engram-store.js';
 
 function msg(id: string, role: 'user' | 'assistant', content: string): ConversationMessage {
   return { id, role, content, timestamp: Date.now() };
@@ -80,5 +81,118 @@ describe('CompactionEngine', () => {
 
     expect(smallFrame.tokenUsage).toBeLessThanOrEqual(200);
     expect(largeFrame.tokenUsage).toBeGreaterThanOrEqual(smallFrame.tokenUsage);
+  });
+
+  it('budgets corrections before derived levels under a tight budget', async () => {
+    const engine = new CompactionEngine({ memtableSize: 1 });
+    await engine.addMessages([
+      msg('1', 'user', "Let's use PostgreSQL."),
+      msg('2', 'user', 'The service must stay under 200ms p99 latency.'),
+      msg('3', 'user', 'Actually, switch PostgreSQL to SQLite.'),
+      ...Array.from({ length: 20 }, (_, i) =>
+        msg(`f${i}`, 'user', `We chose option ${i} for the widget layer over the legacy one.`),
+      ),
+    ]);
+
+    const frame = engine.buildContextFrame(60);
+    const contents = frame.sections.map((s) => s.content);
+    const correctionIdx = contents.findIndex((c) => c.startsWith('[correction]'));
+    const invariantIdx = contents.findIndex((c) => c.startsWith('[invariant]'));
+
+    expect(correctionIdx).toBe(0);
+    expect(contents[correctionIdx]).toContain('"SQLite"');
+    // Output order: corrections ahead of invariants
+    if (invariantIdx !== -1) expect(invariantIdx).toBeGreaterThan(correctionIdx);
+  });
+
+  it('does not emit L1 lines a correction superseded', async () => {
+    const engine = new CompactionEngine({ memtableSize: 1 });
+    await engine.addMessages([
+      msg('1', 'user', 'We decided to use MySQL for storage.'),
+      msg('2', 'assistant', 'Got it, LOG_BUDGET = 30.'),
+      msg('3', 'user', 'Switch MySQL to Postgres.'),
+      msg('4', 'user', 'Change the log budget to 100.'),
+      msg('5', 'user', 'Now write the migration scripts.'),
+    ]);
+
+    const l1 = engine
+      .buildContextFrame(5000)
+      .sections.filter((s) => s.level === 1)
+      .map((s) => s.content)
+      .join('\n');
+
+    expect(l1).toContain('Switch MySQL to Postgres.');
+    expect(l1).toContain('Change the log budget to 100.');
+    expect(l1).not.toContain('We decided to use MySQL');
+    expect(l1).not.toContain('LOG_BUDGET = 30');
+  });
+
+  it('does not emit decision summaries a correction superseded', async () => {
+    const engine = new CompactionEngine({ memtableSize: 1 });
+    await engine.addMessages([
+      msg('1', 'user', "Let's use MySQL for storage."),
+      msg('2', 'user', "Actually, we're using Postgres, not MySQL."),
+      msg('3', 'user', 'Now write the migration scripts.'),
+    ]);
+    await engine.recompact(CompactionLevel.L3_GRAPH);
+
+    const frame = engine.buildContextFrame(5000);
+    const text = frame.sections.map((s) => s.content).join('\n');
+    expect(text).not.toContain('[Decision: MySQL');
+    expect(text).toContain('Postgres');
+  });
+
+  it('selects L1 by importance first, most recent first on ties', () => {
+    const engine = new CompactionEngine();
+    const l1 = engine.getState().l1_compacted;
+    l1.push(
+      { originalMessageId: 'a', compacted: 'low importance line aaaa', importance: 0.1 },
+      { originalMessageId: 'b', compacted: 'high importance line bbb', importance: 0.9 },
+      { originalMessageId: 'c', compacted: 'mid importance older ccc', importance: 0.5 },
+      { originalMessageId: 'd', compacted: 'mid importance newer ddd', importance: 0.5 },
+    );
+
+    // Each line is 6 tokens; room for exactly two
+    const content = engine.buildContextFrame(12).sections.map((s) => s.content).join('\n');
+
+    // Emitted in conversation order
+    expect(content).toBe('high importance line bbb\nmid importance newer ddd');
+  });
+
+  it('reserves budget for the most recent L0 message', async () => {
+    const engine = new CompactionEngine({ memtableSize: 2 });
+    for (let i = 0; i < 30; i++) {
+      await engine.addMessage(
+        msg(`${i}`, 'user', `Component ${i} of the rendering pipeline is now documented in the wiki.`),
+      );
+    }
+    await engine.addMessage(msg('latest', 'user', 'Ship it today.'));
+
+    const frame = engine.buildContextFrame(200);
+    const last = frame.sections[frame.sections.length - 1];
+
+    expect(frame.tokenUsage).toBeLessThanOrEqual(200);
+    expect(frame.sections.some((s) => s.level === 1)).toBe(true);
+    expect(last.level).toBe(0);
+    expect(last.content).toContain('user: Ship it today.');
+  });
+
+  it('budgets active engrams where they are emitted, after corrections', async () => {
+    const engine = new CompactionEngine({ memtableSize: 1 });
+    const store = new ActiveEngramStore();
+    store.add('deploy target is Fly.io');
+    engine.attachActiveEngrams(store);
+    await engine.addMessages([
+      msg('1', 'user', "Let's use PostgreSQL."),
+      msg('2', 'user', 'Actually, switch PostgreSQL to SQLite.'),
+      msg('3', 'user', 'Continue.'),
+    ]);
+
+    const contents = engine.buildContextFrame(5000).sections.map((s) => s.content);
+    const correctionIdx = contents.findIndex((c) => c.startsWith('[correction]'));
+    const memoryIdx = contents.findIndex((c) => c.startsWith('[memory]'));
+
+    expect(correctionIdx).toBe(0);
+    expect(memoryIdx).toBeGreaterThan(correctionIdx);
   });
 });
