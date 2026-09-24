@@ -235,6 +235,8 @@ export class CompactionEngine {
     const l2Lines: string[] = [];
     let l2Tokens = 0;
     for (const summary of sortedSummaries) {
+      // A decision summary whose decisions were all superseded is history
+      if (summary.decisions.length > 0 && summary.decisions.every((d) => d.superseded)) continue;
       const line = `[${summary.topic}] ${summary.summary}`;
       const lineTokens = estimateTokens(line);
       if (used + l2Tokens + lineTokens > derivedBudget) break;

@@ -103,11 +103,22 @@ function splitReplacement(text: string): { from?: string; to?: string } {
 
 const CORRECTION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch }> = [
   {
-    regex: /(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead|scratch that|change that to)\s*[,:]?\s*(.+?)(?:\.|$)/gi,
+    // A bare "instead" is a correction keyword; "instead of" is the
+    // replacement form handled by the "use X instead of Y" pattern below.
+    regex: /(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead(?!\s+of\b)|scratch that|change that to)\s*[,:]?\s*(.+?)(?:\.|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
       details: { correctedTo: m[1].trim(), ...splitReplacement(m[1]) },
+    }),
+  },
+  {
+    // "use X instead of Y" with no correction keyword in front
+    regex: /\b(?:use|using|go with|switch to|pick|choose|prefer)\s+(.+?),?\s+(?:instead of|rather than)\s+(.+?)(?:\.|$)/gi,
+    extract: (m) => ({
+      type: 'correction',
+      content: m[0],
+      details: { from: m[2].trim(), to: m[1].trim() },
     }),
   },
   {
@@ -270,8 +281,13 @@ export class RegexCompactor implements Compactor {
     const patterns = extractPatterns(msg.content);
     const hasCode = containsCode(msg.content);
 
-    // Handle corrections → create tombstones
+    // Handle corrections → create tombstones. Several patterns can match
+    // the same correction ("Actually, use X instead of Y"); record it once.
+    const recorded = new Set<string>();
     for (const match of patterns.filter((p) => p.type === 'correction')) {
+      const key = `${(match.details.from ?? '').toLowerCase()}→${(match.details.to ?? match.details.correctedTo ?? '').toLowerCase()}`;
+      if (recorded.has(key)) continue;
+      recorded.add(key);
       const tombstone: Tombstone = {
         supersededContent: match.details.from ?? '',
         originalMessageId: this.findRelatedMessage(match, state) ?? msg.id,
@@ -405,11 +421,12 @@ export class RegexCompactor implements Compactor {
   }
 
   /**
-   * Drop L1 entries a tombstone supersedes so stale facts can't resurface
-   * in context frames or in L2 summaries built from L1. An entry goes if
-   * it is the tombstone's original message, or if it mentions the
-   * superseded value (whole word, case-insensitive) without also
-   * mentioning the corrected value.
+   * Drop what a tombstone supersedes so stale facts can't resurface in
+   * context frames. An L1 entry goes if it is the tombstone's original
+   * message, or if it mentions the superseded value (whole word,
+   * case-insensitive) without also mentioning the corrected value.
+   * Decisions that chose the superseded value are marked superseded, and
+   * L2 summaries that would still state it are dropped.
    */
   private pruneSuperseded(tombstone: Tombstone, state: CompactedState): void {
     const old = normalizeForMatch(tombstone.supersededContent);
@@ -417,13 +434,27 @@ export class RegexCompactor implements Compactor {
     const oldRe = wholeWordRe(old);
     const corrected = normalizeForMatch(tombstone.correctedValue ?? '');
     const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
+    const statesOnlyOld = (raw: string): boolean => {
+      const text = normalizeForMatch(raw);
+      return oldRe.test(text) && !correctedRe?.test(text);
+    };
 
     state.l1_compacted = state.l1_compacted.filter((entry) => {
       if (entry.originalMessageId === tombstone.correctionMessageId) return true;
       if (entry.originalMessageId === tombstone.originalMessageId) return false;
-      const text = normalizeForMatch(entry.compacted);
-      return !(oldRe.test(text) && !correctedRe?.test(text));
+      return !statesOnlyOld(entry.compacted);
     });
+
+    for (const summary of state.l2_summaries) {
+      for (const decision of summary.decisions) {
+        if (!decision.superseded && statesOnlyOld(decision.chosen)) decision.superseded = true;
+      }
+    }
+    state.l2_summaries = state.l2_summaries.filter((summary) =>
+      summary.decisions.length > 0
+        ? summary.decisions.some((d) => !d.superseded)
+        : !statesOnlyOld(summary.summary),
+    );
   }
 
   private checkDecisionSupersession(decision: Decision, state: CompactedState): void {
@@ -477,7 +508,7 @@ export class RegexCompactor implements Compactor {
     // Extract entity relationships from L2 summaries
     for (const summary of state.l2_summaries) {
       for (const decision of summary.decisions) {
-        if (decision.chosen) {
+        if (decision.chosen && !decision.superseded) {
           const entityName = decision.chosen;
           if (!state.l3_graph.entities.has(entityName)) {
             state.l3_graph.entities.set(entityName, {

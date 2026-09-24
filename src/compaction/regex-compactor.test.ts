@@ -127,6 +127,45 @@ describe('RegexCompactor', () => {
     expect(pairs).toContainEqual(['npm', 'pnpm']);
   });
 
+  it('extracts "use X instead of Y" without a correction keyword', async () => {
+    const state = await compactor.compact(
+      [
+        msg('1', 'user', 'Use Postgres instead of MySQL.'),
+        msg('2', 'user', 'Switch to pnpm rather than npm.'),
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    const pairs = state.tombstones.map((t) => [t.supersededContent, t.correctedValue]);
+    expect(pairs).toContainEqual(['MySQL', 'Postgres']);
+    expect(pairs).toContainEqual(['npm', 'pnpm']);
+    expect(state.tombstones.every((t) => t.supersededContent !== '' && !/^of\b/i.test(t.correctedValue ?? ''))).toBe(true);
+  });
+
+  it('records one tombstone when several patterns match the same correction', async () => {
+    const state = await compactor.compact(
+      [msg('1', 'user', 'Actually, use Postgres instead of MySQL.')],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    expect(state.tombstones.map((t) => [t.supersededContent, t.correctedValue])).toEqual([['MySQL', 'Postgres']]);
+  });
+
+  it('drops decision summaries a correction superseded', async () => {
+    const compacted = await compactor.compact(
+      [
+        msg('1', 'user', "Let's use MySQL for storage."),
+        msg('2', 'user', "Actually, we're using Postgres, not MySQL."),
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+    const state = await compactor.recompact(compacted, CompactionLevel.L3_GRAPH);
+
+    const stale = state.l2_summaries.filter((s) => /mysql/i.test(s.summary) && !/postgres/i.test(s.summary));
+    expect(stale).toEqual([]);
+    expect(state.l3_graph.entities.has('MySQL for storage')).toBe(false);
+  });
+
   it('treats punctuated and "lol"-prefixed acks as noise', async () => {
     const acks = ['Thanks!', 'thanks!!', 'ok!', 'great!', 'lol ok, great', 'haha thanks.'];
     const state = await compactor.compact(

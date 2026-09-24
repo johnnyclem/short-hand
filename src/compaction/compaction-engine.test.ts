@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { CompactionEngine } from './compaction-engine.js';
-import type { ConversationMessage } from '../types.js';
+import { CompactionLevel, type ConversationMessage } from '../types.js';
 import { ActiveEngramStore } from '../crdt/active-engram-store.js';
 
 function msg(id: string, role: 'user' | 'assistant', content: string): ConversationMessage {
@@ -125,6 +125,21 @@ describe('CompactionEngine', () => {
     expect(l1).toContain('Change the log budget to 100.');
     expect(l1).not.toContain('We decided to use MySQL');
     expect(l1).not.toContain('LOG_BUDGET = 30');
+  });
+
+  it('does not emit decision summaries a correction superseded', async () => {
+    const engine = new CompactionEngine({ memtableSize: 1 });
+    await engine.addMessages([
+      msg('1', 'user', "Let's use MySQL for storage."),
+      msg('2', 'user', "Actually, we're using Postgres, not MySQL."),
+      msg('3', 'user', 'Now write the migration scripts.'),
+    ]);
+    await engine.recompact(CompactionLevel.L3_GRAPH);
+
+    const frame = engine.buildContextFrame(5000);
+    const text = frame.sections.map((s) => s.content).join('\n');
+    expect(text).not.toContain('[Decision: MySQL');
+    expect(text).toContain('Postgres');
   });
 
   it('selects L1 by importance first, most recent first on ties', () => {
