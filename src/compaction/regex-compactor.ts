@@ -86,13 +86,28 @@ const DECISION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) =
   },
 ];
 
+/** "<new>, not <old>" / "<new> instead of <old>" / "<new> rather than <old>". */
+const REPLACEMENT_RE = /^(.+?)(?:,\s*not|,?\s+instead of|,?\s+rather than)\s+(.+)$/i;
+const LEADING_FILLER_RE = /^(?:we(?:'re| are) using|it(?:'s| is)|use|using)\s+/i;
+
+/** Split a correction's captured text into from/to when it names both sides. */
+function splitReplacement(text: string): { from?: string; to?: string } {
+  const m = text.trim().match(REPLACEMENT_RE);
+  if (!m) return {};
+  const from = m[2].trim();
+  let to = m[1].trim();
+  const stripped = to.replace(LEADING_FILLER_RE, '').trim();
+  if (stripped) to = stripped;
+  return from && to ? { from, to } : {};
+}
+
 const CORRECTION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch }> = [
   {
     regex: /(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead|scratch that|change that to)\s*[,:]?\s*(.+?)(?:\.|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
-      details: { correctedTo: m[1].trim() },
+      details: { correctedTo: m[1].trim(), ...splitReplacement(m[1]) },
     }),
   },
   {
@@ -131,11 +146,33 @@ const CONSTRAINT_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray)
 // Noise detection
 // ---------------------------------------------------------------------------
 
+const ACK = '(?:ok(?:ay)?|sure|thanks?|thank you|got it|sounds good|great|perfect|yes|no|right|exactly|yep|yup|nope)';
+
 const NOISE_PATTERNS = [
-  /^(?:ok(?:ay)?|sure|thanks?|thank you|got it|sounds good|great|perfect|yes|no|right|exactly|yep|yup|nope)\.?$/i,
+  // One or more bare acks, optionally led by "lol"/"haha": "Thanks!", "lol ok, great"
+  new RegExp(`^(?:(?:lol|haha)[,\\s]+)?${ACK}(?:[,\\s]+${ACK})*[.!]*$`, 'i'),
   /^(?:hi|hello|hey|good (?:morning|afternoon|evening))[\s!.]*$/i,
   /^(?:let me know|feel free|no worries|no problem)[\s.]*$/i,
 ];
+
+// ---------------------------------------------------------------------------
+// Supersession matching
+// ---------------------------------------------------------------------------
+
+/** Lowercase, treat _/- as spaces, drop a leading article: "the LOG_BUDGET" → "log budget". */
+function normalizeForMatch(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^(?:the|a|an)\s+/, '');
+}
+
+function wholeWordRe(phrase: string): RegExp {
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\w])${escaped}(?![\\w])`);
+}
 
 function isNoise(content: string): boolean {
   const trimmed = content.trim();
@@ -245,6 +282,9 @@ export class RegexCompactor implements Compactor {
         correctedValue: match.details.to ?? match.details.correctedTo,
       };
       state.tombstones.push(tombstone);
+      // Runs before this message's own L1 entry is pushed, so the
+      // correction itself is never pruned.
+      this.pruneSuperseded(tombstone, state);
     }
 
     // Handle decisions
@@ -348,14 +388,42 @@ export class RegexCompactor implements Compactor {
   }
 
   private findRelatedMessage(match: PatternMatch, state: CompactedState): string | undefined {
-    if (!match.details.from) return undefined;
-    const needle = match.details.from.toLowerCase();
-    for (const entry of state.l1_compacted) {
-      if (entry.compacted.toLowerCase().includes(needle)) {
-        return entry.originalMessageId;
+    const needle = normalizeForMatch(match.details.from ?? '');
+    if (!needle) return undefined;
+    const needleRe = wholeWordRe(needle);
+    const corrected = normalizeForMatch(match.details.to ?? '');
+    const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
+    // Most recent mention of the old value (and not the new one) is the
+    // statement being corrected
+    for (let i = state.l1_compacted.length - 1; i >= 0; i--) {
+      const text = normalizeForMatch(state.l1_compacted[i].compacted);
+      if (needleRe.test(text) && !correctedRe?.test(text)) {
+        return state.l1_compacted[i].originalMessageId;
       }
     }
     return undefined;
+  }
+
+  /**
+   * Drop L1 entries a tombstone supersedes so stale facts can't resurface
+   * in context frames or in L2 summaries built from L1. An entry goes if
+   * it is the tombstone's original message, or if it mentions the
+   * superseded value (whole word, case-insensitive) without also
+   * mentioning the corrected value.
+   */
+  private pruneSuperseded(tombstone: Tombstone, state: CompactedState): void {
+    const old = normalizeForMatch(tombstone.supersededContent);
+    if (!old) return;
+    const oldRe = wholeWordRe(old);
+    const corrected = normalizeForMatch(tombstone.correctedValue ?? '');
+    const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
+
+    state.l1_compacted = state.l1_compacted.filter((entry) => {
+      if (entry.originalMessageId === tombstone.correctionMessageId) return true;
+      if (entry.originalMessageId === tombstone.originalMessageId) return false;
+      const text = normalizeForMatch(entry.compacted);
+      return !(oldRe.test(text) && !correctedRe?.test(text));
+    });
   }
 
   private checkDecisionSupersession(decision: Decision, state: CompactedState): void {

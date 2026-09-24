@@ -101,4 +101,75 @@ describe('RegexCompactor', () => {
 
     expect(state.l3_graph.entities.size).toBeGreaterThan(0);
   });
+
+  it('extracts from/to for "X, not Y" corrections', async () => {
+    const state = await compactor.compact(
+      [msg('1', 'user', "Actually, we're using Postgres, not MySQL.")],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    const tombstone = state.tombstones.find((t) => t.supersededContent === 'MySQL');
+    expect(tombstone).toBeDefined();
+    expect(tombstone!.correctedValue).toBe('Postgres');
+  });
+
+  it('extracts from/to for "instead of" / "rather than" corrections', async () => {
+    const state = await compactor.compact(
+      [
+        msg('1', 'user', 'Correction: Redis instead of Memcached.'),
+        msg('2', 'user', 'Actually, use pnpm rather than npm.'),
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    const pairs = state.tombstones.map((t) => [t.supersededContent, t.correctedValue]);
+    expect(pairs).toContainEqual(['Memcached', 'Redis']);
+    expect(pairs).toContainEqual(['npm', 'pnpm']);
+  });
+
+  it('treats punctuated and "lol"-prefixed acks as noise', async () => {
+    const acks = ['Thanks!', 'thanks!!', 'ok!', 'great!', 'lol ok, great', 'haha thanks.'];
+    const state = await compactor.compact(
+      [
+        ...acks.map((a, i) => msg(`ack${i}`, 'user', a)),
+        msg('real1', 'user', 'use Postgres'),
+        msg('real2', 'user', 'ok, use Postgres'),
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['real1', 'real2']);
+  });
+
+  it('prunes L1 entries superseded by a correction', async () => {
+    const state = await compactor.compact(
+      [
+        msg('1', 'user', 'We decided to use MySQL for storage.', 1000),
+        msg('2', 'assistant', 'Got it, LOG_BUDGET = 30.', 2000),
+        msg('3', 'user', 'Compare MySQL and Postgres performance later.', 3000),
+        msg('4', 'user', 'Switch MySQL to Postgres.', 4000),
+        msg('5', 'user', 'Change the log budget to 100.', 5000),
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    const ids = state.l1_compacted.map((e) => e.originalMessageId);
+    // Stale MySQL and LOG_BUDGET lines are gone; the line that already
+    // names the corrected value and both corrections themselves stay
+    expect(ids).toEqual(['3', '4', '5']);
+    expect(state.tombstones.find((t) => t.key === 'MySQL')!.originalMessageId).toBe('1');
+  });
+
+  it('does not prune on a correction with no superseded value', async () => {
+    const state = await compactor.compact(
+      [
+        msg('1', 'user', 'We decided to use MySQL for storage.'),
+        msg('2', 'user', 'Wait, let me think about the schema first.'),
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    expect(state.tombstones.some((t) => t.supersededContent === '')).toBe(true);
+    expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['1', '2']);
+  });
 });
