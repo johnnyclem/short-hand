@@ -137,6 +137,8 @@ export class SourceIngester {
   private events: IngestionEvent[] = [];
   /** Last ingested version of each source, and the message ids it produced. */
   private versions = new Map<string, { version: string; messageIds: string[] }>();
+  /** The latest ingest queued per source: ingests of one source run one at a time, in call order. */
+  private pending = new Map<string, Promise<unknown>>();
 
   constructor(config: Partial<IngestionConfig> = {}) {
     this.config = { ...DEFAULT_INGESTION_CONFIG, ...config };
@@ -154,9 +156,23 @@ export class SourceIngester {
    * is a no-op (`skipped: true`); ingesting a new version of a source this
    * ingester has seen first retracts the previous version's chunks
    * (`CompactionEngine.retract`), so stale text does not stay live beside
-   * the update.
+   * the update. Ingests of one source run one at a time in call order (a
+   * file watcher firing twice), so each sees the version before it; other
+   * sources are not held up.
    */
   async ingest(source: Source, engine: CompactionEngine): Promise<IngestionEvent> {
+    const run = (this.pending.get(source.id) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.ingestNow(source, engine));
+    this.pending.set(source.id, run);
+    try {
+      return await run;
+    } finally {
+      if (this.pending.get(source.id) === run) this.pending.delete(source.id);
+    }
+  }
+
+  private async ingestNow(source: Source, engine: CompactionEngine): Promise<IngestionEvent> {
     const version = this.versionOf(source);
     const previous = this.versions.get(source.id);
     if (previous?.version === version) {

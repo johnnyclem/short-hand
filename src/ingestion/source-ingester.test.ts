@@ -257,5 +257,25 @@ describe('SourceIngester', () => {
       expect(live).not.toContain('helm rollback');
       expect(engine.getState().archive!.some((a) => a.reason === 'retracted')).toBe(true);
     });
+
+    it('overlapping ingests of one source run in call order, so the later version retracts the earlier (SH-R10)', async () => {
+      const ingester = new SourceIngester();
+      const engine = new CompactionEngine({ memtableSize: 0 });
+      const v1 = makeSource({ id: 'doc', content: 'The primary region is us-east-1.' });
+      const v2 = makeSource({ id: 'doc', content: 'The primary region is us-west-2.' });
+      const [first, second] = await Promise.all([ingester.ingest(v1, engine), ingester.ingest(v2, engine)]);
+      expect(first.retractedChunks).toBe(0);
+      expect(second.retractedChunks).toBe(1);
+      expect(engine.getState().l1_compacted.map((e) => e.compacted)).toEqual(['The primary region is us-west-2.']);
+
+      const again = await ingester.ingest(v2, engine);
+      expect(again).toMatchObject({ skipped: true, retractedChunks: 0 });
+      expect(engine.getState().l1_compacted.map((e) => e.compacted)).toEqual(['The primary region is us-west-2.']);
+
+      // Other sources are not held up behind it
+      const [, other] = await Promise.all([ingester.ingest(v1, engine), ingester.ingest(makeSource({ id: 'other', content: 'Unrelated.' }), engine)]);
+      expect(other.skipped).toBeUndefined();
+      expect(engine.getState().l1_compacted.map((e) => e.compacted).sort()).toEqual(['The primary region is us-east-1.', 'Unrelated.']);
+    });
   });
 });
