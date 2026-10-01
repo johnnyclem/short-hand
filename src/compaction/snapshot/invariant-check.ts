@@ -155,7 +155,7 @@ export const decisionCompleteness: CompactionInvariant = {
   id: 'INV-003',
   description:
     'All decisions from the original conversation must be present in ' +
-    'the compacted state.',
+    'the compacted summary.',
   category: 'decision_completeness',
 
   check(compacted, original): InvariantViolation | null {
@@ -175,15 +175,16 @@ export const decisionCompleteness: CompactionInvariant = {
 
     if (originalDecisions.length === 0) return null;
 
+    // Only the summary counts: it is what the downstream model receives.
+    // The structured decision list is extracted from the full history and
+    // would vouch for a summary that dropped every decision.
     const summaryLower = compacted.summary.toLowerCase();
-    const decisionDescriptions = compacted.decisions.map(d => d.description.toLowerCase());
 
     const missingDecisions: string[] = [];
     for (const od of originalDecisions) {
       const inSummary = summaryLower.includes(od.text.slice(0, 30));
-      const inDecisions = decisionDescriptions.some(d => d.includes(od.text.slice(0, 30)));
 
-      if (!inSummary && !inDecisions) {
+      if (!inSummary) {
         missingDecisions.push(`Decision "${od.text}" from message ${od.messageId}`);
       }
     }

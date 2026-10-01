@@ -195,3 +195,38 @@ describe('VerificationHarness', () => {
     expect(result.passed).toBe(false);
   });
 });
+
+describe('VerificationHarness — recall is scored on what the model sees (SAT-12)', () => {
+  const t = '2026-09-01T00:00:00Z';
+  const history = makeHistory([
+    makeMessage('m1', 'user', 'The database is postgres. We configured timeout to 30', { timestamp: t }),
+    makeMessage('m2', 'assistant', 'OK, decided to use connection pooling with pgbouncer.', { timestamp: t }),
+    makeMessage('m3', 'user', 'Actually, not postgres but sqlite, and we changed timeout to 60', { timestamp: t }),
+  ]);
+
+  it('fails a snapshot whose summary is empty even though its structured fields are full', async () => {
+    const real = await new DefaultCompactor().compact(history, 'L3');
+    const gutted = { ...real, summary: '', compactedTokenCount: 0 };
+    const harness = new VerificationHarness({ strategies: { recallTest: true, invariantCheck: false, informationTheoretic: false } });
+
+    expect(harness.verify(real, history).recallTest!.recallScore).toBeGreaterThan(0);
+    const result = harness.verify(gutted, history);
+    expect(result.recallTest!.recallScore).toBe(0);
+    expect(result.passed).toBe(false);
+  });
+
+  it('reports decisions missing from the summary even when the structured list carries them', async () => {
+    const real = await new DefaultCompactor().compact(history, 'L3');
+    const gutted = { ...real, summary: '', compactedTokenCount: 0 };
+    const result = new VerificationHarness().verify(gutted, history);
+    expect(result.invariantCheck!.violations.some((v) => v.invariantId === 'INV-003')).toBe(true);
+  });
+
+  it('derives the entities to retain from the history, not from the snapshot', async () => {
+    const real = await new DefaultCompactor().compact(history, 'L3');
+    const gutted = { ...real, summary: '', compactedTokenCount: 0, entities: [] };
+    const result = new VerificationHarness().verify(gutted, history);
+    expect(result.informationTheoretic!.entityRetention.length).toBeGreaterThan(0);
+    expect(result.informationTheoretic!.entityRetention.every((e) => !e.retained)).toBe(true);
+  });
+});

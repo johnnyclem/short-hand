@@ -28,6 +28,7 @@ import type {
   InformationTheoreticResult,
   RateDistortionMetrics,
 } from './types.js';
+import { extractEntities } from './compactor.js';
 
 // ---------------------------------------------------------------------------
 // Tokenization (simple whitespace + punctuation splitter)
@@ -180,7 +181,12 @@ export function computeRateDistortion(
 // Entity retention analysis
 // ---------------------------------------------------------------------------
 
-/** Measure per-entity information retention. */
+/**
+ * Measure per-entity information retention. The entities to retain are
+ * extracted from the original history — never taken from the snapshot,
+ * whose entity list a compactor could simply leave empty — and each one
+ * counts as retained only if the summary names it or its value.
+ */
 export function measureEntityRetention(
   compactedState: CompactedSnapshot,
   original: ConversationHistory,
@@ -188,7 +194,7 @@ export function measureEntityRetention(
   const results: EntityRetention[] = [];
   const summaryLower = compactedState.summary.toLowerCase();
 
-  for (const entity of compactedState.entities) {
+  for (const entity of extractEntities(original.messages)) {
     const namePresent = summaryLower.includes(entity.name.toLowerCase());
     const valuePresent = summaryLower.includes(String(entity.value).toLowerCase());
 

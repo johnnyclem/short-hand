@@ -156,9 +156,9 @@ describe('DefaultQuizEvaluator', () => {
     expect(answer.failureMode).toBe('missing');
   });
 
-  it('checks structured entities as fallback', async () => {
+  it('finds entity names the L2 summary renders', async () => {
     const state = await compactor.compact(richConversation, 'L2');
-    // Create a question whose answer matches an entity name
+    // Create a question whose answer matches an entity name (L2 lists them)
     const entityNames = state.entities.map(e => e.name);
     if (entityNames.length > 0) {
       const question = {
@@ -234,5 +234,23 @@ describe('runRecallTest', () => {
     // No questions generated → perfect recall by default
     expect(result.recallScore).toBe(1);
     expect(result.questions).toHaveLength(0);
+  });
+});
+
+describe('DefaultQuizEvaluator scores the summary only (SAT-12)', () => {
+  it('does not credit an entity that only the structured fields still hold', async () => {
+    const compactor = new DefaultCompactor();
+    const state = await compactor.compact(richConversation, 'L2');
+    const name = state.entities[0].name;
+    const question = {
+      id: 'sat12',
+      question: `What about ${name}?`,
+      groundTruth: name,
+      sourceMessageIds: ['m1'],
+      category: 'entity' as const,
+      difficulty: 'easy' as const,
+    };
+    const answer = new DefaultQuizEvaluator().evaluate(question, { ...state, summary: 'Nothing survived.' });
+    expect(answer.correct).toBe(false);
   });
 });

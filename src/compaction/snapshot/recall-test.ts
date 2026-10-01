@@ -289,6 +289,14 @@ function findAnswerInSummary(
 // DefaultQuizEvaluator
 // ---------------------------------------------------------------------------
 
+/**
+ * Answers each question from the snapshot's `summary` alone — the text the
+ * downstream model actually receives (truth section included, when one was
+ * applied). The structured `entities` / `decisions` fields are not
+ * consulted: they are extracted from the full history and carried through
+ * recompaction unchanged, so crediting them would pass a compactor whose
+ * summary dropped the facts.
+ */
 export class DefaultQuizEvaluator implements QuizEvaluator {
   evaluate(
     question: RecallQuestion,
@@ -305,36 +313,6 @@ export class DefaultQuizEvaluator implements QuizEvaluator {
         answer: extractedAnswer,
         correct: true,
         confidence,
-      };
-    }
-
-    // Check entities and decisions as structured fallback
-    const entityMatch = compactedState.entities.some(e => {
-      const truthNorm = normalize(question.groundTruth);
-      return normalize(e.name).includes(truthNorm) ||
-        normalize(String(e.value)).includes(truthNorm) ||
-        truthNorm.includes(normalize(e.name));
-    });
-
-    if (entityMatch) {
-      return {
-        questionId: question.id,
-        answer: 'Found in structured entities',
-        correct: true,
-        confidence: 0.7,
-      };
-    }
-
-    const decisionMatch = compactedState.decisions.some(d =>
-      normalize(d.description).includes(normalize(question.groundTruth).slice(0, 30)),
-    );
-
-    if (decisionMatch) {
-      return {
-        questionId: question.id,
-        answer: 'Found in structured decisions',
-        correct: true,
-        confidence: 0.7,
       };
     }
 
