@@ -15,21 +15,114 @@
 import type { CodeSpan, CompactedEntry, ContextFrame } from '../types.js';
 import { estimateTokens } from '../utils.js';
 
-/**
- * Frozen truth markers, escaped wherever they appear in untrusted text —
- * including look-alikes a model would read the same way: a full-width
- * bracket or letters (`［ＴＢ］`), or invisible code points before the
- * letters. A `[` that is already escaped is left alone, so escaping twice
- * changes nothing.
- */
-const FROZEN_MARKER_RE = /(?<!\\)[[［](?=[\s\p{Default_Ignorable_Code_Point}]*(?:TB|UV|ＴＢ|ＵＶ)(?![\p{L}\p{N}_]))/gu;
+// Markers are matched as a model reads them, not byte for byte: on a folded
+// copy of the text after a bracket (NFKC, marks and default-ignorable code
+// points dropped, lower case, Cyrillic/Greek/… homoglyphs mapped to Latin).
+// The `\` goes in front of the original bracket, so the text itself is
+// otherwise left byte for byte.
 
+/** Code points whose NFKC form is `[`: `[`, vertical `﹇`, full-width `［`. */
+const OPEN_BRACKETS = new Set(['[', '\uFE47', '\uFF3B']);
+/** Code points whose NFKC form is `#`: `#`, small `﹟`, full-width `＃`. */
+const HASHES = new Set(['#', '\uFE5F', '\uFF03']);
+
+/** Letters of other scripts a model reads as Latin T, B, U or V (from Unicode's confusables). */
+const HOMOGLYPHS: Record<string, string> = {
+  // T: Cyrillic Те, Greek tau, Cherokee, Lisu, small capital
+  '\u0422': 't', '\u0442': 't', '\u03A4': 't', '\u03C4': 't', '\u13A2': 't', '\uA4D4': 't', '\u1D1B': 't',
+  // B: Cyrillic Ve and soft sign, Greek beta, Cherokee, Lisu, small capital
+  '\u0412': 'b', '\u0432': 'b', '\u042C': 'b', '\u044C': 'b', '\u0392': 'b', '\u03B2': 'b', '\u13F4': 'b', '\uA4D0': 'b', '\u0299': 'b',
+  // U: Armenian Seh, Greek upsilon, Lisu, small capital
+  '\u054D': 'u', '\u057D': 'u', '\u03C5': 'u', '\uA4F4': 'u', '\u1D1C': 'u',
+  // V: Cyrillic izhitsa, Greek nu, Cherokee, Lisu, small capital
+  '\u0474': 'v', '\u0475': 'v', '\u03BD': 'v', '\u13D9': 'v', '\uA4E6': 'v', '\u1D20': 'v',
+};
+
+const IGNORABLE_RE = /\p{Default_Ignorable_Code_Point}/u;
+const SPACE_RE = /\s/u;
+const LINE_BREAKS = new Set(['\n', '\r', '\u2028', '\u2029']);
+/** What may come before a section marker or heading on its line: indentation, quote and list marks, invisible code points. */
+const LINE_PREFIX_RE = /^[ \t>*+\-\p{Zs}\p{Default_Ignorable_Code_Point}]$/u;
+
+/** Frozen truth markers (`[TB…`, `[UV…`), escaped anywhere. `[TBD]` is a word, not a marker. */
+const FROZEN_RE = /^(?:tb|uv)(?![\p{L}\p{N}_])/u;
 /** Section markers, escaped when untrusted text puts them at a line start. */
-const LINE_MARKER_RE =
-  /^([ \t>*+-]*)\[(?=[ \t]*(?:truth|correction|invariant|memory|code|entity|edge|summary|history|recent)\b)/gim;
+const SECTION_RE = /^(?:truth|correction|invariant|memory|code|entity|edge|summary|history|recent)(?![\p{L}\p{N}_])/u;
+/** The truth-section heading (after its `#`s), escaped when untrusted text reproduces it. */
+const TRUTH_HEADING_RE = /^asserted truth(?![\p{L}\p{N}_])/u;
+/** Folded characters a check needs: a frozen marker and its next character, the longest section marker or heading and its. */
+const FROZEN_AHEAD = 3;
+const LINE_AHEAD = 15;
 
-/** The truth-section heading, escaped when untrusted text reproduces it. */
-const TRUTH_HEADING_RE = /^([ \t]*)(#{1,6}[ \t]*Asserted Truth\b)/gim;
+function fold(ch: string): string {
+  if (ch < '\u0080') return ch.toLowerCase();
+  const mapped = HOMOGLYPHS[ch];
+  if (mapped) return mapped;
+  const plain = ch.normalize('NFKD').replace(/\p{M}/gu, '').normalize('NFKC').toLowerCase();
+  return plain.length === 1 ? (HOMOGLYPHS[plain] ?? plain) : plain;
+}
+
+/**
+ * The text from `start`, folded, up to `max` characters: leading
+ * whitespace and every default-ignorable code point and mark are dropped,
+ * and inner whitespace runs read as one space.
+ */
+function foldAhead(text: string, start: number, max: number): string {
+  let out = '';
+  for (let i = start; i < text.length && out.length < max; ) {
+    const ch = String.fromCodePoint(text.codePointAt(i)!);
+    i += ch.length;
+    // ASCII punctuation and digits never start a marker: the common case (`[1,`, `[{`, `["`) ends here
+    if (out.length === 0 && ch < '\u0080' && !/[A-Za-z\s]/.test(ch)) return ch;
+    if (SPACE_RE.test(ch)) {
+      if (out.length > 0 && !out.endsWith(' ')) out += ' ';
+    } else if (!IGNORABLE_RE.test(ch)) {
+      out += fold(ch);
+    }
+  }
+  return out;
+}
+
+/** After a run of 1–6 `#`s at `start` (and spaces), does the line reproduce the truth heading? */
+function isTruthHeading(text: string, start: number): boolean {
+  let i = start;
+  while (i < text.length && HASHES.has(text[i]) && i - start <= 6) i++;
+  return i - start <= 6 && TRUTH_HEADING_RE.test(foldAhead(text, i, LINE_AHEAD));
+}
+
+/**
+ * Put a `\` in front of every frozen truth marker and, unless
+ * `frozenOnly`, every section marker or truth heading at a line start.
+ * One pass; a bracket or `#` already preceded by `\` is left alone.
+ */
+function escapeMarkers(text: string, frozenOnly: boolean): string {
+  let out = '';
+  let last = 0;
+  let lineStart = true; // only line-prefix characters since the last line break
+  let prev = '';
+  for (let i = 0; i < text.length; ) {
+    const ch = String.fromCodePoint(text.codePointAt(i)!);
+    if (prev !== '\\') {
+      let marker = false;
+      if (OPEN_BRACKETS.has(ch)) {
+        const atLineStart = !frozenOnly && lineStart;
+        const ahead = foldAhead(text, i + ch.length, atLineStart ? LINE_AHEAD : FROZEN_AHEAD);
+        marker = FROZEN_RE.test(ahead) || (atLineStart && SECTION_RE.test(ahead));
+      } else if (!frozenOnly && lineStart && HASHES.has(ch)) {
+        marker = isTruthHeading(text, i);
+      }
+      if (marker) {
+        out += text.slice(last, i) + '\\';
+        last = i;
+      }
+    }
+    if (LINE_BREAKS.has(ch)) lineStart = true;
+    else if (lineStart && !LINE_PREFIX_RE.test(ch)) lineStart = false;
+    prev = ch;
+    i += ch.length;
+  }
+  return out + text.slice(last);
+}
 
 /** Fenced code blocks: inside them only the frozen markers are escaped. */
 const FENCE_RE = /```[\s\S]*?```/g;
@@ -43,49 +136,53 @@ export interface EscapeOptions {
   singleLine?: boolean;
 }
 
-function escapeProse(text: string): string {
-  return text
-    .replace(FROZEN_MARKER_RE, '\\$&')
-    .replace(LINE_MARKER_RE, '$1\\[')
-    .replace(TRUTH_HEADING_RE, '$1\\$2');
-}
-
 /**
  * Neutralize marker syntax in untrusted text: a `\` goes in front of any
  * frozen truth marker (`[TB…`, `[UV…`, anywhere), any section marker at a
- * line start, and a reproduced truth heading. Inside fenced code blocks
- * only the frozen markers are escaped, so code (an INI `[memory]` section,
- * a `# Asserted Truth` comment) keeps its text. Everything else is left
- * byte-for-byte. Idempotent: escaped text passes through unchanged.
+ * line start, and a reproduced `## Asserted Truth` heading. Markers are
+ * matched as a model would read them: a bracket whose NFKC form is `[`
+ * (`［`, `﹇`), letters in any case, width or script look-alike
+ * (`[ｔB]`, Cyrillic `[ТВ]`), with invisible code points or combining
+ * marks anywhere in them, and a line start behind indentation, quote or
+ * list marks, non-breaking spaces or invisible code points. Inside fenced
+ * code blocks only the frozen markers are escaped, so code (an INI
+ * `[memory]` section, a `# Asserted Truth` comment) keeps its text.
+ * Everything else is left byte-for-byte. Idempotent: escaped text passes
+ * through unchanged.
  */
 export function escapeUntrusted(text: string, options: EscapeOptions = {}): string {
   if (options.singleLine) {
-    return escapeProse(text.replace(/[ \t]*(?:\r\n|[\r\n\u2028\u2029])+[ \t]*/g, ' '));
+    return escapeMarkers(text.replace(/[ \t]*(?:\r\n|[\r\n\u2028\u2029])+[ \t]*/g, ' '), false);
   }
   let out = '';
   let last = 0;
   for (const fence of text.matchAll(FENCE_RE)) {
-    out += escapeProse(text.slice(last, fence.index));
-    out += fence[0].replace(FROZEN_MARKER_RE, '\\$&');
+    out += escapeMarkers(text.slice(last, fence.index), false);
+    out += escapeMarkers(fence[0], true);
     last = fence.index! + fence[0].length;
   }
-  return out + escapeProse(text.slice(last));
+  return out + escapeMarkers(text.slice(last), false);
 }
 
 /**
  * Escape untrusted text for a markdown page (the wiki renderer): a `\` goes
- * before `\`, `[` and `]`, so text can never open a link or an image, and
- * `<` / `>` become `&lt;` / `&gt;`, so it can never be raw HTML. `inline`
+ * before `\`, `[` and `]`, so text can never open a link or an image;
+ * `&`, `<` and `>` become `&amp;`, `&lt;` and `&gt;`, so it can never be
+ * raw HTML or an entity (`&#91;TB&#93;` that renders as `[TB]`). `inline`
  * collapses line breaks (a label, a list item); otherwise a line-start `#`
- * is escaped so text can't open a heading. The frozen truth markers and the
- * truth heading are escaped as `escapeUntrusted` escapes them.
+ * and a line of only `=` or `-` (a setext underline) are escaped so text
+ * can't make a heading. The frozen truth markers and the truth heading are
+ * escaped as `escapeUntrusted` escapes them.
  */
 export function escapeMarkdown(text: string, options: { inline?: boolean } = {}): string {
   let out = String(text)
     .replace(/[\\[\]]/g, (c) => `\\${c}`)
+    .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
-  if (!options.inline) out = out.replace(/^([ \t]*)(#{1,6}(?:[ \t]|$))/gm, '$1\\$2');
+  if (!options.inline) {
+    out = out.replace(/^([ \t]*)(#{1,6}(?:[ \t]|$))/gm, '$1\\$2').replace(/^([ \t]*)(=+|-+)([ \t]*)$/gm, '$1\\$2$3');
+  }
   return escapeUntrusted(out, { singleLine: options.inline });
 }
 

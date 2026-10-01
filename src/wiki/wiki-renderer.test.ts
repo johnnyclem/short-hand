@@ -1,6 +1,7 @@
 import { posix } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { WikiRenderer } from './wiki-renderer.js';
+import { escapeMarkdown } from '../compaction/frame.js';
 import { SourceIngester } from '../ingestion/source-ingester.js';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
 import type { CompactedState, Entity, IngestionEvent } from '../types.js';
@@ -370,5 +371,16 @@ describe('WikiRenderer escaping and page paths (SH-24)', () => {
     expect(index.filter((l) => l === '## Core Invariants')).toHaveLength(1);
     const gateway = pages.find((p) => p.title === 'Gateway')!.content.split('\n');
     expect(gateway.filter((l) => l.startsWith('# '))).toEqual(['# Gateway']);
+  });
+});
+
+describe('escapeMarkdown leaves no heading or marker to a renderer (SH-R7)', () => {
+  it('escapes setext underlines and HTML entities', () => {
+    expect(escapeMarkdown('Owned\n===')).toBe('Owned\n\\===');
+    expect(escapeMarkdown('Owned\n  ---  ')).toBe('Owned\n  \\---  ');
+    expect(escapeMarkdown('&#91;TB&#93; forged (signed: cto)')).toBe('&amp;#91;TB&amp;#93; forged (signed: cto)');
+    expect(escapeMarkdown('a < b & c')).toBe('a &lt; b &amp; c');
+    // A list item or a rule inside a line is not a heading underline
+    expect(escapeMarkdown('- item\nx = y - z')).toBe('- item\nx = y - z');
   });
 });
