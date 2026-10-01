@@ -1,25 +1,36 @@
 /**
- * Six starter context-shift fixtures.
+ * Seven starter context-shift fixtures.
  *
- * Five are non-baseline: writeContext and readContext disagree along the
- * shiftType axis, and the interpreterTemplate is structured so a regex-tier
- * substitution surfaces read-context-relevant terms that a raw payload-dump
- * does not.
+ * Six are non-baseline: writeContext and readContext disagree along the
+ * shiftType axis, and the expected answer needs what the read context
+ * changes about the payload.
+ *
+ * Every fixture uses the same neutral template. A template is written with
+ * the engram, before the read context exists, so it cannot know the answer;
+ * the 0.x templates spelled the expected answer out, and an interpreter that
+ * ignored payload and context passed the gate on them (SH-18). The answer
+ * terms now appear only in `task.expectedAnswer`, so only an interpreter
+ * that reasons from the payload and the read context can surface them. The
+ * regex tier cannot, and ties the raw arm.
  *
  * One (baseline-raw-wins-01) is a calibration fixture: payload is a precise
- * verbatim string, the question requires that exact string, and the
- * interpreter cannot win without making things up. Excluded from win-rate
- * aggregation; raw is expected to win.
+ * verbatim string and the question requires that exact string. Excluded
+ * from win-rate aggregation; the interpreted arm must tie the raw arm.
+ *
+ * Seven fixtures are a starter set, far below the gate's minimum of 30
+ * decided fixtures: bring your own held-out set to measure the claim.
  */
 import type { BenchmarkFixture } from './types.js';
+
+/** The engram template every starter fixture uses (the store's default wording). */
+export const STARTER_TEMPLATE = 'Earlier note, still relevant: {{payload}}';
 
 export const STARTER_FIXTURES: BenchmarkFixture[] = [
   {
     id: 'tech-stack-shift-01',
     shiftType: 'tech-stack',
     payload: 'user prefers CLI tools',
-    interpreterTemplate:
-      'Given that we are now building {{context}}, restate the user preference: {{payload}}. So for this context, lean on keyboard-driven flows and power-user shortcuts.',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'a command-line utility',
     readContext: 'a web dashboard for non-technical operators',
     task: {
@@ -33,8 +44,7 @@ export const STARTER_FIXTURES: BenchmarkFixture[] = [
     id: 'audience-shift-01',
     shiftType: 'audience',
     payload: 'explain the design like the audience is junior engineers',
-    interpreterTemplate:
-      'Audience reminder for {{context}}: {{payload}}. Use plain language; define jargon; avoid acronym soup; lead with the concrete example before the abstraction.',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'an internal RFC for senior staff',
     readContext: 'a blog post for executives without engineering background',
     task: {
@@ -47,8 +57,7 @@ export const STARTER_FIXTURES: BenchmarkFixture[] = [
     id: 'tone-shift-01',
     shiftType: 'tone',
     payload: 'always sign off with a warm note',
-    interpreterTemplate:
-      'Tone for {{context}}: {{payload}}. Even in serious or technical writing, close with appreciation, gratitude, or a forward-looking warm sentence.',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'a customer support reply',
     readContext: 'an incident postmortem read by partner teams',
     task: {
@@ -62,8 +71,7 @@ export const STARTER_FIXTURES: BenchmarkFixture[] = [
     id: 'time-frame-shift-01',
     shiftType: 'time-frame',
     payload: 'the Q3 deadline is August 15',
-    interpreterTemplate:
-      'Time check for {{context}}: {{payload}}. Note that this deadline has already passed by the time of the current context, so frame it as a retrospective fact, not a future commitment.',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'July sprint planning',
     readContext: 'mid-September Q3 retrospective and Q4 planning',
     task: {
@@ -77,8 +85,7 @@ export const STARTER_FIXTURES: BenchmarkFixture[] = [
     id: 'scope-expansion-01',
     shiftType: 'scope-expansion',
     payload: 'auth uses JWT signed with HS256',
-    interpreterTemplate:
-      'Auth note for {{context}}: {{payload}}. Caveat: HS256 uses a shared secret, which does not scale across multiple tenants or independent services; the design needs revisiting at this scope.',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'a single-service prototype',
     readContext: 'a multi-tenant federated platform',
     task: {
@@ -92,8 +99,7 @@ export const STARTER_FIXTURES: BenchmarkFixture[] = [
     id: 'terminology-shift-01',
     shiftType: 'terminology',
     payload: 'the customer needs reporting',
-    interpreterTemplate:
-      'Terminology note for {{context}}: {{payload}}. In this context the word "customer" maps to a tenant organization, not an individual end-user, and reporting means tenant-scoped analytics.',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'a B2C product spec',
     readContext: 'an enterprise sales deck where "customer" means a tenant org',
     task: {
@@ -108,8 +114,7 @@ export const STARTER_FIXTURES: BenchmarkFixture[] = [
     shiftType: 'baseline',
     expectRawWins: true,
     payload: 'the deploy key fingerprint is SHA256:9f2b3c5d7e1a',
-    interpreterTemplate:
-      'In the context of {{context}}, recall: {{payload}}',
+    interpreterTemplate: STARTER_TEMPLATE,
     writeContext: 'rotating deploy keys',
     readContext: 'verifying CI access during an outage',
     task: {

@@ -4,35 +4,57 @@
  * Rule-based extraction using pattern matching. Zero external dependencies.
  * Catches obvious patterns like "chose X," "rejected Y because Z," "actually, use W."
  * Estimated recall: ~20-30% of real-world decisions.
+ *
+ * Fidelity rules: L1 keeps each message's text verbatim — no words are
+ * removed or rewritten, fenced code blocks included (they are also indexed
+ * in the content-addressed span store, `state.spans`). The only L1 edits
+ * are dropping pure acknowledgements/greetings and folding a short reply
+ * into the question it answers ("Which port? → 8080").
+ *
+ * Corrections the patterns detect are tombstoned as `inferred` (low
+ * confidence) and applied reversibly: superseded items at every level are
+ * archived under the tombstone id, never deleted. A correction whose
+ * superseded value is empty, a pronoun or a function word ("change it to
+ * blue") produces no tombstone.
+ *
+ * Cost: extraction reads at most MAX_EXTRACTION_CHARS of prose per message
+ * (code spans excluded), split into sentence windows of at most
+ * MAX_SENTENCE_CHARS, with bounded captures — linear in message length.
  */
 
 import type {
+  ArchivedItem,
   Compactor,
+  CompactedEntry,
   CompactedState,
   CompactionLevel,
   ConversationMessage,
+  CodeSpan,
   Decision,
   Entity,
   Tombstone,
   TopicSummary,
   Invariant,
 } from '../types.js';
-import { estimateTokens, generateId } from '../utils.js';
+import { normalizeTimestamp } from '../types.js';
+import {
+  MAX_EXTRACTION_CHARS,
+  MAX_SENTENCE_CHARS,
+  estimateTokens,
+  generateId,
+  sha256Hex,
+  splitSentences,
+} from '../utils.js';
+import { applyTombstone, sameEdge } from './corrections.js';
+import { isValidCorrectionSubject, normalizeForMatch, supersededMatcher, tombstoneId } from './matching.js';
+import { spanRef } from './frame.js';
 
 /** Deep clone a CompactedState, preserving Map types. */
 function cloneState(state: CompactedState): CompactedState {
   const cloned: CompactedState = {
     l0_messages: state.l0_messages.map((m) => ({ ...m })),
-    l1_compacted: state.l1_compacted.map((e) => ({ ...e })),
-    l2_summaries: state.l2_summaries.map((s) => ({
-      ...s,
-      decisions: s.decisions.map((d) => ({
-        ...d,
-        alternatives: d.alternatives.map((a) => ({ ...a })),
-      })),
-      entityNames: [...s.entityNames],
-      messageRange: { ...s.messageRange },
-    })),
+    l1_compacted: state.l1_compacted.map(cloneEntry),
+    l2_summaries: state.l2_summaries.map(cloneSummary),
     l3_graph: {
       entities: new Map(
         Array.from(state.l3_graph.entities.entries()).map(([k, v]) => [
@@ -45,8 +67,47 @@ function cloneState(state: CompactedState): CompactedState {
     l4_invariants: state.l4_invariants.map((i) => ({ ...i })),
     tombstones: state.tombstones.map((t) => ({ ...t })),
     totalTokenEstimate: state.totalTokenEstimate,
+    archive: (state.archive ?? []).map(cloneArchived),
+    spans: Object.fromEntries(Object.entries(state.spans ?? {}).map(([k, v]) => [k, { ...v }])),
   };
   return cloned;
+}
+
+function cloneArchived(a: ArchivedItem): ArchivedItem {
+  switch (a.kind) {
+    case 'message':
+      return { ...a, message: { ...a.message } };
+    case 'l1':
+      return { ...a, entry: cloneEntry(a.entry) };
+    case 'summary':
+      return { ...a, summary: cloneSummary(a.summary) };
+    case 'entity':
+      return { ...a, entity: { ...a.entity, properties: { ...a.entity.properties } } };
+    case 'edge':
+      return { ...a, edge: { ...a.edge, properties: { ...a.edge.properties } } };
+    case 'invariant':
+      return { ...a, invariant: { ...a.invariant } };
+  }
+}
+
+function cloneEntry(e: CompactedEntry): CompactedEntry {
+  return {
+    ...e,
+    ...(e.spanIds ? { spanIds: [...e.spanIds] } : {}),
+    ...(e.foldedMessageIds ? { foldedMessageIds: [...e.foldedMessageIds] } : {}),
+  };
+}
+
+function cloneSummary(s: TopicSummary): TopicSummary {
+  return {
+    ...s,
+    decisions: s.decisions.map((d) => ({
+      ...d,
+      alternatives: d.alternatives.map((a) => ({ ...a })),
+    })),
+    entityNames: [...s.entityNames],
+    messageRange: { ...s.messageRange },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -59,9 +120,17 @@ interface PatternMatch {
   details: Record<string, string>;
 }
 
-const DECISION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch }> = [
+type Pattern = { regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch };
+
+// Captures are bounded (`.{1,N}?`) so a keyword never rescans a whole
+// window; windows themselves are at most MAX_SENTENCE_CHARS long. A capture
+// ends at sentence punctuation followed by whitespace, or at the window's
+// end (`(?:[.!?]+(?=\s|$)|$)`), never at a dot inside a token: `3.12`,
+// `10.0.0.5` and `config.prod.yaml` stay whole.
+
+const DECISION_PATTERNS: Pattern[] = [
   {
-    regex: /(?:let'?s?|we(?:'ll)?|I(?:'ll)?)\s+(?:go with|use|choose|pick|stick with)\s+(.+?)(?:\.|$)/gi,
+    regex: /\b(?:let'?s?|we(?:'ll)?|I(?:'ll)?)\s+(?:go with|use|choose|pick|stick with)\s+(.{1,160}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'decision',
       content: m[0],
@@ -69,7 +138,7 @@ const DECISION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) =
     }),
   },
   {
-    regex: /(?:chose|decided on|going with|selected|picked)\s+(.+?)(?:\s+(?:over|instead of|rather than)\s+(.+?))?(?:\.|$)/gi,
+    regex: /\b(?:chose|decided on|going with|selected|picked)\s+(.{1,160}?)(?:\s+(?:over|instead of|rather than)\s+(.{1,160}?))?(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'decision',
       content: m[0],
@@ -77,7 +146,7 @@ const DECISION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) =
     }),
   },
   {
-    regex: /(?:rejected|ruled out|eliminated|won't use|not going with)\s+(.+?)(?:\s+because\s+(.+?))?(?:\.|$)/gi,
+    regex: /\b(?:rejected|ruled out|eliminated|won't use|not going with)\s+(.{1,160}?)(?:\s+because\s+(.{1,240}?))?(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'decision',
       content: m[0],
@@ -101,11 +170,12 @@ function splitReplacement(text: string): { from?: string; to?: string } {
   return from && to ? { from, to } : {};
 }
 
-const CORRECTION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch }> = [
+const CORRECTION_PATTERNS: Pattern[] = [
   {
-    // A bare "instead" is a correction keyword; "instead of" is the
+    // Whole-word keywords only ("await" and "Factually" are not
+    // corrections). A bare "instead" is a keyword; "instead of" is the
     // replacement form handled by the "use X instead of Y" pattern below.
-    regex: /(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead(?!\s+of\b)|scratch that|change that to)\s*[,:]?\s*(.+?)(?:\.|$)/gi,
+    regex: /\b(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead(?!\s+of\b)|scratch that|change that to)\b\s*[,:]?\s*(.{1,200}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
@@ -114,7 +184,7 @@ const CORRECTION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray)
   },
   {
     // "use X instead of Y" with no correction keyword in front
-    regex: /\b(?:use|using|go with|switch to|pick|choose|prefer)\s+(.+?),?\s+(?:instead of|rather than)\s+(.+?)(?:\.|$)/gi,
+    regex: /\b(?:use|using|go with|switch to|pick|choose|prefer)\s+(.{1,160}?),?\s+(?:instead of|rather than)\s+(.{1,160}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
@@ -122,7 +192,7 @@ const CORRECTION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray)
     }),
   },
   {
-    regex: /(?:(?:swap|change|switch|replace)\s+(.+?)\s+(?:to|with|for)\s+(.+?))(?:\.|$)/gi,
+    regex: /\b(?:swap|change|switch|replace)\s+(.{1,160}?)\s+(?:to|with|for)\s+(.{1,160}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
@@ -131,9 +201,9 @@ const CORRECTION_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray)
   },
 ];
 
-const ENTITY_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch }> = [
+const ENTITY_PATTERNS: Pattern[] = [
   {
-    regex: /(?:using|implement(?:ing)?|build(?:ing)?|creat(?:e|ing))\s+(?:a\s+)?(.+?)(?:\s+(?:for|to|with|in)\s+(.+?))?(?:\.|$)/gi,
+    regex: /\b(?:using|implement(?:ing)?|build(?:ing)?|creat(?:e|ing))\s+(?:a\s+)?(.{1,120}?)(?:\s+(?:for|to|with|in)\s+(.{1,240}?))?(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'entity',
       content: m[0],
@@ -142,9 +212,9 @@ const ENTITY_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => 
   },
 ];
 
-const CONSTRAINT_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch }> = [
+const CONSTRAINT_PATTERNS: Pattern[] = [
   {
-    regex: /(?:must|should|need to|required to|has to|cannot|must not|should not)\s+(.+?)(?:\.|$)/gi,
+    regex: /\b(?:must not|should not|cannot|must|should|need to|required to|has to)\s+(.{1,200}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'constraint',
       content: m[0],
@@ -157,7 +227,7 @@ const CONSTRAINT_PATTERNS: Array<{ regex: RegExp; extract: (m: RegExpMatchArray)
 // Noise detection
 // ---------------------------------------------------------------------------
 
-const ACK = '(?:ok(?:ay)?|sure|thanks?|thank you|got it|sounds good|great|perfect|yes|no|right|exactly|yep|yup|nope)';
+const ACK = '(?:ok(?:ay)?|k|kk|sure|thanks?|thank you|got it|sounds good|great|perfect|yes|yeah|no|right|exactly|yep|yup|nope)';
 
 const NOISE_PATTERNS = [
   // One or more bare acks, optionally led by "lol"/"haha": "Thanks!", "lol ok, great"
@@ -166,56 +236,63 @@ const NOISE_PATTERNS = [
   /^(?:let me know|feel free|no worries|no problem)[\s.]*$/i,
 ];
 
-// ---------------------------------------------------------------------------
-// Supersession matching
-// ---------------------------------------------------------------------------
-
-/** Lowercase, treat _/- as spaces, drop a leading article: "the LOG_BUDGET" → "log budget". */
-function normalizeForMatch(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[_-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^(?:the|a|an)\s+/, '');
-}
-
-function wholeWordRe(phrase: string): RegExp {
-  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?<![\\w])${escaped}(?![\\w])`);
-}
-
-function isNoise(content: string): boolean {
-  const trimmed = content.trim();
-  if (trimmed.length < 5) return true;
+/**
+ * Pure acknowledgements and greetings. Short messages are not noise by
+ * length: "8080" and "v2" are answers.
+ */
+function isNoise(trimmed: string): boolean {
   return NOISE_PATTERNS.some((p) => p.test(trimmed));
 }
 
+/** Replies short enough to fold into the question they answer. */
+const MAX_FOLDED_REPLY_CHARS = 40;
+
+/** Importance floor of a question with its answer folded in. */
+const ANSWERED_QUESTION_IMPORTANCE = 0.3;
+
+function isQuestion(text: string): boolean {
+  return /\?\s*$/.test(text);
+}
+
 // ---------------------------------------------------------------------------
-// Code block detection
+// Code spans
 // ---------------------------------------------------------------------------
 
 const CODE_BLOCK_RE = /```[\s\S]*?```/g;
 
-function containsCode(content: string): boolean {
-  // A `g`-flagged regex is stateful under .test(); search() is not.
-  return content.search(CODE_BLOCK_RE) !== -1;
+/** Fenced code blocks in order of appearance. */
+function findCodeSpans(content: string): string[] {
+  return content.match(CODE_BLOCK_RE) ?? [];
 }
 
 // ---------------------------------------------------------------------------
-// RegexCompactor
+// Extraction
 // ---------------------------------------------------------------------------
 
-function extractPatterns(content: string): PatternMatch[] {
+/**
+ * Run every pattern over bounded sentence windows of the message prose.
+ * Questions never yield decisions, corrections or constraints ("Should we
+ * deploy on Friday?" is not an invariant).
+ */
+function extractPatterns(prose: string): PatternMatch[] {
   const matches: PatternMatch[] = [];
+  const windows = splitSentences(prose.slice(0, MAX_EXTRACTION_CHARS), MAX_SENTENCE_CHARS);
 
-  for (const patterns of [DECISION_PATTERNS, CORRECTION_PATTERNS, ENTITY_PATTERNS, CONSTRAINT_PATTERNS]) {
-    for (const { regex, extract } of patterns) {
-      // Reset lastIndex for global regexes
-      regex.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = regex.exec(content)) !== null) {
-        matches.push(extract(m));
+  for (const raw of windows) {
+    const window = raw.trim();
+    if (!window) continue;
+    const question = isQuestion(window);
+    const groups = question
+      ? [ENTITY_PATTERNS]
+      : [DECISION_PATTERNS, CORRECTION_PATTERNS, ENTITY_PATTERNS, CONSTRAINT_PATTERNS];
+    for (const patterns of groups) {
+      for (const { regex, extract } of patterns) {
+        regex.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = regex.exec(window)) !== null) {
+          matches.push(extract(m));
+          if (m[0].length === 0) regex.lastIndex++;
+        }
       }
     }
   }
@@ -232,8 +309,17 @@ function createEmptyState(): CompactedState {
     l4_invariants: [],
     tombstones: [],
     totalTokenEstimate: 0,
+    archive: [],
+    spans: {},
   };
 }
+
+/** L1 entries per L2 discussion block. */
+const SUMMARY_WINDOW = 5;
+/** Characters of L1 text an L2 discussion block keeps. */
+const SUMMARY_CHARS = 500;
+/** Id prefix of discussion-block summaries (keyed by message range). */
+const DISCUSSION_PREFIX = 'l2:';
 
 export class RegexCompactor implements Compactor {
   readonly tier = 'regex' as const;
@@ -245,8 +331,10 @@ export class RegexCompactor implements Compactor {
   ): Promise<CompactedState> {
     const state = currentState ? cloneState(currentState) : createEmptyState();
 
+    let previous: ConversationMessage | undefined;
     for (const msg of messages) {
-      this.processMessage(msg, state);
+      this.processMessage(msg, state, previous);
+      previous = msg;
     }
 
     state.totalTokenEstimate = this.computeTokenEstimate(state);
@@ -260,7 +348,7 @@ export class RegexCompactor implements Compactor {
     const result = cloneState(state);
 
     if (targetLevel >= 2) {
-      result.l2_summaries = this.buildTopicSummaries(result);
+      this.buildTopicSummaries(result);
     }
     if (targetLevel >= 3) {
       this.promoteToGraph(result);
@@ -277,30 +365,46 @@ export class RegexCompactor implements Compactor {
   // Internal processing
   // -----------------------------------------------------------------------
 
-  private processMessage(msg: ConversationMessage, state: CompactedState): void {
-    const patterns = extractPatterns(msg.content);
-    const hasCode = containsCode(msg.content);
+  private processMessage(
+    msg: ConversationMessage,
+    state: CompactedState,
+    previous: ConversationMessage | undefined,
+  ): void {
+    const timestamp = normalizeTimestamp(msg.timestamp);
+    const codeSpans = findCodeSpans(msg.content);
+    const spanIds = codeSpans.map((text) => this.storeSpan(state, text, msg.id));
+    // Code is kept and indexed, not mined: patterns run on the prose only
+    const prose = codeSpans.length > 0 ? msg.content.replace(CODE_BLOCK_RE, '\n') : msg.content;
+    const patterns = extractPatterns(prose);
 
-    // Handle corrections → create tombstones. Several patterns can match
-    // the same correction ("Actually, use X instead of Y"); record it once.
-    const recorded = new Set<string>();
+    // Corrections → tombstones. Several patterns can match the same
+    // correction ("Actually, use X instead of Y"); the content-derived id
+    // records it once. Keyword-only corrections ("Wait, …") name no
+    // superseded value: they raise importance but are not tombstoned.
+    const known = new Set(state.tombstones.map((t) => t.id));
     for (const match of patterns.filter((p) => p.type === 'correction')) {
-      const key = `${(match.details.from ?? '').toLowerCase()}→${(match.details.to ?? match.details.correctedTo ?? '').toLowerCase()}`;
-      if (recorded.has(key)) continue;
-      recorded.add(key);
+      const from = match.details.from;
+      const to = match.details.to;
+      if (!isValidCorrectionSubject(from) || !to?.trim()) continue;
+      if (normalizeForMatch(from) === normalizeForMatch(to)) continue;
+      const id = tombstoneId(['inferred', normalizeForMatch(from), normalizeForMatch(to), msg.id]);
+      if (known.has(id)) continue;
+      known.add(id);
       const tombstone: Tombstone = {
-        supersededContent: match.details.from ?? '',
-        originalMessageId: this.findRelatedMessage(match, state) ?? msg.id,
+        id,
+        supersededContent: from,
+        originalMessageId: this.findRelatedMessage(from, to, state) ?? msg.id,
         correctionMessageId: msg.id,
         reason: match.content,
-        timestamp: msg.timestamp,
-        key: match.details.from,
-        correctedValue: match.details.to ?? match.details.correctedTo,
+        timestamp,
+        key: from,
+        correctedValue: to,
+        confidence: 'inferred',
       };
       state.tombstones.push(tombstone);
-      // Runs before this message's own L1 entry is pushed, so the
-      // correction itself is never pruned.
-      this.pruneSuperseded(tombstone, state);
+      // Runs before this message's own entries are added, so the
+      // correction itself is never archived.
+      applyTombstone(state, tombstone);
     }
 
     // Handle decisions
@@ -319,7 +423,7 @@ export class RegexCompactor implements Compactor {
       // Store as L2 summary fragment
       const summary: TopicSummary = {
         id: generateId(),
-        topic: `Decision: ${match.details.chosen}`,
+        topic: match.details.chosen ? `Decision: ${match.details.chosen}` : `Rejected: ${match.details.rejected}`,
         summary: match.content,
         decisions: [decision],
         entityNames: [],
@@ -355,34 +459,54 @@ export class RegexCompactor implements Compactor {
         key: match.details.constraint.slice(0, 50),
         value: match.content,
         sourceMessage: msg.id,
-        timestamp: msg.timestamp,
+        timestamp,
       };
       state.l4_invariants.push(invariant);
     }
 
-    // L1 compaction: strip noise, keep substance
-    if (!isNoise(msg.content)) {
-      const importance = this.quickImportance(patterns, hasCode);
-      let compacted = msg.content;
+    // L1: keep the message verbatim; drop only pure acks and greetings, and
+    // fold a short reply into the question it answers.
+    const trimmed = msg.content.trim();
+    if (!trimmed) return;
+    const importance = this.quickImportance(patterns, codeSpans.length > 0);
 
-      // Strip code blocks from compacted text (they're indexed separately)
-      if (hasCode) {
-        compacted = compacted.replace(CODE_BLOCK_RE, '[code block]');
-      }
-
-      // For low-importance messages, strip further
-      if (importance < 0.3) {
-        compacted = this.stripToEssence(compacted);
-      }
-
-      if (compacted.trim()) {
-        state.l1_compacted.push({
-          originalMessageId: msg.id,
-          compacted: compacted.trim(),
-          importance,
-        });
-      }
+    const last = state.l1_compacted[state.l1_compacted.length - 1];
+    const lastIsPrevious = previous === undefined || previous.id === last?.originalMessageId;
+    if (
+      last &&
+      lastIsPrevious &&
+      last.role !== undefined &&
+      last.role !== msg.role &&
+      isQuestion(last.compacted) &&
+      trimmed.length <= MAX_FOLDED_REPLY_CHARS &&
+      !trimmed.includes('\n')
+    ) {
+      last.compacted = `${last.compacted} → ${trimmed}`;
+      last.foldedMessageIds = [...(last.foldedMessageIds ?? []), msg.id];
+      last.importance = Math.max(last.importance, importance, ANSWERED_QUESTION_IMPORTANCE);
+      return;
     }
+
+    if (isNoise(trimmed)) return;
+
+    state.l1_compacted.push({
+      originalMessageId: msg.id,
+      compacted: trimmed,
+      importance,
+      timestamp,
+      role: msg.role,
+      ...(spanIds.length > 0 ? { spanIds } : {}),
+    });
+  }
+
+  private storeSpan(state: CompactedState, text: string, messageId: string): string {
+    const hash = sha256Hex(text);
+    if (!state.spans) state.spans = {};
+    if (!state.spans[hash]) {
+      const span: CodeSpan = { hash, text, sourceMessageId: messageId };
+      state.spans[hash] = span;
+    }
+    return hash;
   }
 
   private quickImportance(patterns: PatternMatch[], hasCode: boolean): number {
@@ -395,66 +519,13 @@ export class RegexCompactor implements Compactor {
     return Math.min(1.0, score);
   }
 
-  private stripToEssence(content: string): string {
-    // Remove filler phrases
-    return content
-      .replace(/\b(?:I think|maybe|perhaps|probably|basically|essentially|just|simply)\b/gi, '')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-  }
-
-  private findRelatedMessage(match: PatternMatch, state: CompactedState): string | undefined {
-    const needle = normalizeForMatch(match.details.from ?? '');
-    if (!needle) return undefined;
-    const needleRe = wholeWordRe(needle);
-    const corrected = normalizeForMatch(match.details.to ?? '');
-    const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
-    // Most recent mention of the old value (and not the new one) is the
-    // statement being corrected
+  private findRelatedMessage(from: string, to: string, state: CompactedState): string | undefined {
+    // Most recent statement of only the old value is the one being corrected
+    const statesOnlyOld = supersededMatcher({ supersededContent: from, correctedValue: to });
     for (let i = state.l1_compacted.length - 1; i >= 0; i--) {
-      const text = normalizeForMatch(state.l1_compacted[i].compacted);
-      if (needleRe.test(text) && !correctedRe?.test(text)) {
-        return state.l1_compacted[i].originalMessageId;
-      }
+      if (statesOnlyOld(state.l1_compacted[i].compacted)) return state.l1_compacted[i].originalMessageId;
     }
     return undefined;
-  }
-
-  /**
-   * Drop what a tombstone supersedes so stale facts can't resurface in
-   * context frames. An L1 entry goes if it is the tombstone's original
-   * message, or if it mentions the superseded value (whole word,
-   * case-insensitive) without also mentioning the corrected value.
-   * Decisions that chose the superseded value are marked superseded, and
-   * L2 summaries that would still state it are dropped.
-   */
-  private pruneSuperseded(tombstone: Tombstone, state: CompactedState): void {
-    const old = normalizeForMatch(tombstone.supersededContent);
-    if (!old) return;
-    const oldRe = wholeWordRe(old);
-    const corrected = normalizeForMatch(tombstone.correctedValue ?? '');
-    const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
-    const statesOnlyOld = (raw: string): boolean => {
-      const text = normalizeForMatch(raw);
-      return oldRe.test(text) && !correctedRe?.test(text);
-    };
-
-    state.l1_compacted = state.l1_compacted.filter((entry) => {
-      if (entry.originalMessageId === tombstone.correctionMessageId) return true;
-      if (entry.originalMessageId === tombstone.originalMessageId) return false;
-      return !statesOnlyOld(entry.compacted);
-    });
-
-    for (const summary of state.l2_summaries) {
-      for (const decision of summary.decisions) {
-        if (!decision.superseded && statesOnlyOld(decision.chosen)) decision.superseded = true;
-      }
-    }
-    state.l2_summaries = state.l2_summaries.filter((summary) =>
-      summary.decisions.length > 0
-        ? summary.decisions.some((d) => !d.superseded)
-        : !statesOnlyOld(summary.summary),
-    );
   }
 
   private checkDecisionSupersession(decision: Decision, state: CompactedState): void {
@@ -471,37 +542,63 @@ export class RegexCompactor implements Compactor {
     }
   }
 
-  private buildTopicSummaries(state: CompactedState): TopicSummary[] {
-    // Group L1 entries into topic clusters by proximity
-    // For regex tier, this is a simple windowed approach
-    const windowSize = 5;
-    const summaries: TopicSummary[] = [...state.l2_summaries];
-    const entries = state.l1_compacted;
+  /**
+   * L1 → L2: fold L1 entries into discussion blocks of SUMMARY_WINDOW
+   * entries. Summarized entries move from L1 to the archive (reason
+   * `summarized`), so recompaction is idempotent and frames never carry the
+   * same text twice. Blocks are keyed by their message range. Windows whose
+   * average importance is too low to summarize stay in L1.
+   */
+  private buildTopicSummaries(state: CompactedState): void {
+    const archive = state.archive ?? (state.archive = []);
+    const existingIds = new Set(state.l2_summaries.map((s) => s.id));
+    let blockCount =
+      state.l2_summaries.filter((s) => s.id.startsWith(DISCUSSION_PREFIX)).length +
+      archive.filter((a) => a.kind === 'summary' && a.summary.id.startsWith(DISCUSSION_PREFIX)).length;
 
-    for (let i = 0; i < entries.length; i += windowSize) {
-      const window = entries.slice(i, i + windowSize);
+    const entries = state.l1_compacted;
+    const summarized = new Set<CompactedEntry>();
+    for (let i = 0; i < entries.length; i += SUMMARY_WINDOW) {
+      const window = entries.slice(i, i + SUMMARY_WINDOW);
       if (window.length === 0) continue;
 
-      const combined = window.map((e) => e.compacted).join(' ');
       const avgImportance = window.reduce((sum, e) => sum + e.importance, 0) / window.length;
+      if (avgImportance <= 0.2) continue;
 
-      if (avgImportance > 0.2) {
-        summaries.push({
-          id: generateId(),
-          topic: `Discussion block ${Math.floor(i / windowSize) + 1}`,
-          summary: combined.slice(0, 500),
+      const first = window[0].originalMessageId;
+      const last = window[window.length - 1].originalMessageId;
+      const id = `${DISCUSSION_PREFIX}${first}..${last}`;
+      if (!existingIds.has(id)) {
+        // Code spans are referenced by hash, never cut mid-block
+        const combined = window.map((e) => this.withSpanReferences(e, state)).join(' ');
+        const text = combined.slice(0, SUMMARY_CHARS);
+        blockCount += 1;
+        state.l2_summaries.push({
+          id,
+          topic: `Discussion block ${blockCount}`,
+          summary: text,
           decisions: [],
           entityNames: [],
-          messageRange: {
-            first: window[0].originalMessageId,
-            last: window[window.length - 1].originalMessageId,
-          },
-          tokenEstimate: estimateTokens(combined.slice(0, 500)),
+          messageRange: { first, last },
+          tokenEstimate: estimateTokens(text),
         });
+        existingIds.add(id);
+      }
+      for (const entry of window) {
+        summarized.add(entry);
+        archive.push({ kind: 'l1', reason: 'summarized', by: id, entry });
       }
     }
+    state.l1_compacted = entries.filter((e) => !summarized.has(e));
+  }
 
-    return summaries;
+  private withSpanReferences(entry: CompactedEntry, state: CompactedState): string {
+    let text = entry.compacted;
+    for (const hash of entry.spanIds ?? []) {
+      const span = state.spans?.[hash];
+      if (span) text = text.split(span.text).join(`[code sha256:${spanRef(hash)}]`);
+    }
+    return text;
   }
 
   private promoteToGraph(state: CompactedState): void {
@@ -520,7 +617,7 @@ export class RegexCompactor implements Compactor {
             });
           }
 
-          // Add rejection edges
+          // Add rejection edges, once per (source, relation, target)
           for (const alt of decision.alternatives) {
             if (alt.option) {
               if (!state.l3_graph.entities.has(alt.option)) {
@@ -532,13 +629,16 @@ export class RegexCompactor implements Compactor {
                   lastMention: decision.messageId,
                 });
               }
-              state.l3_graph.edges.push({
+              const edge = {
                 source: entityName,
                 target: alt.option,
-                relation: 'rejected_in_favor_of',
+                relation: 'rejected_in_favor_of' as const,
                 properties: { reason: alt.reason },
                 sourceMessage: decision.messageId,
-              });
+              };
+              if (!state.l3_graph.edges.some((e) => sameEdge(e, edge))) {
+                state.l3_graph.edges.push(edge);
+              }
             }
           }
         }

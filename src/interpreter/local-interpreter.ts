@@ -1,8 +1,10 @@
 /**
  * LocalInterpreter — bounded interpreter against an Ollama HTTP endpoint.
  *
- * Dependency-free: uses Node ≥18 global fetch (injectable for tests).
+ * Dependency-free: uses the global fetch (injectable for tests).
  * Same bounded contract as HostInterpreter; same wire-level safety.
+ * A `done_reason: "length"` response (cut off at num_predict) throws
+ * InterpreterBudgetError('output_too_long').
  */
 import { estimateTokens } from '../utils.js';
 import {
@@ -73,7 +75,7 @@ export class LocalInterpreter implements Interpreter {
       opts.fetch ?? ((globalThis as { fetch?: FetchLike }).fetch as FetchLike);
     this.logger = opts.logger ?? silentLogger;
     if (!this.fetchImpl) {
-      throw new Error('LocalInterpreter requires global fetch (Node ≥18) or an injected fetch');
+      throw new Error('LocalInterpreter requires global fetch (Node ≥22) or an injected fetch');
     }
   }
 
@@ -117,11 +119,20 @@ export class LocalInterpreter implements Interpreter {
       }
 
       const raw = await res.text();
-      let parsed: { response?: string };
+      let parsed: { response?: string; done_reason?: string };
       try {
-        parsed = JSON.parse(raw) as { response?: string };
+        parsed = JSON.parse(raw) as { response?: string; done_reason?: string };
       } catch {
         throw new InterpreterUnavailableError('ollama returned non-JSON body');
+      }
+
+      // Ollama stops with done_reason "length" when num_predict cut the
+      // output off; a truncated memory is never returned.
+      if (parsed.done_reason === 'length') {
+        throw new InterpreterBudgetError('output_too_long', {
+          doneReason: parsed.done_reason,
+          cap: opts.maxOutputTokens,
+        });
       }
 
       const text = (parsed.response ?? '').replace(/\s+$/, '');

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { SourceIngester } from './source-ingester.js';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
 import type { Source } from '../types.js';
+import { estimateTokens } from '../utils.js';
 
 function makeSource(overrides: Partial<Source> = {}): Source {
   return {
@@ -94,15 +95,18 @@ describe('SourceIngester', () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].role).toBe('system');
       expect(messages[0].content).toBe('chunk 0');
-      expect(messages[0].id).toBe('src-1-chunk-0');
+      const version = ingester.versionOf(source);
+      expect(version).toMatch(/^[0-9a-f]{12}$/);
+      expect(messages[0].id).toBe(`src-1@${version}-chunk-0`);
       expect(messages[0].metadata).toEqual({
         sourceId: 'src-1',
         sourceTitle: 'Test Document',
         sourceUri: 'https://example.com/doc',
         chunkIndex: 0,
         totalChunks: 2,
+        sourceVersion: version,
       });
-      expect(messages[1].id).toBe('src-1-chunk-1');
+      expect(messages[1].id).toBe(`src-1@${version}-chunk-1`);
       // Timestamps are monotonically increasing
       expect(messages[1].timestamp).toBeGreaterThan(messages[0].timestamp);
     });
@@ -181,6 +185,97 @@ describe('SourceIngester', () => {
 
       expect(events).toHaveLength(3);
       expect(events.map((e) => e.sourceId)).toEqual(['a', 'b', 'c']);
+    });
+  });
+
+  describe('chunking cost and coverage (SH-13)', () => {
+    // Bound: a 200 KB paragraph with no sentence terminator chunks in well
+    // under a second (the backtracking splitter took ~50 s).
+    it('splits a 200 KB unpunctuated paragraph in linear time within chunkSize', () => {
+      const ingester = new SourceIngester({ chunkSize: 800, chunkOverlap: 0 });
+      const content = 'col_a,col_b,col_c,1234,5678 '.repeat(7_500);
+      const start = performance.now();
+      const chunks = ingester.chunkSource(makeSource({ content, contentType: 'text/plain' }));
+      expect(performance.now() - start).toBeLessThan(500);
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) expect(estimateTokens(chunk)).toBeLessThanOrEqual(800);
+      expect(chunks.join('').replace(/\s+/g, '')).toBe(content.replace(/\s+/g, ''));
+    });
+
+    it('chunks 200 KB of minified JSON without a content type in linear time', () => {
+      const ingester = new SourceIngester({ chunkSize: 800, chunkOverlap: 0 });
+      const content = '[[1,2],[3,4]],'.repeat(15_000);
+      const start = performance.now();
+      const chunks = ingester.chunkSource(makeSource({ content }));
+      expect(performance.now() - start).toBeLessThan(500);
+      for (const chunk of chunks) expect(estimateTokens(chunk)).toBeLessThanOrEqual(800);
+    });
+
+    it('keeps trailing text without a sentence terminator', () => {
+      const ingester = new SourceIngester({ chunkSize: 40, chunkOverlap: 0 });
+      const para =
+        'The deploy runs in three stages. Each stage waits for health checks. ' +
+        'Rollbacks are rare but happen. IMPORTANT: the rollback command is kubectl rollout undo deploy/api';
+      const chunks = ingester.chunkSource(makeSource({ content: para, contentType: 'text/plain' }));
+      expect(chunks.join(' ')).toContain('kubectl rollout undo deploy/api');
+    });
+
+    it('enforces chunkSize for an oversize paragraph that follows a small one', () => {
+      const ingester = new SourceIngester({ chunkSize: 100, chunkOverlap: 10 });
+      const content = 'Tiny intro.\n\n' + 'This sentence is part of a very long paragraph. '.repeat(400);
+      const chunks = ingester.chunkSource(makeSource({ content, contentType: 'text/plain' }));
+      for (const chunk of chunks) expect(estimateTokens(chunk)).toBeLessThanOrEqual(100);
+    });
+  });
+
+  describe('provenance and re-ingestion (SH-27)', () => {
+    it('reports only the entities this source introduced', async () => {
+      const ingester = new SourceIngester();
+      const engine = new CompactionEngine({ memtableSize: 0 });
+      const a = await ingester.ingest(makeSource({ id: 'a', title: 'A', content: 'We are using PostgreSQL for storage.' }), engine);
+      const b = await ingester.ingest(makeSource({ id: 'b', title: 'B', content: 'Nothing technical here at all.' }), engine);
+      expect(a.entitiesDiscovered).toEqual(['PostgreSQL']);
+      expect(b.entitiesDiscovered).toEqual([]);
+    });
+
+    it('skips an unchanged source and retracts the previous version of an edited one', async () => {
+      const ingester = new SourceIngester();
+      const engine = new CompactionEngine({ memtableSize: 0 });
+      const v1 = makeSource({ id: 'doc', content: 'The rollback command is helm rollback api.' });
+      await ingester.ingest(v1, engine);
+
+      const again = await ingester.ingest(v1, engine);
+      expect(again.skipped).toBe(true);
+      expect(engine.getState().l1_compacted).toHaveLength(1);
+
+      const v2 = makeSource({ id: 'doc', content: 'The rollback command is kubectl rollout undo deploy/api.' });
+      const event = await ingester.ingest(v2, engine);
+      expect(event.retractedChunks).toBe(1);
+      expect(event.version).not.toBe(again.version);
+      const live = engine.getState().l1_compacted.map((e) => e.compacted).join('\n');
+      expect(live).toContain('kubectl rollout undo');
+      expect(live).not.toContain('helm rollback');
+      expect(engine.getState().archive!.some((a) => a.reason === 'retracted')).toBe(true);
+    });
+
+    it('overlapping ingests of one source run in call order, so the later version retracts the earlier (SH-R10)', async () => {
+      const ingester = new SourceIngester();
+      const engine = new CompactionEngine({ memtableSize: 0 });
+      const v1 = makeSource({ id: 'doc', content: 'The primary region is us-east-1.' });
+      const v2 = makeSource({ id: 'doc', content: 'The primary region is us-west-2.' });
+      const [first, second] = await Promise.all([ingester.ingest(v1, engine), ingester.ingest(v2, engine)]);
+      expect(first.retractedChunks).toBe(0);
+      expect(second.retractedChunks).toBe(1);
+      expect(engine.getState().l1_compacted.map((e) => e.compacted)).toEqual(['The primary region is us-west-2.']);
+
+      const again = await ingester.ingest(v2, engine);
+      expect(again).toMatchObject({ skipped: true, retractedChunks: 0 });
+      expect(engine.getState().l1_compacted.map((e) => e.compacted)).toEqual(['The primary region is us-west-2.']);
+
+      // Other sources are not held up behind it
+      const [, other] = await Promise.all([ingester.ingest(v1, engine), ingester.ingest(makeSource({ id: 'other', content: 'Unrelated.' }), engine)]);
+      expect(other.skipped).toBeUndefined();
+      expect(engine.getState().l1_compacted.map((e) => e.compacted).sort()).toEqual(['The primary region is us-east-1.', 'Unrelated.']);
     });
   });
 });

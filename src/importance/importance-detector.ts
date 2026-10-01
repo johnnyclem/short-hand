@@ -1,299 +1,270 @@
 /**
- * ImportanceDetector — three-signal importance scoring.
+ * ImportanceDetector — combines three domain-agnostic signals to score
+ * the importance of each conversation message without domain hints.
  *
- * Signal 1: State Delta — how much a message mutates the entity-relationship graph.
- * Signal 2: Reference Frequency — how often later messages reference this one.
- * Signal 3: Trajectory Discontinuity — semantic direction change (simplified without embeddings).
+ * Signal 1: State delta (entity-relationship graph mutations)
+ * Signal 2: Reference frequency (retrospective citation analysis)
+ * Signal 3: Trajectory discontinuity (embedding-space change-point detection)
  *
- * In v0.1.0, signals 2 and 3 use heuristic approximations rather than embeddings.
+ * The key insight from information theory (Shannon, 1948): the information
+ * content of a message is inversely proportional to its probability.
+ * "Hello" carries almost zero information. "Swap RSA for Ed25519" carries
+ * enormous information. You don't need to know what domain you're in to
+ * know what matters — you need to measure what changed.
  */
 
 import type {
   ConversationMessage,
   ImportanceScore,
-  ImportanceWeights,
-} from '../types.js';
-import { DEFAULT_IMPORTANCE_WEIGHTS } from '../types.js';
-
-// ---------------------------------------------------------------------------
-// Entity extraction (lightweight, for state delta)
-// ---------------------------------------------------------------------------
-
-/** Simple entity extraction via regex — good enough for importance scoring. */
-function extractMentionedEntities(content: string): string[] {
-  const entities: string[] = [];
-
-  // Capitalized terms (likely proper nouns / tech names)
-  const caps = content.match(/\b[A-Z][a-zA-Z]{2,}(?:\s[A-Z][a-zA-Z]+)*/g);
-  if (caps) entities.push(...caps);
-
-  // Backtick-quoted identifiers
-  const backticks = content.match(/`([^`]+)`/g);
-  if (backticks) entities.push(...backticks.map((b) => b.replace(/`/g, '')));
-
-  // Known tech patterns
-  const techPatterns = /\b(?:React|Vue|Angular|Node|Express|PostgreSQL|MySQL|SQLite|MongoDB|Redis|Docker|Kubernetes|JWT|OAuth|REST|GraphQL|gRPC|AWS|GCP|Azure|TypeScript|JavaScript|Python|Rust|Go)\b/gi;
-  const techMatches = content.match(techPatterns);
-  if (techMatches) entities.push(...techMatches);
-
-  // Deduplicate
-  return [...new Set(entities.map((e) => e.trim()).filter((e) => e.length > 1))];
-}
-
-// ---------------------------------------------------------------------------
-// Override/correction detection
-// ---------------------------------------------------------------------------
-
-const OVERRIDE_PATTERNS = [
-  /\bactually\b/i,
-  /\bwait\b/i,
-  /\bcorrection\b/i,
-  /\bscratch that\b/i,
-  /\binstead\b/i,
-  /\bchange\s+(?:that|this|it)\b/i,
-  /\bno[,.]?\s+(?:let's|we should|use)\b/i,
-  /\brather\s+than\b/i,
-  /\bswap\b/i,
-  /\breplace\b/i,
-];
-
-function hasOverrideIndicator(content: string): boolean {
-  return OVERRIDE_PATTERNS.some((p) => p.test(content));
-}
-
-// ---------------------------------------------------------------------------
-// Reference detection (heuristic, without embeddings)
-// ---------------------------------------------------------------------------
-
-const EXPLICIT_REFERENCE_PATTERNS = [
-  /\bas (?:I|we|you) (?:said|mentioned|discussed|noted) (?:earlier|before|above|previously)\b/i,
-  /\bgoing back to\b/i,
-  /\bearlier\b/i,
-  /\bpreviously\b/i,
-  /\bas (?:discussed|mentioned|noted)\b/i,
-  /\bremember when\b/i,
-  /\blike (?:I|we) said\b/i,
-];
-
-function detectExplicitReferences(content: string): number {
-  return EXPLICIT_REFERENCE_PATTERNS.filter((p) => p.test(content)).length;
-}
-
-// ---------------------------------------------------------------------------
-// Trajectory discontinuity (lexical approximation)
-// ---------------------------------------------------------------------------
-
-/** Compute Jaccard distance between two token sets as a proxy for semantic shift. */
-function tokenJaccard(a: string, b: string): number {
-  const setA = new Set(a.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
-  const setB = new Set(b.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
-  if (setA.size === 0 && setB.size === 0) return 0;
-
-  let intersection = 0;
-  for (const word of setA) {
-    if (setB.has(word)) intersection++;
-  }
-  const union = setA.size + setB.size - intersection;
-  return union === 0 ? 0 : 1 - intersection / union;
-}
+  ImportanceDetectorConfig,
+  SignalWeights,
+} from './types.js';
+import { DEFAULT_IMPORTANCE_CONFIG } from './types.js';
+import { EntityGraph, computeStateDelta, extractEntities } from './state-delta.js';
+import { TrajectoryTracker } from './trajectory-discontinuity.js';
+import { ReferenceGraph } from './reference-frequency.js';
 
 // ---------------------------------------------------------------------------
 // ImportanceDetector
 // ---------------------------------------------------------------------------
 
-interface MessageRecord {
-  message: ConversationMessage;
-  entities: string[];
-  score: ImportanceScore;
-}
-
+/**
+ * ImportanceDetector — the main entry point for domain-agnostic importance scoring.
+ *
+ * Usage:
+ *   const detector = new ImportanceDetector();
+ *   for (const message of conversation) {
+ *     const score = detector.addMessage(message);
+ *     if (score.importance > 0.7) { ... keep this message ... }
+ *   }
+ *
+ * All three signals are computed incrementally (online) as messages arrive.
+ * Signal 2 (reference frequency) is also recomputable retrospectively.
+ */
 export class ImportanceDetector {
-  private weights: ImportanceWeights;
-  private history: MessageRecord[] = [];
-  private entityGraph = new Map<string, Set<string>>(); // entity → set of message IDs
-  private referenceCounts = new Map<string, number>(); // messageId → reference count
+  private readonly config: ImportanceDetectorConfig;
+  private readonly entityGraph: EntityGraph;
+  private readonly trajectoryTracker: TrajectoryTracker;
+  private readonly referenceGraph: ReferenceGraph;
 
-  constructor(weights?: Partial<ImportanceWeights>) {
-    this.weights = { ...DEFAULT_IMPORTANCE_WEIGHTS, ...weights };
-  }
+  private scores: Map<string, ImportanceScore> = new Map();
+  private maxStateDelta = 0;
+  private maxReferenceScore = 0;
 
-  /** Score a new message incrementally. */
-  score(message: ConversationMessage): ImportanceScore {
-    const entities = extractMentionedEntities(message.content);
-    const stateDelta = this.computeStateDelta(message, entities);
-    const referenceFrequency = this.computeReferenceSignal(message);
-    const trajectoryDiscontinuity = this.computeTrajectorySignal(message);
-
-    const overall = Math.min(
-      1.0,
-      this.weights.stateDelta * stateDelta +
-        this.weights.referenceFrequency * referenceFrequency +
-        this.weights.trajectoryDiscontinuity * trajectoryDiscontinuity,
-    );
-
-    const scoreResult: ImportanceScore = {
-      overall,
-      stateDelta,
-      referenceFrequency,
-      trajectoryDiscontinuity,
+  constructor(config?: Partial<ImportanceDetectorConfig>) {
+    this.config = {
+      ...DEFAULT_IMPORTANCE_CONFIG,
+      ...config,
+      weights: {
+        ...DEFAULT_IMPORTANCE_CONFIG.weights,
+        ...config?.weights,
+      },
     };
 
-    // Record for future reference tracking
-    this.history.push({ message, entities, score: scoreResult });
-
-    // Update entity graph
-    for (const entity of entities) {
-      if (!this.entityGraph.has(entity)) {
-        this.entityGraph.set(entity, new Set());
-      }
-      this.entityGraph.get(entity)!.add(message.id);
-    }
-
-    // Update reference counts for prior messages (entity reuse)
-    this.updateReferenceCounts(message, entities);
-
-    return scoreResult;
+    this.entityGraph = new EntityGraph();
+    this.trajectoryTracker = new TrajectoryTracker({
+      discontinuityThreshold: this.config.discontinuityThreshold,
+      minCosineDistance: this.config.minCosineDistance,
+    });
+    this.referenceGraph = new ReferenceGraph({
+      semanticThreshold: this.config.semanticReferenceThreshold,
+      decayFactor: this.config.referenceDecay,
+    });
   }
 
   /**
-   * Retrospectively recompute all scores. Unlike incremental score() calls,
-   * this folds in the reference-frequency signal: messages whose entities
-   * were re-mentioned by later messages get their referenceFrequency (and
-   * overall score) boosted.
+   * Process a new message and return its importance score.
+   *
+   * This is the main API. Call it for each message in order.
+   * All three signals are computed incrementally.
    */
-  recompute(): ImportanceScore[] {
-    const records = this.history;
-    this.history = [];
-    this.entityGraph.clear();
-    this.referenceCounts.clear();
-
-    // First pass: replay incrementally, rebuilding the entity graph and
-    // reference counts across the full history.
-    for (const record of records) {
-      this.score(record.message);
+  addMessage(message: ConversationMessage): ImportanceScore {
+    // --- Signal 1: State delta ---
+    const delta = computeStateDelta(message, this.entityGraph);
+    if (delta.magnitude > this.maxStateDelta) {
+      this.maxStateDelta = delta.magnitude;
     }
 
-    // Second pass: now that reference counts reflect the whole conversation,
-    // fold them into each message's reference-frequency signal.
-    for (const record of this.history) {
-      const refs = this.referenceCounts.get(record.message.id) ?? 0;
-      if (refs === 0) continue;
+    // --- Signal 3: Trajectory discontinuity ---
+    const trajectoryPoint = this.trajectoryTracker.addMessage(message);
 
-      const referenceFrequency = Math.min(
-        1.0,
-        record.score.referenceFrequency + refs * 0.15,
-      );
-      const overall = Math.min(
-        1.0,
-        this.weights.stateDelta * record.score.stateDelta +
-          this.weights.referenceFrequency * referenceFrequency +
-          this.weights.trajectoryDiscontinuity * record.score.trajectoryDiscontinuity,
-      );
-      record.score = { ...record.score, referenceFrequency, overall };
-    }
+    // --- Signal 2: Reference frequency ---
+    const entities = extractEntities(message.content, message.id);
+    const entityNames = entities.map(e => e.name);
+    this.referenceGraph.addMessage(message, this.entityGraph, entityNames);
 
-    return this.history.map((r) => r.score);
+    // --- Combine signals ---
+    const score = this.computeImportance(message.id, delta.magnitude, trajectoryPoint);
+    this.scores.set(message.id, score);
+
+    return score;
   }
 
-  /** Get the current score for a message ID. */
+  /**
+   * Recompute all importance scores retrospectively.
+   *
+   * Useful after all messages have been added — Signal 2 (reference frequency)
+   * can only be fully accurate in retrospect, since future messages may
+   * reference past ones.
+   */
+  recomputeScores(): Map<string, ImportanceScore> {
+    // Update max reference score
+    this.maxReferenceScore = this.referenceGraph.getMaxWeightedScore();
+
+    // Recompute each message's combined score
+    const trajectoryPoints = this.trajectoryTracker.getPoints();
+    const trajectoryMap = new Map(trajectoryPoints.map(p => [p.messageId, p]));
+
+    for (const [messageId, existing] of this.scores) {
+      const refScore = this.referenceGraph.getScore(messageId);
+      const trajectoryPoint = trajectoryMap.get(messageId);
+
+      const normalizedRef = this.maxReferenceScore > 0 && refScore
+        ? refScore.weightedScore / this.maxReferenceScore
+        : 0;
+
+      const trajectorySignal = trajectoryPoint
+        ? Math.min(1, Math.max(0, trajectoryPoint.zScore) / 3)
+        : 0;
+
+      const { importance, dominantSignal } = this.combine(
+        existing.stateDelta,
+        normalizedRef,
+        trajectorySignal,
+      );
+
+      this.scores.set(messageId, {
+        ...existing,
+        referenceFrequency: normalizedRef,
+        importance,
+        dominantSignal,
+      });
+    }
+
+    return new Map(this.scores);
+  }
+
+  /**
+   * Get the importance score for a specific message.
+   */
   getScore(messageId: string): ImportanceScore | undefined {
-    return this.history.find((r) => r.message.id === messageId)?.score;
+    return this.scores.get(messageId);
   }
 
-  /** Get all scores. */
-  getAllScores(): Array<{ messageId: string; score: ImportanceScore }> {
-    return this.history.map((r) => ({ messageId: r.message.id, score: r.score }));
+  /**
+   * Get all scores sorted by importance (highest first).
+   */
+  getAllScores(): ImportanceScore[] {
+    return Array.from(this.scores.values())
+      .sort((a, b) => b.importance - a.importance);
   }
 
-  // -----------------------------------------------------------------------
-  // Signal 1: State Delta
-  // -----------------------------------------------------------------------
-
-  private computeStateDelta(message: ConversationMessage, entities: string[]): number {
-    let delta = 0;
-
-    // Node additions (new entities not seen before)
-    for (const entity of entities) {
-      if (!this.entityGraph.has(entity)) {
-        delta += 1.0; // New entity
-      } else {
-        delta += 0.7; // Entity modification/re-mention
-      }
-    }
-
-    // Override indicator boost
-    if (hasOverrideIndicator(message.content)) {
-      delta += 1.5;
-    }
-
-    // Normalize to 0-1 range (cap at ~5 significant mutations)
-    return Math.min(1.0, delta / 5);
+  /**
+   * Get messages above a given importance threshold.
+   */
+  getImportantMessages(threshold: number = 0.5): ImportanceScore[] {
+    return this.getAllScores().filter(s => s.importance >= threshold);
   }
 
-  // -----------------------------------------------------------------------
-  // Signal 2: Reference Frequency
-  // -----------------------------------------------------------------------
-
-  private computeReferenceSignal(message: ConversationMessage): number {
-    // For newly arriving messages, reference frequency is zero.
-    // The signal is retrospective — it grows as later messages arrive.
-    // Here we check if THIS message references prior messages (explicit references).
-    const explicitRefs = detectExplicitReferences(message.content);
-    // Boost the referenced messages (handled in updateReferenceCounts).
-    // For the current message, return a small signal if it's referencing others.
-    return Math.min(1.0, explicitRefs * 0.3);
+  /**
+   * Get the signal weights (useful for diagnostics).
+   */
+  getWeights(): Readonly<SignalWeights> {
+    return this.config.weights;
   }
 
-  private updateReferenceCounts(message: ConversationMessage, entities: string[]): void {
-    // Entity reuse: if this message mentions entities from prior messages, boost those messages
-    for (const entity of entities) {
-      const priorMessages = this.entityGraph.get(entity);
-      if (priorMessages) {
-        for (const msgId of priorMessages) {
-          if (msgId !== message.id) {
-            const current = this.referenceCounts.get(msgId) ?? 0;
-            this.referenceCounts.set(msgId, current + 1);
-          }
-        }
-      }
-    }
-
-    // Explicit reference detection would boost prior messages too,
-    // but without message linking we can only count the patterns.
-    if (detectExplicitReferences(message.content) > 0 && this.history.length > 1) {
-      // Boost the most recent messages (heuristic: explicit refs likely point to recent context)
-      const recentId = this.history[this.history.length - 2]?.message.id;
-      if (recentId) {
-        const current = this.referenceCounts.get(recentId) ?? 0;
-        this.referenceCounts.set(recentId, current + 1);
-      }
-    }
+  /** Access the underlying entity graph (for inspection/debugging). */
+  getEntityGraph(): EntityGraph {
+    return this.entityGraph;
   }
 
-  // -----------------------------------------------------------------------
-  // Signal 3: Trajectory Discontinuity
-  // -----------------------------------------------------------------------
+  /** Access the underlying trajectory tracker. */
+  getTrajectoryTracker(): TrajectoryTracker {
+    return this.trajectoryTracker;
+  }
 
-  private computeTrajectorySignal(message: ConversationMessage): number {
-    if (this.history.length === 0) return 0;
+  /** Access the underlying reference graph. */
+  getReferenceGraph(): ReferenceGraph {
+    return this.referenceGraph;
+  }
 
-    // Compute lexical distance from the previous message
-    const prev = this.history[this.history.length - 1].message.content;
-    const distance = tokenJaccard(prev, message.content);
+  /** Reset all state. */
+  reset(): void {
+    this.entityGraph.clear();
+    this.trajectoryTracker.reset();
+    this.referenceGraph.reset();
+    this.scores.clear();
+    this.maxStateDelta = 0;
+    this.maxReferenceScore = 0;
+  }
 
-    // Also compute distance from the running "trajectory" (mean of last 3)
-    const recentWindow = this.history.slice(-3).map((r) => r.message.content);
-    const windowText = recentWindow.join(' ');
-    const trajectoryDistance = tokenJaccard(windowText, message.content);
+  // -------------------------------------------------------------------------
+  // Internal
+  // -------------------------------------------------------------------------
 
-    // Use the max of pairwise and trajectory distance
-    const rawSignal = Math.max(distance, trajectoryDistance);
+  private computeImportance(
+    messageId: string,
+    deltaMagnitude: number,
+    trajectoryPoint: { zScore: number; cosineDistance: number; isDiscontinuity: boolean } | null,
+  ): ImportanceScore {
+    // Normalize state delta to [0, 1] using running max
+    const normalizedDelta = this.maxStateDelta > 0
+      ? deltaMagnitude / this.maxStateDelta
+      : (deltaMagnitude > 0 ? 1 : 0);
 
-    // Z-score approximation: track running mean/variance
-    // For now, use a simpler threshold: distance > 0.7 is a big shift
-    if (rawSignal > 0.8) return 1.0;
-    if (rawSignal > 0.6) return 0.7;
-    if (rawSignal > 0.4) return 0.4;
-    return rawSignal * 0.5;
+    // Reference frequency — use current score (will be updated in recompute).
+    // The running max is O(1); sorting every score per message made
+    // scoring quadratic in conversation length.
+    const refScore = this.referenceGraph.getScore(messageId);
+    const currentMaxRef = this.referenceGraph.getMaxWeightedScore();
+    const normalizedRef = currentMaxRef > 0 && refScore
+      ? refScore.weightedScore / currentMaxRef
+      : 0;
+
+    // Trajectory discontinuity — normalize z-score to [0, 1] range
+    // z-scores above 3 are extreme outliers, so cap there
+    const trajectorySignal = trajectoryPoint
+      ? Math.min(1, Math.max(0, trajectoryPoint.zScore) / 3)
+      : 0;
+
+    const { importance, dominantSignal } = this.combine(
+      normalizedDelta,
+      normalizedRef,
+      trajectorySignal,
+    );
+
+    return {
+      messageId,
+      stateDelta: normalizedDelta,
+      referenceFrequency: normalizedRef,
+      trajectoryDiscontinuity: trajectorySignal,
+      importance,
+      dominantSignal,
+    };
+  }
+
+  private combine(
+    stateDelta: number,
+    referenceFrequency: number,
+    trajectoryDiscontinuity: number,
+  ): { importance: number; dominantSignal: ImportanceScore['dominantSignal'] } {
+    const w = this.config.weights;
+
+    const importance = Math.min(1, Math.max(0,
+      stateDelta * w.stateDelta +
+      referenceFrequency * w.referenceFrequency +
+      trajectoryDiscontinuity * w.trajectoryDiscontinuity,
+    ));
+
+    // Determine dominant signal
+    const signals: Array<{ value: number; name: ImportanceScore['dominantSignal'] }> = [
+      { value: stateDelta * w.stateDelta, name: 'state_delta' },
+      { value: referenceFrequency * w.referenceFrequency, name: 'reference_frequency' },
+      { value: trajectoryDiscontinuity * w.trajectoryDiscontinuity, name: 'trajectory_discontinuity' },
+    ];
+
+    const dominant = signals.reduce((a, b) => a.value >= b.value ? a : b);
+
+    return { importance, dominantSignal: dominant.name };
   }
 }

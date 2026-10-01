@@ -112,3 +112,44 @@ describe('LocalInterpreter — bounded contract', () => {
     await expect(p).rejects.toMatchObject({ name: 'AbortError' });
   });
 });
+
+describe('LocalInterpreter — truncated output (SH-17)', () => {
+  it('throws InterpreterBudgetError when Ollama reports done_reason "length"', async () => {
+    const fetch: FetchLike = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ response: 'the rate limit does', done: true, done_reason: 'length' }),
+    });
+    const l = new LocalInterpreter({ model: 'llama3', fetch });
+    const err = await l
+      .interpret({ template: 't', payload: 'p', context: 'c' }, { maxOutputTokens: 5, timeoutMs: 1000 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InterpreterBudgetError);
+    expect((err as InterpreterBudgetError).meta.doneReason).toBe('length');
+  });
+
+  it('accepts done_reason "stop"', async () => {
+    const fetch: FetchLike = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ response: 'ok', done: true, done_reason: 'stop' }),
+    });
+    const l = new LocalInterpreter({ model: 'llama3', fetch });
+    await expect(
+      l.interpret({ template: 't', payload: 'p', context: 'c' }, { maxOutputTokens: 5, timeoutMs: 1000 }),
+    ).resolves.toBe('ok');
+  });
+});
+
+describe('LocalInterpreter — runtime floor', () => {
+  it('names the suite Node floor (22) when no fetch is available', () => {
+    const g = globalThis as { fetch?: unknown };
+    const saved = g.fetch;
+    g.fetch = undefined;
+    try {
+      expect(() => new LocalInterpreter({ model: 'llama3' })).toThrow(/Node ≥22/);
+    } finally {
+      g.fetch = saved;
+    }
+  });
+});

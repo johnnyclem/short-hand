@@ -1,14 +1,11 @@
 /**
  * Pluggable scorers for the context-shift benchmark.
  *
- * KeywordJudge — token-overlap F1 vs expectedAnswer. Deterministic, CI-safe.
- * LMJudge      — uses an injected Interpreter to grade against a strict rubric.
+ * KeywordJudge — recall of expectedAnswer tokens. Deterministic, CI-safe.
+ * LMJudge      — a grading call to an Anthropic-shaped client (structured output).
  */
-import {
-  silentLogger,
-  type Interpreter,
-  type InterpreterLogger,
-} from '../interpreter/types.js';
+import type { AnthropicLikeClient } from '../interpreter/host-interpreter.js';
+import { callModelText, ModelCallError } from './model-call.js';
 
 export interface JudgeArgs {
   answer: string;
@@ -70,75 +67,93 @@ export class KeywordJudge implements Judge {
 }
 
 export interface LMJudgeOptions {
-  interpreter: Interpreter;
+  /** Anthropic-shaped client (`messages.create`), as for HostInterpreter. */
+  client: AnthropicLikeClient;
+  model: string;
+  /** Output cap for the grade. Default 200. */
   maxOutputTokens?: number;
+  /** Default 15 000 ms. */
   timeoutMs?: number;
-  logger?: InterpreterLogger;
 }
 
+const JUDGE_SYSTEM = `You are a strict grader. You score how well an ANSWER satisfies a RUBRIC, given the READ-TIME CONTEXT the answer was written for.
+Rules:
+- Score from 0.0 (does not satisfy the rubric, or contradicts it) to 1.0 (fully satisfies it).
+- Judge correctness and relevance to the rubric only. Do not reward length, tone or restatement.
+- Reply with a JSON object: {"score": <number from 0 to 1>, "reason": "<at most 20 words>"}.`;
+
+const JUDGE_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    score: { type: 'number' },
+    reason: { type: 'string' },
+  },
+  required: ['score', 'reason'],
+  additionalProperties: false,
+};
+
+/**
+ * LMJudge — grades with its own call: a grading system prompt and a JSON
+ * schema for the reply (structured output). It never goes through an
+ * Interpreter, whose system prompt asks for one prose sentence (SH-19).
+ *
+ * A failed, truncated, refused or unparseable grade, or a score outside
+ * [0, 1], throws ModelCallError instead of scoring 0: a run with a broken
+ * judge fails rather than reporting losses it never measured.
+ */
 export class LMJudge implements Judge {
   readonly name = 'lm' as const;
 
-  private readonly interpreter: Interpreter;
+  private readonly client: AnthropicLikeClient;
+  private readonly model: string;
   private readonly maxOutputTokens: number;
   private readonly timeoutMs: number;
-  private readonly logger: InterpreterLogger;
 
   constructor(opts: LMJudgeOptions) {
-    this.interpreter = opts.interpreter;
-    this.maxOutputTokens = opts.maxOutputTokens ?? 80;
-    this.timeoutMs = opts.timeoutMs ?? 8_000;
-    this.logger = opts.logger ?? silentLogger;
+    this.client = opts.client;
+    this.model = opts.model;
+    this.maxOutputTokens = opts.maxOutputTokens ?? 200;
+    this.timeoutMs = opts.timeoutMs ?? 15_000;
   }
 
   async score(args: JudgeArgs): Promise<number> {
     const rubric =
       args.rubric ??
       (args.expectedAnswer
-        ? `matches expectedAnswer: ${args.expectedAnswer}`
-        : 'no rubric');
+        ? `The answer conveys: ${args.expectedAnswer}`
+        : 'The answer is correct and relevant to the read-time context.');
 
-    // The judge uses the Interpreter contract structurally: template carries
-    // the grading instructions, payload carries the answer, context carries
-    // the read-time context.
-    const template = `You are a strict grader. Score the ANSWER on a scale of 0.0 to 1.0 based on how well it satisfies the RUBRIC for the given READ-TIME CONTEXT.
-Output ONLY a JSON object: {"score": <number 0..1>, "reason": "<≤20 words>"}.
-RUBRIC: ${rubric}
-READ-TIME CONTEXT: {{context}}
-ANSWER: {{payload}}`;
-
-    let raw: string;
-    try {
-      raw = await this.interpreter.interpret(
-        { template, payload: args.answer, context: args.readContext },
-        { maxOutputTokens: this.maxOutputTokens, timeoutMs: this.timeoutMs },
-      );
-    } catch (err) {
-      this.logger.warn('lm_judge_unavailable', {
-        message: err instanceof Error ? err.message : String(err),
-      });
-      return 0;
-    }
-
-    return parseScore(raw, this.logger);
+    const raw = await callModelText(
+      this.client,
+      {
+        model: this.model,
+        max_tokens: this.maxOutputTokens,
+        system: JUDGE_SYSTEM,
+        messages: [
+          {
+            role: 'user',
+            content: `RUBRIC: ${rubric}\nREAD-TIME CONTEXT: ${args.readContext}\nANSWER: ${args.answer}`,
+          },
+        ],
+        output_config: { format: { type: 'json_schema', schema: JUDGE_SCHEMA } },
+      },
+      this.timeoutMs,
+      'judge',
+    );
+    return parseScore(raw);
   }
 }
 
-function parseScore(raw: string, logger: InterpreterLogger): number {
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) {
-    logger.warn('lm_judge_unparseable', { raw });
-    return 0;
-  }
+function parseScore(raw: string): number {
+  let parsed: { score?: unknown };
   try {
-    const parsed = JSON.parse(match[0]) as { score?: unknown };
-    if (typeof parsed.score !== 'number' || !Number.isFinite(parsed.score)) {
-      logger.warn('lm_judge_no_score', { raw });
-      return 0;
-    }
-    return Math.max(0, Math.min(1, parsed.score));
+    parsed = JSON.parse(raw) as { score?: unknown };
   } catch {
-    logger.warn('lm_judge_unparseable', { raw });
-    return 0;
+    throw new ModelCallError('judge: the grade is not a JSON object', { raw });
   }
+  const score = parsed?.score;
+  if (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1) {
+    throw new ModelCallError('judge: the grade has no score between 0 and 1', { raw });
+  }
+  return score;
 }

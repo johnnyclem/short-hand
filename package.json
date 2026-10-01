@@ -1,7 +1,7 @@
 {
-  "name": "short-hand",
-  "version": "0.1.0",
-  "description": "Progressive context compaction for LLMs. Old computer science for new constraints.",
+  "name": "@shorthand/core",
+  "version": "1.0.0",
+  "description": "Progressive context compaction for LLMs: LSM-style compaction, CRDT agent memory, importance detection, and truth-ledger interop. Old computer science for new constraints.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,20 +9,64 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./compaction": {
+      "types": "./dist/compaction/index.d.ts",
+      "import": "./dist/compaction/index.js"
+    },
+    "./crdt": {
+      "types": "./dist/crdt/index.d.ts",
+      "import": "./dist/crdt/index.js"
+    },
+    "./importance": {
+      "types": "./dist/importance/index.d.ts",
+      "import": "./dist/importance/index.js"
+    },
+    "./truth": {
+      "types": "./dist/truth/index.d.ts",
+      "import": "./dist/truth/index.js"
+    },
+    "./wiki": {
+      "types": "./dist/wiki/index.d.ts",
+      "import": "./dist/wiki/index.js"
+    },
+    "./ingestion": {
+      "types": "./dist/ingestion/index.d.ts",
+      "import": "./dist/ingestion/index.js"
+    },
+    "./interpreter": {
+      "types": "./dist/interpreter/index.d.ts",
+      "import": "./dist/interpreter/index.js"
+    },
+    "./verification": {
+      "types": "./dist/verification/index.d.ts",
+      "import": "./dist/verification/index.js"
+    },
+    "./benchmark": {
+      "types": "./dist/benchmark/index.d.ts",
+      "import": "./dist/benchmark/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "src",
+    "!src/**/*.test.ts",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "MIGRATION.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
+    "smoke:pack": "node scripts/pack-smoke.mjs",
     "benchmark": "npm run build && node dist/benchmark/run.js",
     "benchmark:live": "npm run build && node dist/benchmark/run.js --live",
+    "sync:truth-fixtures": "node scripts/sync-truth-fixtures.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -36,7 +80,10 @@
     "progressive",
     "context-compaction",
     "token",
-    "summarization"
+    "summarization",
+    "agent-memory",
+    "importance-detection",
+    "truth-ledger"
   ],
   "author": "Johnny Clem",
   "license": "MIT",
@@ -49,11 +96,17 @@
   },
   "homepage": "https://github.com/johnnyclem/short-hand#readme",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "sideEffects": false,
   "devDependencies": {
-    "@types/node": "20.19.39",
+    "@types/node": "22.20.4",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "fast-check": "^4.10.2",
     "typescript": "^5.8.3",
     "vitest": "^3.1.1"
   }

@@ -1,9 +1,9 @@
 /**
  * RecallTester — round-trip recall testing framework.
  *
- * Generates quiz questions from the full conversation history,
- * then evaluates whether the compacted state retains enough information
- * to answer them correctly.
+ * Generates quiz questions from the full conversation history, then
+ * evaluates whether what the model will see — a context frame, or the live
+ * levels of a compacted state — retains enough information to answer them.
  *
  * Quiz categories:
  * - Entity recall: "What database was chosen?"
@@ -14,9 +14,12 @@
 
 import type {
   CompactedState,
+  ContextFrame,
   ConversationMessage,
+  Tombstone,
   VerificationResult,
 } from '../types.js';
+import { supersededMatcher } from '../compaction/matching.js';
 
 export interface RecallQuestion {
   category: 'entity' | 'decision' | 'correction' | 'temporal';
@@ -75,15 +78,28 @@ export class RecallTester {
   }
 
   /**
-   * Evaluate recall: check whether the compacted state contains
-   * the information needed to answer each question.
+   * Evaluate recall: can the answer to each question be found in what the
+   * downstream model would see?
    *
-   * In v0.1.0, this is a simple string-matching test.
-   * Future versions will use LLM-based evaluation.
+   * - Given a `ContextFrame` (from `buildContextFrame(budget)`), only the
+   *   frame's text counts — budget truncation shows up as lost recall.
+   *   Correction lines are left out: they name the superseded value, which
+   *   is not recall of the current one.
+   * - Given a `CompactedState`, the live levels L0–L4 count — not tombstone
+   *   text and not the archive.
+   *
+   * A question whose expected answer is a value a correction superseded is
+   * not scored (reported as `recall:superseded`): the compactor is right to
+   * have dropped it. Tombstones come from the state, or from
+   * `options.tombstones` for a frame.
+   *
+   * Matching is plain string matching on the answer's key terms (words of
+   * three or more characters).
    */
   evaluateRecall(
     questions: RecallQuestion[],
-    state: CompactedState,
+    target: CompactedState | ContextFrame,
+    options: { tombstones?: Tombstone[] } = {},
   ): VerificationResult {
     if (questions.length === 0) {
       return {
@@ -93,15 +109,26 @@ export class RecallTester {
       };
     }
 
-    // Flatten all compacted state text for searching
-    const stateText = this.flattenState(state).toLowerCase();
+    const isFrame = 'sections' in target;
+    const corpus = (isFrame ? this.flattenFrame(target) : this.flattenState(target)).toLowerCase();
+    const tombstones = options.tombstones ?? (isFrame ? [] : target.tombstones);
+    const superseded = tombstones.filter((t) => t.supersededContent).map((t) => supersededMatcher(t));
 
     let recalled = 0;
+    let scored = 0;
     const checks = questions.map((q) => {
+      if (superseded.some((statesOnlyOld) => statesOnlyOld(q.expectedAnswer))) {
+        return {
+          name: 'recall:superseded',
+          passed: true,
+          message: `Skipped (superseded by a correction): ${q.question} (was: ${q.expectedAnswer})`,
+        };
+      }
+      scored++;
       const answer = q.expectedAnswer.toLowerCase();
-      // Check if the key terms from the expected answer appear in the state
+      // Check if the key terms from the expected answer appear in the corpus
       const keyTerms = answer.split(/\s+/).filter((t) => t.length > 2);
-      const found = keyTerms.length > 0 && keyTerms.every((term) => stateText.includes(term));
+      const found = keyTerms.length > 0 && keyTerms.every((term) => corpus.includes(term));
 
       if (found) recalled++;
 
@@ -114,13 +141,20 @@ export class RecallTester {
       };
     });
 
-    const recallScore = recalled / questions.length;
+    const recallScore = scored > 0 ? recalled / scored : 1.0;
 
     return {
       passed: recallScore >= 0.9,
       checks,
       recallScore,
     };
+  }
+
+  private flattenFrame(frame: ContextFrame): string {
+    return frame.sections
+      .filter((s) => s.kind !== 'correction')
+      .map((s) => s.content)
+      .join('\n');
   }
 
   private flattenState(state: CompactedState): string {
@@ -136,10 +170,12 @@ export class RecallTester {
       parts.push(entry.compacted);
     }
 
-    // L2
+    // L2 — a decision summary whose decisions were all superseded is history
     for (const summary of state.l2_summaries) {
+      const live = summary.decisions.filter((d) => !d.superseded);
+      if (summary.decisions.length > 0 && live.length === 0) continue;
       parts.push(summary.summary);
-      for (const decision of summary.decisions) {
+      for (const decision of live) {
         parts.push(decision.description);
         parts.push(decision.chosen);
         for (const alt of decision.alternatives) {
@@ -161,12 +197,8 @@ export class RecallTester {
       parts.push(inv.value);
     }
 
-    // Tombstones
-    for (const t of state.tombstones) {
-      parts.push(t.supersededContent);
-      parts.push(t.correctedValue ?? '');
-      parts.push(t.reason);
-    }
+    // Tombstones are deliberately left out: their text names the
+    // superseded value, which must not count as recall.
 
     return parts.join(' ');
   }

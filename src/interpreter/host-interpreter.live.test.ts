@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { HostInterpreter, type AnthropicLikeClient } from './host-interpreter.js';
+import { DEFAULT_LIVE_MODEL } from '../benchmark/live.js';
 
 const HAS_KEY = !!process.env.ANTHROPIC_API_KEY;
 
@@ -31,7 +32,7 @@ describe.skipIf(!HAS_KEY)('HostInterpreter — live (gated by ANTHROPIC_API_KEY)
     }
     const h = new HostInterpreter({
       client,
-      model: process.env.SHORTHAND_BENCHMARK_MODEL ?? 'claude-3-5-haiku-latest',
+      model: process.env.SHORTHAND_BENCHMARK_MODEL || DEFAULT_LIVE_MODEL,
     });
     const out = await h.interpret(
       {

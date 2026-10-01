@@ -5,13 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,3 +26,25 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  pack-smoke:
+    name: Pack and install smoke (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # npm pack, install the tarball into an empty project, import every
+      # subpath export at runtime, and typecheck a consumer under
+      # moduleResolution Node16 and Bundler.
+      - run: npm run smoke:pack
+      # Offline context-shift benchmark: a wiring smoke test of the CLI.
+      - run: node dist/benchmark/run.js
