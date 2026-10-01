@@ -91,7 +91,7 @@ Before merging changes that touch `src/interpreter/`, `src/crdt/active-engram-st
 
 ```ts
 import Anthropic from '@anthropic-ai/sdk';
-import { HostInterpreter } from 'short-hand';
+import { HostInterpreter } from '@shorthand/core';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const interpreter = new HostInterpreter({

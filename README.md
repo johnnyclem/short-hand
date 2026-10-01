@@ -1,11 +1,16 @@
-# short-hand
+# @shorthand/core
 
 Progressive context compaction for LLMs. Old computer science for new constraints.
 
 - **LSM-tree compaction** — five levels, from a raw memtable down to core invariants, with corrections tracked explicitly (tombstones) so overridden facts don't quietly resurface.
+- **Snapshot compaction with verification** — compact a whole history to one summary at L0–L3, then check it with recall tests, pluggable invariants and information-theoretic bounds.
 - **Active engrams** — agential memories that get *reinterpreted* at recall time instead of just replayed, backed by a pluggable regex/local/host interpreter tier and a benchmark that measures whether the reinterpretation actually helps.
-- **CRDT primitives** — LWW-Register, OR-Set, G-Set, and a per-agent `AgentMemory` for merging memory across agents.
+- **CRDT memory** — Lamport and vector clocks, LWW-Register, OR-Set, G-Set, RGA, and a per-agent `AgentMemory` (L0–L4 plus active engrams) for merging memory across agents, with a structural conflict detector.
+- **Importance detection** — three domain-agnostic signals (state delta, reference frequency, trajectory discontinuity).
+- **Truth-ledger interop** — consume [stenographer](https://github.com/johnnyclem/stenographer)'s TB/UV JSONL as first-class context, fail closed on anything unrecognized, and emit candidate invariants back as PROPOSAL lines.
 - **Zero runtime dependencies.** Fully typed. ESM-only.
+
+This repository is the one canonical home of `@shorthand/core`. smallchat's former vendored copy (`smallchat/shorthand`) was merged into it; see [MIGRATION.md](./MIGRATION.md) for every rename.
 
 ## Why
 
@@ -16,13 +21,28 @@ Some memories shouldn't be compacted at all — they need to be restated every t
 ## Install
 
 ```bash
-npm install short-hand
+npm install @shorthand/core
 ```
+
+Every module is also available on its own subpath:
+
+| Subpath | What it holds |
+|---|---|
+| `@shorthand/core` | Everything below except the benchmark |
+| `@shorthand/core/compaction` | `CompactionEngine`, `RegexCompactor`, `DefaultCompactor` and the snapshot verification strategies |
+| `@shorthand/core/crdt` | Clocks, LWW-Register, OR-Set, G-Set, RGA, `AgentMemory`, `MemoryMerge`, `ConflictDetector`, `ActiveEngramStore` |
+| `@shorthand/core/importance` | `ImportanceDetector` and its three signals |
+| `@shorthand/core/truth` | Truth-ledger codec, selection, rendering, proposals |
+| `@shorthand/core/wiki` | `WikiRenderer` |
+| `@shorthand/core/ingestion` | `SourceIngester` |
+| `@shorthand/core/interpreter` | Regex/local/host interpreters and `withFallback` |
+| `@shorthand/core/verification` | `InvariantChecker`, `RecallTester` (LSM state) |
+| `@shorthand/core/benchmark` | The context-shift benchmark (dev tool; not in the root export) |
 
 ## Quick Start
 
 ```typescript
-import { CompactionEngine } from 'short-hand';
+import { CompactionEngine } from '@shorthand/core';
 
 const engine = new CompactionEngine({
   memtableSize: 10,   // messages to keep verbatim
@@ -90,7 +110,7 @@ In `v0.1.0` these last two signals are lexical (Jaccard-similarity) approximatio
 An **active engram** is a memory that carries its own interpreter template and activation policy. Instead of injecting its payload verbatim, the store calls `interpret(context)` on every eligible engram before it enters a context frame — the same fact gets restated differently depending on what the conversation is about right now.
 
 ```typescript
-import { ActiveEngramStore } from 'short-hand';
+import { ActiveEngramStore } from '@shorthand/core';
 
 const store = new ActiveEngramStore();
 
@@ -151,7 +171,7 @@ The interpreter step is a **bounded LM call made at retrieval time** — separat
 | `host` | `HostInterpreter` | Any Anthropic-shaped client you inject (`messages.create(...)`) | Stable, requires your own client + API key |
 
 ```typescript
-import { HostInterpreter, LocalInterpreter, RegexInterpreter, withFallback } from 'short-hand';
+import { HostInterpreter, LocalInterpreter, RegexInterpreter, withFallback } from '@shorthand/core';
 
 const host = new HostInterpreter({
   client: anthropicClient, // any { messages: { create(req, opts?) } } shape — no SDK import required
@@ -203,14 +223,14 @@ Aggregate (excluding calibration): wins=6  ties=0  losses=0
   winRate=1.000  meanLift=+0.771  Wilson95=[0.610, 1.000]
 ```
 
-`ContextShiftBenchmark`, `Judge` (`KeywordJudge` / `LMJudge`), and `Answerer` are all pluggable — swap in your own fixtures, judge, or downstream model to validate the same claim against your own workload.
+`ContextShiftBenchmark`, `Judge` (`KeywordJudge` / `LMJudge`), and `Answerer` (all imported from `@shorthand/core/benchmark`) are pluggable — swap in your own fixtures, judge, or downstream model to validate the same claim against your own workload.
 
 ## Source Ingestion
 
 `SourceIngester` bridges raw documents into the compaction pipeline: it chunks a document (markdown-aware, respecting heading boundaries, with configurable overlap) into `ConversationMessage`s and feeds them through a `CompactionEngine`.
 
 ```typescript
-import { CompactionEngine, SourceIngester } from 'short-hand';
+import { CompactionEngine, SourceIngester } from '@shorthand/core';
 
 const engine = new CompactionEngine();
 const ingester = new SourceIngester({ chunkSize: 800, chunkOverlap: 100 });
@@ -234,7 +254,7 @@ const event = await ingester.ingest(
 `WikiRenderer` materializes a `CompactedState` as a set of interlinked markdown pages — entity pages, topic pages, an index, and an append-only ingestion log.
 
 ```typescript
-import { WikiRenderer } from 'short-hand';
+import { WikiRenderer } from '@shorthand/core';
 
 const wiki = new WikiRenderer({ wikiTitle: 'Project Knowledge Base' });
 const pages = wiki.render(engine.getState(), ingester.getEvents());
@@ -251,7 +271,7 @@ Each entity page cross-links its relationships, the topics that reference it, re
 The main orchestrator. Manages the full LSM-tree lifecycle.
 
 ```typescript
-import { CompactionEngine } from 'short-hand';
+import { CompactionEngine } from '@shorthand/core';
 
 const engine = new CompactionEngine({
   memtableSize: 10,        // L0 capacity before auto-flush (default: 10)
@@ -287,81 +307,91 @@ engine.attachActiveEngrams(store);       // surface agential memories in frames
 Tier 0 compactor — pattern-based extraction with zero external dependencies. Extracts decisions, corrections, entities, and constraints via regex. By its own estimate it catches roughly 20–30% of real-world decisions; it's a fast, dependency-free baseline, not a full extraction pipeline.
 
 ```typescript
-import { RegexCompactor } from 'short-hand';
+import { RegexCompactor } from '@shorthand/core';
 
 const compactor = new RegexCompactor();
 const newState = await compactor.compact(messages, targetLevel, currentState);
 const recompacted = await compactor.recompact(state, targetLevel);
 ```
 
-### ImportanceDetector
+### Snapshot compaction and verification
 
-Scores messages by importance to guide compaction decisions.
+`DefaultCompactor` compacts a whole `ConversationHistory` into one `CompactedSnapshot` at a `SnapshotLevel` (`'L0'`–`'L3'`), and three strategies check the result against the original conversation.
 
 ```typescript
-import { ImportanceDetector } from 'short-hand';
+import { DefaultCompactor, VerificationHarness, checkInvariants, BUILTIN_INVARIANTS } from '@shorthand/core';
+
+const compactor = new DefaultCompactor();
+const snapshot = await compactor.compact({ sessionId: 's1', messages }, 'L2');
+const deeper = await compactor.recompact(snapshot, 'L3');
+
+// Recall test + invariant checks + information-theoretic retention, in one pass
+const result = new VerificationHarness({ minRecallScore: 0.85 }).verify(deeper, { sessionId: 's1', messages });
+
+// Invariants are pluggable: add your own beside the built-ins
+const report = checkInvariants(deeper, history, [...BUILTIN_INVARIANTS, myInvariant]);
+```
+
+These checks are heuristics over extracted entities, decisions and tombstones, not proofs: a pass means the checked properties held for what the extractors found.
+
+### ImportanceDetector
+
+Scores each message on three domain-agnostic signals: how much it mutates a running entity-relationship graph (state delta), how often later messages refer back to it (reference frequency), and how sharply it turns away from the conversation's trajectory in embedding space (trajectory discontinuity).
+
+```typescript
+import { ImportanceDetector } from '@shorthand/core';
 
 const detector = new ImportanceDetector();
-const score = detector.score(message);
-// { overall: 0.72, stateDelta: 0.85, referenceFrequency: 0.4, trajectoryDiscontinuity: 0.8 }
+const score = detector.addMessage(message); // incremental — call once per message, in order
+// { messageId, importance: 0.72, stateDelta, referenceFrequency, trajectoryDiscontinuity, dominantSignal: 'state_delta' }
 
-detector.recompute();      // retrospectively recompute all scores
-detector.getScore(msgId);  // look up a previously scored message
-detector.getAllScores();   // all { messageId, score } pairs
-const score = detector.score(message); // incremental — call once per message
-// { overall: 0.72, stateDelta: 0.85, referenceFrequency: 0.4, trajectoryDiscontinuity: 0.8 }
-
-// Retrospective pass: folds in how often later messages referenced each one
-const updated = detector.recompute();
+detector.recomputeScores();          // retrospective pass: folds in later references
+detector.getScore(msgId);            // look up a previously scored message
+detector.getImportantMessages(0.5);  // scores at or above a threshold, highest first
 ```
+
+The trajectory signal and semantic references need `message.embedding` (a `Float32Array` your host computes; no model ships with this package). Without embeddings those contributions are 0 and the score rests on state delta and explicit references.
 
 ### CRDT Primitives
 
-Distributed-friendly data structures for multi-agent scenarios.
+State-based CRDTs for multi-agent memory: each replica serializes its state, and `merge` accepts any other replica's state in any order. Each primitive owns a Lamport clock; equal counters are ordered by agent id.
 
 ```typescript
-import { AgentMemory, LWWRegister, ORSet, GSet } from 'short-hand';
+import { AgentMemory, MemoryMerge, LWWRegister, ORSet, GSet, RGA } from '@shorthand/core';
 
-// Per-agent memory combining all CRDT layers (L4 invariants, L3 entities, L2 summaries, active engrams)
+// Per-agent memory across all layers: L4 invariants (LWW), L3 graph
+// (OR-Set nodes + LWW edges), L2 summaries (G-Set), L1/L0 logs (RGA),
+// plus the agent's active engrams.
 const memory = new AgentMemory('agent-1');
 memory.setInvariant('db', 'PostgreSQL');
-memory.addEntity({
-  name: 'PostgreSQL',
-  type: 'technology',
-  properties: {},
-  firstMention: 'm1',
-  lastMention: 'm1',
-});
+memory.addEntity({ id: 'pg', type: 'technology', name: 'PostgreSQL' });
+memory.addSummary('storage', 'We settled on PostgreSQL for storage.', true);
+memory.appendMessage('m1', 'user', 'Use PostgreSQL.');
 
-// Last-Writer-Wins Register (L4 invariants) — what AgentMemory.invariants uses internally
+// Merge another agent's serialized state (mutates in place)
+memory.mergeFrom(otherMemory.serialize());
+const restored = AgentMemory.from(memory.serialize());
+
+// Merge several agents and get a report of semantic conflicts (same
+// invariant key with different values, contradictory edges, divergent summaries)
+const report = new MemoryMerge().mergeAll(memory, [a.serialize(), b.serialize()]);
+
+// The primitives on their own
 const reg = new LWWRegister<string>('agent-1');
-reg.set('db', 'PostgreSQL', 1);
-reg.set('db', 'MySQL', 2); // newer Lamport timestamp wins
-// Per-agent memory combining all CRDT types
-const memory = new AgentMemory('agent-1');
-memory.setInvariant('db', 'PostgreSQL');
-memory.addEntity(entity);
-memory.addSummary(summary);
+reg.set('db', 'PostgreSQL');               // stamped with the register's Lamport clock
 
-// Last-Writer-Wins Register (L4 invariants)
-const reg = new LWWRegister<string>('agent-1');
-reg.set('db', 'PostgreSQL', 1);
-reg.set('db', 'MySQL', 2); // newer timestamp wins
-
-// Observed-Remove Set (L3 entities, add-wins)
-const orset = new ORSet<string>('agent-1');
+const orset = new ORSet<string>('agent-1'); // add-wins; removes travel as tombstones
 orset.add('React');
 orset.remove('React');
 
-// Grow-Only Set (L2 summaries)
-const gset = new GSet<string>();
-gset.add('Session covered auth flow');
+const gset = new GSet<string>();            // grow-only; entries dedupe by dedupeKey or content
+gset.add({ value: 'Session covered auth flow', sourceAgent: 'agent-1', isDirectParticipant: true });
 
-// Merge another agent's serialized state into this one (mutates in place)
-memory.mergeFrom(otherMemory.serialize());
-// Merge another agent's serialized memory into this one
-memory.mergeFrom(otherMemory.serialize());
+const log = new RGA<string>('agent-1');     // replicated sequence
+log.append('first');
 ```
+
+The CRDT layer is experimental: known convergence gaps (concurrent inserts at the head of an RGA, equal-length G-Set ties, conflict severity that ignores causality) are tracked for a follow-up release, so don't rely on it as a convergence guarantee yet.
 
 ### ActiveEngramStore
 
@@ -371,7 +401,7 @@ re-interpreted against the *current* context before injection — salience over
 fidelity.
 
 ```typescript
-import { ActiveEngramStore } from 'short-hand';
+import { ActiveEngramStore } from '@shorthand/core';
 
 const store = new ActiveEngramStore();
 const id = store.add('user prefers CLI tools', {
@@ -401,7 +431,7 @@ import {
   LocalInterpreter,   // Ollama HTTP endpoint
   HostInterpreter,    // Anthropic-shaped client (bring your own SDK instance)
   withFallback,
-} from 'short-hand';
+} from '@shorthand/core';
 
 const interpreter = withFallback(
   new HostInterpreter({ client, model: 'claude-haiku-4-5-20251001' }),
@@ -418,7 +448,7 @@ const text = await interpreter.interpret(
 Safety checks and recall testing for compacted state.
 
 ```typescript
-import { InvariantChecker, RecallTester } from 'short-hand';
+import { InvariantChecker, RecallTester } from '@shorthand/core';
 
 // Five structural safety checks against compacted state
 const checker = new InvariantChecker();
@@ -440,7 +470,7 @@ Feed documents through the compaction pipeline, then materialize the
 compacted knowledge as interlinked markdown pages.
 
 ```typescript
-import { SourceIngester, WikiRenderer } from 'short-hand';
+import { SourceIngester, WikiRenderer } from '@shorthand/core';
 
 const ingester = new SourceIngester({ chunkSize: 800, chunkOverlap: 100 });
 const event = await ingester.ingest(
@@ -466,7 +496,7 @@ npm run benchmark:live   # Anthropic-backed (needs ANTHROPIC_API_KEY + @anthropi
 ### Utilities
 
 ```typescript
-import { estimateTokens, generateId } from 'short-hand';
+import { estimateTokens, generateId } from '@shorthand/core';
 
 estimateTokens('Hello world'); // ~3 (4 chars per token heuristic)
 generateId();                  // e.g. 'mdlk2h4c-9f2a1qz'
@@ -527,10 +557,10 @@ import type {
   WikiPage,
   Interpreter,
   InterpreterTier,
-} from 'short-hand';
+} from '@shorthand/core';
 ```
 
-This is a curated subset — the full export surface (CRDT serialization types, benchmark fixtures/reports, host/local interpreter options, and more) is in `src/index.ts`.
+This is a curated subset — the full export surface (CRDT serialization types, snapshot verification types, host/local interpreter options, and more) is in `src/index.ts`; benchmark fixtures and reports are on `@shorthand/core/benchmark`.
 
 ## Development
 
@@ -547,29 +577,36 @@ npm run benchmark:live    # host-tier benchmark against a real model (needs ANTH
 
 ## Truth-Ledger Interop
 
-Short-hand can sync [stenographer's](https://github.com/johnnyclem/stenographer) TB/UV v2 truth ledger at a JSONL seam — no code dependency in either direction:
+@shorthand/core syncs [stenographer's](https://github.com/johnnyclem/stenographer) TB/UV truth ledger at a JSONL seam — no code dependency in either direction:
 
 ```typescript
-// Read: consume a ledger export as high-priority context input
-const result = engine.syncTruthLedger(jsonlLines);
-const frame = engine.buildContextFrame(); // asserted truth renders first
+import { parseWikiLines, selectCurrentTruth, renderTruthSection, exportProposalDrafts } from '@shorthand/core';
 
-// Write: emit L4 candidates back as proposal drafts (proposals only —
-// nothing becomes truth until an accountable author signs it over there)
-import { exportProposalDrafts } from 'short-hand';
-const draftLines = exportProposalDrafts(engine.getState());
+// Read: consume a ledger export as high-priority context input
+const result = engine.syncTruthLedger(jsonlLines); // { selection, displacedInvariantKeys, errors }
+const frame = engine.buildContextFrame();           // asserted truth renders first
+
+// Or work with the selection directly
+const { entries, errors } = parseWikiLines(jsonl);
+const selection = selectCurrentTruth(entries);      // groundTruth / contested / unverified / history
+const section = renderTruthSection(selection);      // '## Asserted Truth (ledger)' + marked lines
+
+// Write: emit L4 invariants and tombstones back as PROPOSAL lines (proposals
+// only — nothing becomes truth until an accountable author signs it over there)
+const proposalLines = exportProposalDrafts(engine.getState(), { author: 'johnny' });
 ```
 
-Synced truth keeps its two axes — provenance and confidence type. Active TBs render as ground truth, contested TBs carry their disputing UVs visibly, open UVs are flagged but never read as proven, and overridden/refuted entries are displaced on the next sync. See [`docs/truth-ledger-integration.md`](./docs/truth-ledger-integration.md) for the design and the convergence decision it defers.
+Synced truth keeps its two axes — provenance and confidence type — and renders with the suite's markers: `[TB]` for ground truth, `[TB ⚠ CONTESTED]` with its disputing UVs beside it, and `[UV — UNVERIFIED]` for open assertions, which never read as proven. Overridden, struck and refuted entries are displaced on the next sync. The codec fails closed: a line without a status is rejected, and an unknown status is kept verbatim but never counts as truth. Snapshot compaction gets the same selection through `TruthAwareCompactor`. See [`docs/truth-ledger-integration.md`](./docs/truth-ledger-integration.md) for the design.
 
 ## Project Status
 
-short-hand is pre-1.0 (`0.1.0`) and single-maintainer. What's solid today: the five-level LSM compaction core, CRDT primitives, tombstones, and importance scoring, all running on the shipped regex tier with 150+ passing tests; the active-engram subsystem and its three interpreter tiers, each behind the same bounded, fallback-safe contract; source ingestion and wiki rendering; and the context-shift benchmark that backs the claims above.
+@shorthand/core is pre-1.0 (`0.1.0`) and single-maintainer. What's solid today: the five-level LSM compaction core, tombstones, snapshot compaction, and importance scoring, all running on the shipped regex tier with 150+ passing tests; the active-engram subsystem and its three interpreter tiers, each behind the same bounded, fallback-safe contract; source ingestion and wiki rendering; and the context-shift benchmark that backs the claims above.
 
 What's still aspirational:
 
+- **CRDT convergence** — the CRDT layer is experimental; see [CRDT Primitives](#crdt-primitives) for the known gaps.
 - **Compactor tiers** — `local`/`host` for L0→L1 write-time compaction accept configuration but currently fall back to `regex` (see [Compactor Tiers](#compactor-tiers)).
-- **Embeddings** — there's no embedding model wired in yet; `ImportanceDetector`'s reference-frequency and trajectory-discontinuity signals use lexical (Jaccard) approximations, and `StubEmbedder` is an explicit placeholder returning zero vectors.
+- **Embeddings** — no embedding model ships with this package (it stays zero-dependency). `ImportanceDetector` uses `message.embedding` when the host supplies one; `StubEmbedder` is an explicit placeholder returning zero vectors.
 
 ## Ecosystem
 

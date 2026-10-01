@@ -8,7 +8,7 @@ Stenographer's TB/UV v2 (its PR #7) split truth into detection (machine, proposa
 
 ## Decision (working posture)
 
-**Option B.** Short-hand consumes the ledger's JSONL export as high-priority context input and emits its own candidates back as proposal drafts. No code dependency in either direction — the contract is the line format, protected by tests on both sides plus stenographer's round-trip invariant.
+**Option B.** @shorthand/core consumes the ledger's JSONL export as high-priority context input and emits its own candidates back as proposal drafts. No code dependency in either direction — the contract is the line format, protected by tests on both sides plus stenographer's round-trip invariant.
 
 Why B first:
 
@@ -20,24 +20,30 @@ Why B first:
 
 ### Read direction: `CompactionEngine.syncTruthLedger(jsonl)`
 
-Parses stenographer's `export_wiki_entries` JSONL (`src/truth/ledger-sync.ts`; last line wins per id, since statuses evolve in an append-only file) and buckets entries per the §7 consumption rules:
+`parseWikiLines` (`src/truth/wiki.ts`) parses stenographer's `export_wiki_entries` JSONL into typed entries (last line wins per id, since statuses evolve in an append-only file), and `selectCurrentTruth` buckets them per the §7 consumption rules. `renderTruthSection` (`src/truth/compaction-bridge.ts`) renders the selection with the suite's frozen markers:
 
-| Ledger state | Bucket | Behavior in short-hand |
+| Ledger state | Selection bucket | Rendered as |
 |---|---|---|
-| Active `TB` | `citable` | Rendered as `[truth] …`, first in every context frame |
-| Contested `TB` | `citable` + attached UVs | Rendered with its contesting UV(s) — both sides travel together, never silently resolved |
-| Open `UV` | `flags` | Rendered `[unverified] …` — flag, don't block; never reads as proven |
-| Overridden `TB`, refuted/verified `UV` | `displaced` | Excluded from current truth; cached projections are evicted on sync |
+| Active `TB` | `groundTruth` | `[TB] …`, first in every context frame |
+| Contested `TB` | `contested` (with its open contesting UVs) | `[TB ⚠ CONTESTED] …` with each `disputed by [UV — UNVERIFIED] …` beside it — both sides travel together, never silently resolved |
+| Open `UV` | `unverified` | `[UV — UNVERIFIED] …` — flag, don't block; never reads as proven. A UV contesting a TB that is not (yet) contested renders standalone with `contests <id>`, so it is never dropped |
+| Overridden or struck `TB`, refuted/verified `UV` | `history` | Not rendered; cached projections are evicted on sync |
+| Missing status | — | Rejected as a parse error |
+| Unknown status | `history` | Kept verbatim (it round-trips) but never counts as truth |
 
-The synced view lives **beside** the LSM levels, not inside them: recompaction can rewrite L4, but it cannot rewrite ledger truth, and no compaction path can promote a UV into something that reads as proven. Hosts that want ledger truth *in* L4 can opt in via `citableToInvariant` (uncontested TBs only — an invariant row can't carry the contested asterisk); such projections get a `truth:<id>` source marker, and the next sync displaces any whose entry was overridden.
+The codec preserves what it does not interpret — `x-steno`, other top-level keys, unknown status values, and tombstoned `literals` (validated with stenographer's write-time rule) — so `serializeWikiEntries(parseWikiLines(lines).entries)` round-trips.
 
-### Write direction: `exportProposalDrafts(state)`
+The synced selection lives **beside** the LSM levels, not inside them: recompaction can rewrite L4, but it cannot rewrite ledger truth, and no compaction path can promote a UV into something that reads as proven. Hosts that want ledger truth *in* L4 can opt in via `groundTruthToInvariant` (active TBs only — an invariant row can't carry the contested asterisk); such projections get a `truth:<id>` source marker, and the next sync displaces any whose entry is no longer ground truth. For string-typed L4 stores (e.g. `AgentMemory`'s LWW register), `truthToInvariantRecords` embeds the marker in the value itself.
 
-L4 invariants (drafted as **UVs** — an invariant is usually tribal knowledge that compacted well, which is exactly what UV means) and detected correction tombstones go out as JSONL proposal drafts. Stenographer's `importProposalDrafts` files each as a `PROPOSAL` under a `detector:short-hand` identity:
+Snapshot compaction (`DefaultCompactor`) gets the same selection through `TruthAwareCompactor` / `applyTruthToSnapshot`, which rebuild the truth section on every round so stale entries are displaced.
+
+### Write direction: `exportProposalDrafts(state, { author })`
+
+L4 invariants (drafted as **UVs** — an invariant is usually tribal knowledge that compacted well, which is exactly what UV means) and detected correction tombstones (drafted as unsigned **TBs**) go out as JSONL PROPOSAL lines in the suite's single envelope: `{schemaVersion: 2, type: "PROPOSAL", id, ts, author, kind: "tb" | "uv", draft, targetRef, signal: {source: "compaction-candidate", detail}, agentSessionId, provenance?}`. `proposeInvariants` does the same for snapshot entities and decisions.
 
 - Proposals only — there is no external write path to TB or UV.
-- Drafts carry no author; accountability is supplied at intake, and the detector identity cannot sign its own intake (the contempt check rejects it).
-- `targetRef` (`shorthand:invariant:<key>` / `shorthand:tombstone:<msgId>`) makes re-imports idempotent while proposals stay open.
+- Every line names an accountable `author`; generic identities (`system`, `assistant`, `agent`, …) throw before a line is emitted, and nothing the compactor emits is signed.
+- `targetRef` (`shorthand:invariant:<key>` / `shorthand:tombstone:<msgId>`, or `entity:` / `decision:` refs for snapshots) makes re-imports idempotent while proposals stay open.
 - Invariants that were themselves projected from the ledger are never proposed back (corroboration loop).
 
 ## What would justify revisiting Option A
@@ -48,6 +54,6 @@ L4 invariants (drafted as **UVs** — an invariant is usually tribal knowledge t
 
 ## Open items inherited from stenographer's §13 (affect this seam)
 
-1. **UV TTL** — open UVs never expire; the `flags` bucket can grow without bound. If frames get noisy, cap or age-weight flags on this side.
+1. **UV TTL** — open UVs never expire; the `unverified` bucket can grow without bound. If frames get noisy, cap or age-weight flags on this side.
 2. **Signer rules** — today every short-hand candidate needs a human (or independent `command` evidence) to become truth. Fine at current volume; revisit if the proposal queue backs up.
-3. **Contested-TB posture** — currently authoritative-with-asterisk, and short-hand renders it that way. If stenographer downgrades contested TBs to UV-grade trust, `renderTruthSection` and the `citable` bucketing are the two places to change.
+3. **Contested-TB posture** — currently authoritative-with-asterisk, and short-hand renders it that way. If stenographer downgrades contested TBs to UV-grade trust, `renderTruthSection` and `selectCurrentTruth` are the two places to change.
