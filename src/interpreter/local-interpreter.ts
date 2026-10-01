@@ -75,7 +75,7 @@ export class LocalInterpreter implements Interpreter {
       opts.fetch ?? ((globalThis as { fetch?: FetchLike }).fetch as FetchLike);
     this.logger = opts.logger ?? silentLogger;
     if (!this.fetchImpl) {
-      throw new Error('LocalInterpreter requires global fetch (Node ≥18) or an injected fetch');
+      throw new Error('LocalInterpreter requires global fetch (Node ≥22) or an injected fetch');
     }
   }
 

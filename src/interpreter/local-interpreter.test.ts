@@ -140,3 +140,16 @@ describe('LocalInterpreter — truncated output (SH-17)', () => {
     ).resolves.toBe('ok');
   });
 });
+
+describe('LocalInterpreter — runtime floor', () => {
+  it('names the suite Node floor (22) when no fetch is available', () => {
+    const g = globalThis as { fetch?: unknown };
+    const saved = g.fetch;
+    g.fetch = undefined;
+    try {
+      expect(() => new LocalInterpreter({ model: 'llama3' })).toThrow(/Node ≥22/);
+    } finally {
+      g.fetch = saved;
+    }
+  });
+});

@@ -1,6 +1,6 @@
 {
   "name": "@shorthand/core",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Progressive context compaction for LLMs: LSM-style compaction, CRDT agent memory, importance detection, and truth-ledger interop. Old computer science for new constraints.",
   "type": "module",
   "main": "./dist/index.js",
@@ -50,16 +50,20 @@
   },
   "files": [
     "dist",
+    "src",
+    "!src/**/*.test.ts",
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
     "MIGRATION.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
+    "smoke:pack": "node scripts/pack-smoke.mjs",
     "benchmark": "npm run build && node dist/benchmark/run.js",
     "benchmark:live": "npm run build && node dist/benchmark/run.js --live",
     "sync:truth-fixtures": "node scripts/sync-truth-fixtures.mjs",
@@ -92,11 +96,14 @@
   },
   "homepage": "https://github.com/johnnyclem/short-hand#readme",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "sideEffects": false,
   "devDependencies": {
-    "@types/node": "20.19.39",
+    "@types/node": "22.20.4",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "fast-check": "^4.10.2",
