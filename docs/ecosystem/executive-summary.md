@@ -1,5 +1,13 @@
 # The Agent Stack: Executive Summary (Short-Hand vantage)
 
+> **Archived (pre-1.0 snapshot, July 2026).** This evaluation describes short-hand as it was
+> before @shorthand/core 1.0, and its findings about this repo are out of date: the package is now
+> `@shorthand/core` (merged with smallchat's vendored copy, which smallchat is replacing with a dependency on this package),
+> CI runs on Node 22 and 24, and the stenographer seam is wired (this package reads stenographer's
+> truth format v2 and writes PROPOSAL streams, checked against stenographer's golden fixtures). It is
+> kept for its reasoning; see the [README](../../README.md) and [CHANGELOG](../../CHANGELOG.md) for
+> the current state. Claims about the other projects were not re-verified.
+
 **Scope:** AgentVault, SmallChat, Stenographer, and Short-Hand — evaluated as a single ecosystem,
 from inside this repo (Short-Hand).
 **Audience:** stakeholders deciding whether/how to integrate these projects.

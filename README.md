@@ -4,11 +4,11 @@ Progressive context compaction for LLMs. Old computer science for new constraint
 
 - **LSM-tree compaction** — five levels, from a raw memtable down to core invariants, with corrections tracked explicitly (tombstones) so overridden facts don't quietly resurface.
 - **Snapshot compaction with verification** — compact a whole history to one summary at L0–L3, then check it with recall tests, pluggable invariants and information-theoretic bounds.
-- **Active engrams** — agential memories that get *reinterpreted* at recall time instead of just replayed, backed by a pluggable regex/local/host interpreter tier and a benchmark that measures whether the reinterpretation actually helps.
+- **Active engrams** — agential memories that get *reinterpreted* at recall time instead of just replayed, backed by a pluggable regex/local/host interpreter tier and a benchmark harness for testing whether the reinterpretation helps (the bundled starter set is a wiring smoke test; it has not shown that it does).
 - **CRDT memory** — Lamport and vector clocks, LWW-Register, OR-Set, G-Set, RGA, and a per-agent `AgentMemory` (L0–L4 plus active engrams) for merging memory across agents, with a structural conflict detector.
-- **Importance detection** — three domain-agnostic signals (state delta, reference frequency, trajectory discontinuity).
+- **Importance detection** — a standalone scorer with three domain-agnostic signals (state delta, reference frequency, trajectory discontinuity).
 - **Truth-ledger interop** — read [stenographer](https://github.com/johnnyclem/stenographer)'s truth format v2 (hash-chained TB/UV streams with TRANSITION status lines) as first-class context, checked against stenographer's golden fixtures; fail closed on anything unrecognized or unverifiable; and emit candidates back as a hash-chained PROPOSAL stream.
-- **Zero runtime dependencies.** Fully typed. ESM-only.
+- **Zero runtime dependencies.** Fully typed. ESM-only. Node ≥22.
 
 This repository is the one canonical home of `@shorthand/core`. smallchat's former vendored copy (`smallchat/shorthand`) was merged into it; see [MIGRATION.md](./MIGRATION.md) for every rename.
 
@@ -16,13 +16,15 @@ This repository is the one canonical home of `@shorthand/core`. smallchat's form
 
 Long conversations with LLMs accumulate context that eventually hits token limits. Naive truncation loses important information. Short-hand applies database-inspired compaction instead: recent messages stay verbatim, older messages progressively condense into summaries, a knowledge graph, and core invariants.
 
-Some memories shouldn't be compacted at all — they need to be restated every time they're recalled, in light of whatever the conversation is about *now*. Short-hand's active-engram subsystem exists for exactly that case, and ships with a benchmark that measures whether the restatement step actually helps versus dumping the raw memory back in.
+Some memories shouldn't be compacted at all — they need to be restated every time they're recalled, in light of whatever the conversation is about *now*. Short-hand's active-engram subsystem exists for that case, and ships with a benchmark harness for testing, on your own fixtures, whether the restatement step helps versus dumping the raw memory back in.
 
 ## Install
 
 ```bash
-npm install @shorthand/core
+npm i @shorthand/core
 ```
+
+Requirements: Node.js 22 or later. The package is ESM-only (`import`, not `require`). TypeScript users need `moduleResolution` `node16`, `nodenext` or `bundler`, which read the `exports` map; the subpaths below are the only importable entry points.
 
 Every module is also available on its own subpath:
 
@@ -96,7 +98,7 @@ Messages enter L0 and progressively compact into deeper levels as the conversati
 
 `buildContextFrame(budget)` fills sections in priority order — synced ledger truth, corrections, L4 invariants, then (after holding back up to 25% of the budget for the newest raw messages) memories, pinned code, L3, L2 and L1 — **item by item**: an item that does not fit is skipped and counted in `section.omitted`, and the next one is tried. A contested TB and the UVs disputing it are one item. L0 fills newest-first and stays contiguous.
 
-The budget is a hard ceiling on the rendered frame: `frame.tokenUsage` is `estimateTokens(renderContextFrame(frame))` and never exceeds the budget (the estimate is the package's ~4 characters per token heuristic, not a model tokenizer count).
+The budget is a ceiling on the rendered frame: `frame.tokenUsage` is `estimateTokens(renderContextFrame(frame))` and is at most the budget (tested at budgets from 0 to 600 tokens, in steps of 7, on a frame with every section kind). The estimate is the package's ~4 characters per token heuristic, not a model tokenizer count, so leave headroom when a model's real context limit is tight.
 
 Each section has a `kind` with one fixed marker:
 
@@ -112,7 +114,7 @@ Each section has a `kind` with one fixed marker:
 | `history` | (message text) | L1 |
 | `recent` | `role: text` | L0 |
 
-Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker (and its full-width or invisible-character look-alikes), any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` and can never pass for ledger truth. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
+Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker (and its full-width or invisible-character look-alikes), any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` in the frame instead of reading as a ledger line. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
 
 An L1 entry whose code does not fit is shown with `[code sha256:<12 hex> — N tokens, not shown]` references; `engine.getSpan(hash)` returns the exact text, and `engine.pinSpan(hash)` gives a span its own frame section.
 
@@ -122,7 +124,7 @@ A correction creates a **tombstone** that records the superseded value, and ever
 
 Corrections come from two places:
 
-- **Declared by the host** (`confidence: 'explicit'`) — the deterministic path:
+- **Declared by the host** (`confidence: 'explicit'`) — the explicit path: no pattern matching, and the same inputs always give the same tombstone id:
 
   ```typescript
   const tombstone = await engine.correct({ key: 'region', from: 'us-east-1', to: 'eu-west-1', sourceMessageId: 'msg-42' });
@@ -132,15 +134,15 @@ Corrections come from two places:
   The tombstone id derives from the inputs, so declaring the same correction twice is a no-op. Older messages still in L0 get the correction when they compact.
 - **Inferred by `RegexCompactor`** (`confidence: 'inferred'`) from phrasing such as "Actually, use Postgres instead of MySQL" or "switch MySQL to Postgres". These are low-confidence suggestions: applied reversibly, rendered as `(inferred)`, and not proposed to the truth ledger unless you pass `includeInferred: true`. Keyword-only corrections ("Wait, …") and corrections whose superseded value is empty, a pronoun or a function word ("change it to blue") never produce a tombstone.
 
-### Importance Scoring
+### Importance scoring
 
-A three-signal model determines which messages matter most:
+`ImportanceDetector` scores messages on three signals (default weights in `DEFAULT_IMPORTANCE_CONFIG`):
 
-- **State delta** (45%) — Does the message change the entity graph or override prior information?
-- **Reference frequency** (25%) — How often are the message's entities referenced later?
-- **Trajectory discontinuity** (30%) — Does the message shift the conversation's direction?
+- **State delta** (0.4) — does the message change the entity graph or override prior information?
+- **Reference frequency** (0.25) — how often do later messages refer back to it?
+- **Trajectory discontinuity** (0.35) — does it turn away from the conversation's direction? Needs `message.embedding`.
 
-In `v0.1.0` these last two signals are lexical (Jaccard-similarity) approximations rather than embedding-based — see [Project Status](#project-status).
+It is a standalone tool: `CompactionEngine` does not call it. L1 ranks entries by the regex compactor's own per-entry estimate (decisions, corrections, constraints and code raise it). See [ImportanceDetector](#importancedetector).
 
 ## Agential Memory: Active Engrams
 
@@ -177,9 +179,9 @@ store.retrieve('why am I hitting the rate limit again?');
 // [{ engramId: id, shadows: <correction id>, interpreted: '…upgraded to Pro…', … }]
 ```
 
-Three rules are enforced structurally, not by convention:
+Three rules hold by construction of the store's API (in process: they are not a sandbox against code that reaches the store's internals):
 
-1. **Interpret before inject** — the raw payload never reaches a context frame directly.
+1. **Interpret before inject** — an engram reaches a context frame only as its interpreter's output. With the regex tier that output is the template with the payload substituted in.
 2. **Declarative activation** — `ActivationPolicy` (topics, `maxRetrievals`, `expiresAt`, `shadowsEngramId`) is evaluated by the store; the engram itself has no code path to influence it.
 3. **Safety boundary** — `importanceScore` can only change via `store.setImportance(id, score)` (clamped to [0, 1]); `get()` and `all()` hand out frozen copies. The interpreter only ever sees `{ template, payload, context }` — never the score, policy, id, or retrieval count.
 
@@ -203,12 +205,12 @@ engine.attachActiveEngrams(store);
 
 ## Interpreter Tiers
 
-The interpreter step is a **bounded LM call made at retrieval time** — separate from the [compactor tiers](#compactor-tiers) that govern L0→L1 write-time compaction. All three implementations share one contract: a hard `maxOutputTokens`/`timeoutMs` budget, and a promise to throw `InterpreterBudgetError` or `InterpreterUnavailableError` (never to hang or silently truncate) so `withFallback()` can route deterministically. Output the backend cut off — Anthropic `stop_reason` `max_tokens` or `model_context_window_exceeded`, Ollama `done_reason: "length"` — throws `InterpreterBudgetError('output_too_long')`; an Anthropic `refusal` throws `InterpreterUnavailableError`.
+The interpreter step is a **bounded LM call made at retrieval time** — separate from the [compactor tiers](#compactor-tiers) that govern L0→L1 write-time compaction. All three implementations share one contract: a `maxOutputTokens`/`timeoutMs` budget per call, and errors instead of hanging past the timeout or returning truncated text — `InterpreterBudgetError` or `InterpreterUnavailableError` — so `withFallback()` routes on the error type alone (a budget or unavailable error falls back; a caller's `AbortError` propagates). Output the backend cut off — Anthropic `stop_reason` `max_tokens` or `model_context_window_exceeded`, Ollama `done_reason: "length"` — throws `InterpreterBudgetError('output_too_long')`; an Anthropic `refusal` throws `InterpreterUnavailableError`.
 
 | Tier | Class | Backend | Status |
 |------|-------|---------|--------|
 | `regex` | `RegexInterpreter` | `{{payload}}`/`{{context}}` string substitution | Stable, zero-dep, always available |
-| `local` | `LocalInterpreter` | Ollama HTTP endpoint (`/api/generate`), Node ≥18 `fetch` | Stable, requires a running Ollama server |
+| `local` | `LocalInterpreter` | Ollama HTTP endpoint (`/api/generate`) over the global `fetch` | Stable, requires a running Ollama server |
 | `host` | `HostInterpreter` | Any Anthropic-shaped client you inject (`messages.create(...)`) | Stable, requires your own client + API key |
 
 ```typescript
@@ -216,7 +218,7 @@ import { HostInterpreter, LocalInterpreter, RegexInterpreter, withFallback } fro
 
 const host = new HostInterpreter({
   client: anthropicClient, // any { messages: { create(req, opts?) } } shape — no SDK import required
-  model: 'claude-3-5-haiku-latest',
+  model: 'claude-haiku-4-5',
 });
 
 const local = new LocalInterpreter({ model: 'llama3.2' }); // defaults to http://localhost:11434/api/generate
@@ -235,36 +237,59 @@ const text = await interpreter.interpret(
 
 ## Context-Shift Benchmark
 
-Interpretation-before-injection is a design bet: does restating a memory for the current context actually beat dumping the raw payload back in? `src/benchmark/` is a held-out suite that measures exactly that, across shift types (tech-stack, audience, tone, time-frame, scope-expansion, terminology) plus one calibration fixture where the raw payload is *expected* to win — if interpretation wins there too, the judge is rewarding fluff over fidelity.
+Interpretation-before-injection is a design bet: does restating a memory for the current context beat injecting the raw payload? `@shorthand/core/benchmark` is a harness for testing that bet on your own fixtures. **It has not shown that the bet pays off**: the seven bundled starter fixtures are a wiring smoke test, and no live result is published here.
 
-Run it yourself:
+For each fixture the harness runs two arms — the raw payload, and the payload interpreted for the fixture's read context — asks an answerer the fixture's question with that arm's text as its memory, and scores both answers with a judge. Shift types: tech-stack, audience, tone, time-frame, scope-expansion, terminology. A calibration fixture (a fingerprint the question needs verbatim) must tie: losing it means the interpretation dropped the fact; winning it means the judge rewards restatement over fidelity. Every starter fixture uses the same neutral template, written before the read context exists, so the answer terms appear only in the expected answer.
+
+`report.gate` (`evaluateGate`) passes only when a run could support the claim at all:
+
+- a tier that interprets (the regex tier only substitutes the template);
+- a downstream answerer (the echo answerer scores the injected text itself);
+- no failed interpretations;
+- every calibration fixture ties;
+- at least 30 decided (won or lost) non-calibration fixtures;
+- a Wilson 95% lower bound on wins / (wins + losses) above 0.5.
+
+Passing says the run could have shown the lift and did, on those fixtures, under that judge. It does not generalize past them. The starter set has six non-calibration fixtures, so it never passes on its own; bring a held-out set of your own.
 
 ```bash
-npm run benchmark        # offline: regex tier + keyword judge + echo answerer, fully deterministic
-npm run benchmark:live    # host tier: real Anthropic model + LM judge (needs ANTHROPIC_API_KEY + npm install @anthropic-ai/sdk)
+npm run benchmark                     # offline: regex tier, keyword judge, echo answerer — a wiring smoke test
+npm run benchmark -- --out report.json
+npm run benchmark:live                # host tier, model answerer, LM judge (ANTHROPIC_API_KEY + npm i @anthropic-ai/sdk)
+npm run benchmark:live -- --require-gate   # exit 1 unless the gate passed
 ```
 
-Offline output, reproduced from this repo:
+Offline output, reproduced from this repo (only `runId` changes between runs). The regex tier ties the raw arm on every fixture, as it should — it adds nothing a keyword judge can see:
 
 ```
-Context-Shift Benchmark — offline
-tier: regex    judge: keyword
+Context-Shift Benchmark — offline (wiring smoke test, not evidence for or against interpretation)
+runId: run-muoy4qim
+tier: regex    judge: keyword    answerer: echo
 fixtures: 7
 
 Per-fixture:
-  tech-stack-shift-01          raw=0.400  interp=0.700  Δ=+0.300
-  audience-shift-01            raw=0.000  interp=0.900  Δ=+0.900
-  tone-shift-01                raw=0.250  interp=1.000  Δ=+0.750
-  time-frame-shift-01          raw=0.000  interp=0.778  Δ=+0.778
-  scope-expansion-01           raw=0.100  interp=1.000  Δ=+0.900
-  terminology-shift-01         raw=0.000  interp=1.000  Δ=+1.000
+  tech-stack-shift-01          raw=0.400  interp=0.400  Δ=+0.000
+  audience-shift-01            raw=0.000  interp=0.000  Δ=+0.000
+  tone-shift-01                raw=0.250  interp=0.250  Δ=+0.000
+  time-frame-shift-01          raw=0.000  interp=0.000  Δ=+0.000
+  scope-expansion-01           raw=0.100  interp=0.100  Δ=+0.000
+  terminology-shift-01         raw=0.000  interp=0.000  Δ=+0.000
   baseline-raw-wins-01         raw=1.000  interp=1.000  Δ=+0.000 [calibration]
 
-Aggregate (excluding calibration): wins=6  ties=0  losses=0
-  winRate=1.000  meanLift=+0.771  Wilson95=[0.610, 1.000]
+Aggregate (excluding calibration): wins=0  ties=6  losses=0
+  winRate=0.000  meanLift=+0.000  Wilson95=[0.000, 1.000]
+  tokens raw=272  interp=380
+
+Gate: not met
+  - regex tier: it substitutes the template and nothing else, so the run cannot show that interpretation helps (wiring smoke test)
+  - echo answerer: it scores the injected text itself, not a downstream answer
+  - 0 decided fixtures (fewer than 30): too few to support a claim
+  - Wilson 95% lower bound 0.000 is not above 0.5
 ```
 
-`ContextShiftBenchmark`, `Judge` (`KeywordJudge` / `LMJudge`), and `Answerer` (all imported from `@shorthand/core/benchmark`) are pluggable — swap in your own fixtures, judge, or downstream model to validate the same claim against your own workload.
+The live run uses one model for the interpreter, the answerer and the judge — `SHORTHAND_BENCHMARK_MODEL`, default `claude-haiku-4-5` (`DEFAULT_LIVE_MODEL`) — so that model's biases enter at all three steps. Nothing falls back: a failed interpretation is recorded on the fixture, fails the gate and makes the CLI exit 1; a failed, truncated or refused answer or grade (`ModelCallError`) stops the run. The judge grades with its own prompt and a JSON schema (structured output).
+
+`ContextShiftBenchmark`, `evaluateGate`, `Judge` (`KeywordJudge` / `LMJudge`), `Answerer` and `createLiveBenchmark` are exported from `@shorthand/core/benchmark`. Pass the interpreter itself, not a `withFallback` wrapper: a fallback inside the interpreter is invisible to the report.
 
 ## Source Ingestion
 
@@ -307,7 +332,7 @@ const pages = wiki.render(engine.getState(), ingester.getEvents());
 
 Each entity page cross-links its relationships, the topics that reference it, relevant invariants, and any corrections (tombstones) that touched it.
 
-Everything a page shows comes from conversations, tool output or ingested documents, so it is escaped through the same renderer as context frames (`escapeMarkdown`): it can't become a link, an image, raw HTML, a heading or a frozen truth marker. Page paths are Unicode-aware slugs (`entities/日本語.md`); names that slug alike (`C++` and `C#`) get a short hash suffix (`entities/c-1a2b3c4d.md`) so no page overwrites another, and links are relative to the page they are on.
+Everything a page shows comes from conversations, tool output or ingested documents, so it is escaped by the same renderer as context frames (`src/compaction/frame.ts`): it can't become a link, an image, raw HTML, a heading or a frozen truth marker. Page paths are Unicode-aware slugs (`entities/日本語.md`); names that slug alike (`C++` and `C#`) get a short hash suffix (`entities/c-1a2b3c4d.md`) so no page overwrites another, and links are relative to the page they are on.
 
 ## API Reference
 
@@ -321,34 +346,23 @@ import { CompactionEngine } from '@shorthand/core';
 const engine = new CompactionEngine({
   memtableSize: 10,        // L0 capacity before auto-flush (default: 10)
   contextBudget: 8000,     // token budget for context frames (default: 8000)
-  preferredTier: 'regex',  // compaction strategy (default: 'regex')
-  autoFallback: true,      // fall back to a lower tier instead of throwing (default: true)
+  preferredTier: 'regex',  // compaction strategy (default: 'regex'; the only implemented tier)
+  autoFallback: true,      // fall back to regex instead of throwing for 'local'/'host' (default: true)
 });
 
 await engine.addMessage(message);              // add one message
 await engine.addMessages(messages);            // add many
-await engine.flush();                          // force L0 → L1 compaction
+await engine.flush();                          // force all of L0 through L1 compaction
 await engine.recompact(level);                 // deeper recompaction (L1→L2, etc.)
 const frame = engine.buildContextFrame(budget); // build context within token budget
 const state = engine.getState();               // inspect current compacted state
-engine.setCompactor(customCompactor);           // swap in a different Compactor
-engine.attachActiveEngrams(activeEngramStore);  // fold active engrams into context frames
+engine.setCompactor(customCompactor);          // swap in a different Compactor
+engine.attachActiveEngrams(activeEngramStore); // fold active engrams into context frames
 await engine.correct({ from, to, sourceMessageId }); // declare a correction (explicit tombstone)
-await engine.revertCorrection(tombstoneId);     // undo one, restoring what it archived
-await engine.retract(messageIds);               // revert their corrections, archive what derives only from them
-engine.getSpan(hash); engine.pinSpan(hash);     // exact code spans; pin one into every frame
-  memtableSize: 10,       // L0 capacity before auto-flush (default: 10)
-  contextBudget: 8000,    // token budget for context frames (default: 8000)
-  preferredTier: 'regex', // compaction strategy (default: 'regex')
-});
-
-await engine.addMessage(message);        // add one message
-await engine.addMessages(messages);      // add many
-await engine.flush();                    // force all of L0 through L1 compaction
-await engine.recompact(level);           // deeper recompaction (L1→L2, etc.)
-const frame = engine.buildContextFrame(budget); // build context within token budget
-const state = engine.getState();         // inspect current compacted state
-engine.attachActiveEngrams(store);       // surface agential memories in frames
+await engine.revertCorrection(tombstoneId);    // undo one, restoring what it archived
+await engine.retract(messageIds);              // revert their corrections, archive what derives only from them
+engine.getSpan(hash); engine.pinSpan(hash); engine.unpinSpan(hash); // exact code spans; pin one into every frame
+engine.syncTruthLedger(jsonl);                 // read a truth-ledger stream (see Truth-Ledger Interop)
 ```
 
 ### RegexCompactor
@@ -441,7 +455,14 @@ const log = new RGA<string>('agent-1');     // replicated sequence
 log.append('first');
 ```
 
-What merges guarantee, exactly (property-tested with fast-check in `src/crdt/crdt-properties.test.ts`): replicas that have merged the same states hold the same replicated state in any merge order — including equal-counter ties, concurrent inserts at the same RGA position (the head included) and LWW writers that share an agent id — `merge` is commutative, associative and idempotent, and a replica restored with `from` continues exactly like the original. Malformed states (and a newer `schemaVersion`) are rejected with a `TypeError` before anything changes. `ConflictDetector` reports an invariant or edge only when the two writes were concurrent; an update made after seeing the old value is not a conflict. The wire format, merge rules and the active-engram trust model are in [`docs/crdt-format.md`](./docs/crdt-format.md).
+What merges guarantee, exactly as property-tested (fast-check, 150 random histories per property, in `src/crdt/crdt-properties.test.ts`) for the LWW-Register, OR-Set, G-Set, RGA, `AgentMemory` and `ActiveEngramStore` merges, with every state crossing a JSON round trip:
+
+- **Convergence:** replicas that have merged the same states hold the same replicated state, in any merge order — including equal-counter ties, concurrent inserts at the same RGA position (the head included) and LWW writers that share an agent id.
+- **Join laws** on reachable states: `merge` is commutative, associative and idempotent (merging a state twice changes nothing).
+- **Restore and continue:** a replica restored with `from` behaves like the original from then on.
+- **Conflicts:** `ConflictDetector` reports no L4 conflict when every write follows a sync of everything before it (property-tested), and reports an invariant or edge only when the two writes were concurrent (unit-tested).
+
+Malformed states (and a newer `schemaVersion`) make a primitive's `merge` throw a `TypeError` before it changes anything (unit-tested). `AgentMemory.mergeFrom` validates layer by layer, so a malformed later layer throws after the earlier layers merged; `ActiveEngramStore.mergeFrom` drops and reports invalid engrams instead. The wire format, merge rules and the active-engram trust model are in [`docs/crdt-format.md`](./docs/crdt-format.md).
 
 The CRDT surface is still **experimental** because these hold only under preconditions it cannot check: every live writer has its own agent id (a restarted agent restores with `from` before writing — otherwise an LWW write can lose to an older one and an OR-Set tag can collide; an RGA merge throws on the collision), peers are honest (nothing is signed: a peer can win any LWW key with a large counter, delete any element or engram, and claim any engram origin), and a custom `GSet` merge function picks the greater entry under a total order. Tombstones are never garbage-collected, and engram retrieval counts and importance scores are per replica.
 
@@ -480,8 +501,9 @@ Merging is a trust boundary: a peer's state can add memories (schema-validated, 
 
 ### Interpreters
 
-Bounded LM step at engram-retrieval time, with three tiers and deterministic
-fallback. Every call carries a `maxOutputTokens` cap and a `timeoutMs`.
+Bounded LM step at engram-retrieval time, with three tiers and a fallback
+that routes on the error type. Every call carries a `maxOutputTokens` cap
+and a `timeoutMs`.
 
 ```typescript
 import {
@@ -492,7 +514,7 @@ import {
 } from '@shorthand/core';
 
 const interpreter = withFallback(
-  new HostInterpreter({ client, model: 'claude-haiku-4-5-20251001' }),
+  new HostInterpreter({ client, model: 'claude-haiku-4-5' }),
   new RegexInterpreter(),
 );
 const text = await interpreter.interpret(
@@ -548,12 +570,14 @@ const pages = renderer.render(engine.getState(), ingester.getEvents());
 
 ### Context-Shift Benchmark
 
-Measures whether interpret-at-retrieval beats raw payload injection when the
-context has shifted since write time.
+See [Context-Shift Benchmark](#context-shift-benchmark) above: a harness and a gate, with a starter set that is a wiring smoke test.
 
-```bash
-npm run benchmark        # offline: regex tier + keyword judge, deterministic
-npm run benchmark:live   # Anthropic-backed (needs ANTHROPIC_API_KEY + @anthropic-ai/sdk)
+```typescript
+import { createLiveBenchmark, LIVE_INTERPRET_OPTIONS } from '@shorthand/core/benchmark';
+
+const report = await createLiveBenchmark({ client, model: 'claude-haiku-4-5' })
+  .run(myHeldOutFixtures, { interpretOpts: LIVE_INTERPRET_OPTIONS });
+report.gate; // { passed, reasons }
 ```
 
 ### Utilities
@@ -561,29 +585,21 @@ npm run benchmark:live   # Anthropic-backed (needs ANTHROPIC_API_KEY + @anthropi
 ```typescript
 import { estimateTokens, generateId } from '@shorthand/core';
 
-estimateTokens('Hello world'); // ~3 (4 chars per token heuristic)
-generateId();                  // e.g. 'mdlk2h4c-9f2a1qz'
-generateId(); // 'lx2f3a9b-k1m2n3o' (timestamp + random, base36)
+estimateTokens('Hello world'); // 3 (ceil of chars / 4, a heuristic)
+generateId();                  // e.g. 'mdlk2h4c-9f2a1qz' (timestamp + random, base36)
 ```
 
-## Tiers
+## Compactor Tiers
 
 Distinct from the [interpreter tiers](#interpreter-tiers) above — these govern **write-time** L0→L1 compaction inside `CompactionEngine`, not retrieval-time restatement.
-Short-hand uses a tiered strategy with automatic fallback in two places:
-
-**Compaction** (messages → compacted state):
 
 | Tier | Strategy | Status | Configuration |
 |------|----------|--------|----------------|
-| **0** | Regex | Stable | None |
-| **1** | Local LM | Planned | `localModel: { backend: 'llama.cpp' \| 'mlx' \| 'ollama' \| 'transformers.js', ... }` |
-| **2** | Host LLM | Planned | `hostLLM: { provider: 'anthropic' \| 'openai' \| 'custom', ... }` |
+| **0** | Regex | Implemented | None |
+| **1** | Local LM | Planned | `preferredTier: 'local'`, `localModel: { backend, modelPath, quantization? }` |
+| **2** | Host LLM | Planned | `preferredTier: 'host'`, `hostLLM: { provider, model, toolName? }` |
 
-Today, `CompactionEngine` only implements the regex compactor. Requesting `preferredTier: 'local'` or `'host'` silently falls back to regex when `autoFallback: true` (the default); set `autoFallback: false` to get a hard error instead of silent degradation.
-| **1** | Local LM | Planned | Local model runtime |
-| **2** | Host LLM | Planned | LLM API access |
-
-The engine defaults to Tier 0 (regex) and falls back gracefully if a higher tier is unavailable.
+Today `CompactionEngine` implements only the regex compactor; `localModel` and `hostLLM` are accepted but unused. Requesting `preferredTier: 'local'` or `'host'` falls back to regex when `autoFallback: true` (the default); set `autoFallback: false` to get an error instead. `engine.setCompactor(compactor)` plugs in your own `Compactor`.
 
 **Interpretation** (engram retrieval — implemented today):
 
@@ -593,7 +609,7 @@ The engine defaults to Tier 0 (regex) and falls back gracefully if a higher tier
 | **local** | `LocalInterpreter` | Ollama HTTP endpoint |
 | **host** | `HostInterpreter` | Any Anthropic-shaped client |
 
-Compose tiers with `withFallback(primary, fallback)` for deterministic degradation.
+Compose tiers with `withFallback(primary, fallback)`: a budget or unavailable error from the primary runs the fallback; a caller's `AbortError` propagates.
 
 ## Types
 
@@ -634,7 +650,8 @@ npm install
 npm run build           # compile TypeScript
 npm test                 # run tests (vitest)
 npm run lint              # type-check without emitting
-npm run benchmark         # offline context-shift benchmark
+npm run smoke:pack        # after build: pack, install, import every subpath, typecheck a consumer
+npm run benchmark         # offline context-shift benchmark (wiring smoke test)
 npm run benchmark:live    # host-tier benchmark against a real model (needs ANTHROPIC_API_KEY)
 npm run sync:truth-fixtures -- ../stenographer   # re-copy the truth-format golden fixtures
 ```
@@ -675,23 +692,23 @@ Ledger text is untrusted in every renderer: a field containing `\n[TB] … (sign
 
 ## Project Status
 
-@shorthand/core is pre-1.0 (`0.1.0`) and single-maintainer. What's solid today: the five-level LSM compaction core, tombstones, snapshot compaction, and importance scoring, all running on the shipped regex tier with 150+ passing tests; the active-engram subsystem and its three interpreter tiers, each behind the same bounded, fallback-safe contract; source ingestion and wiki rendering; and the context-shift benchmark that backs the claims above.
+@shorthand/core 1.0.0 (unreleased; see [CHANGELOG.md](./CHANGELOG.md) and [MIGRATION.md](./MIGRATION.md)), single-maintainer. CI runs lint, the vitest suite and the build on Node 22 and 24, plus a pack-and-install smoke test that imports every subpath of the packed tarball and typechecks a consumer under `moduleResolution` Node16 and Bundler.
 
-What's still aspirational:
+What 1.0 covers: the five-level LSM compaction core with explicit and inferred corrections, typed context frames under a token ceiling, snapshot compaction and its verification heuristics, the active-engram store and its three interpreter tiers behind one bounded contract, source ingestion and wiki rendering, importance scoring, and a truth-format v2 reader and proposal writer checked against stenographer's golden fixtures.
+
+What is still open:
 
 - **CRDT layer** — convergence and the merge laws are property-tested, but the surface stays experimental: they rely on unique replica ids and honest peers, and tombstones are never collected; see [CRDT Primitives](#crdt-primitives).
 - **Compactor tiers** — `local`/`host` for L0→L1 write-time compaction accept configuration but currently fall back to `regex` (see [Compactor Tiers](#compactor-tiers)).
+- **Interpretation lift** — unmeasured. The [benchmark](#context-shift-benchmark) is a harness and a gate; the starter set is a wiring smoke test.
 - **Embeddings** — no embedding model ships with this package (it stays zero-dependency). `ImportanceDetector` uses `message.embedding` when the host supplies one; `StubEmbedder` is an explicit placeholder returning zero vectors.
+- **Extraction** — the regex compactor finds decisions, corrections, entities and constraints by pattern; it misses phrasings its patterns don't cover.
 
 ## Ecosystem
 
-Short-hand is one of four related projects by the same author. See
-[`docs/ecosystem/executive-summary.md`](./docs/ecosystem/executive-summary.md) and
-[`docs/ecosystem/engineering-guide.md`](./docs/ecosystem/engineering-guide.md) for a source-verified
-evaluation of how it relates to [AgentVault](https://github.com/johnnyclem/AgentVault),
-[SmallChat](https://github.com/johnnyclem/smallchat), and
-[Stenographer](https://github.com/johnnyclem/stenographer) — including the finding that, as of this
-writing, none of those integrations are actually wired up in this repo yet.
+Short-hand is part of the smallchat suite. [smallchat](https://github.com/johnnyclem/smallchat) imports `@shorthand/core` (its vendored copy was merged here, and smallchat is replacing it with a dependency on this package), and the truth-ledger seam with [stenographer](https://github.com/johnnyclem/stenographer) is wired: this package reads stenographer's truth format v2 and writes PROPOSAL streams for it (see [Truth-Ledger Interop](#truth-ledger-interop)). Neither is a code dependency of this package.
+
+[`docs/ecosystem/`](./docs/ecosystem/) holds an archived pre-1.0 evaluation of how short-hand related to [AgentVault](https://github.com/johnnyclem/AgentVault), SmallChat and Stenographer; its findings about this repo (no CI, no integrations, the `short-hand` package name) are out of date.
 
 ## License
 

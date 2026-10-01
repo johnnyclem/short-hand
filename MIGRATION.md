@@ -5,7 +5,15 @@
 - **short-hand** (this repo, published nowhere yet, package name `short-hand`): the LSM compaction engine, active engrams, interpreters, ingestion, wiki rendering and benchmark.
 - **smallchat's vendored copy** (`smallchat/shorthand`, package name `@shorthand/core`, installed through `file:./shorthand`): the snapshot compactor and its verification harness, the clock/RGA/conflict-detector CRDT layer, the modular importance detector and the truth codec.
 
-Where the two had the same concept with different APIs, 1.0 keeps one. This guide lists every rename and behavior change, grouped by where you are coming from.
+Where the two had the same concept with different APIs, 1.0 keeps one. This guide lists every rename and behavior change, grouped by where you are coming from. The sections headed **Everyone** apply whichever codebase you come from; read [Everyone: package and runtime](#everyone-package-and-runtime) first.
+
+## Everyone: package and runtime
+
+- **Node.js 22 or later.** `engines.node` is `>=22` (it was `>=18` in short-hand 0.1). Node 18 and 20 are end-of-life; CI runs on 22 and 24. `LocalInterpreter` still needs a global `fetch` (or an injected one).
+- **Install** `npm i @shorthand/core` (`^1.0.0`).
+- **ESM-only**, as before: `import`, not `require`. There is no CommonJS build.
+- **Import from the package root or one of its subpaths** — `@shorthand/core`, `/compaction`, `/crdt`, `/importance`, `/truth`, `/wiki`, `/ingestion`, `/interpreter`, `/verification`, `/benchmark`. `exports` blocks every other path (`@shorthand/core/dist/...` fails with `ERR_PACKAGE_PATH_NOT_EXPORTED`). TypeScript needs `moduleResolution` `node16`, `nodenext` or `bundler` to resolve the subpaths; the release's smoke test typechecks a consumer under Node16 and Bundler.
+- The declarations need no Node types: a bundler project with the DOM lib and no `@types/node` typechecks.
 
 ## Coming from smallchat's vendored copy
 
@@ -89,7 +97,7 @@ The API is the vendored one. Wire-format and behavior changes:
 
 ### Importance
 
-Unchanged.
+The API is unchanged. The state-delta signal now reads at most 16 KB of prose per message, in sentence windows (see [LSM compaction](#lsm-compaction)), and scoring is no longer quadratic in conversation length.
 
 ### Messages
 
@@ -100,7 +108,7 @@ Unchanged.
 ### Package
 
 - Install `@shorthand/core` instead of `short-hand` and change imports from `'short-hand'` to `'@shorthand/core'`.
-- The context-shift benchmark is no longer exported from the root. Import `ContextShiftBenchmark`, `echoAnswerer`, `wilson95`, `KeywordJudge`, `LMJudge`, `STARTER_FIXTURES` and their types from `@shorthand/core/benchmark`. `npm run benchmark` is unchanged.
+- The context-shift benchmark is no longer exported from the root. Import `ContextShiftBenchmark`, `echoAnswerer`, `wilson95`, `KeywordJudge`, `LMJudge`, `STARTER_FIXTURES` and their types from `@shorthand/core/benchmark`. See [Benchmark](#benchmark) for what changed in it.
 - `CompactionLevelEnum` → `CompactionLevel`. The enum is now exported as a value under its own name (it was only exported as a type).
 
 ### Messages
@@ -162,6 +170,25 @@ The serialized formats changed (Lamport timestamps are `{ counter, agentId }`, O
 - Proposals use the suite's PROPOSAL envelope: each line carries `schemaVersion: 2`, `seq`, a ULID `id`, `type: 'PROPOSAL'`, `ts`, an accountable `author` (generic identities throw), `kind` (`'tombstone'` → `'tb'`), `draft`, `targetRef`, `signal`, `agentSessionId`, `prevHash` and `hash`. The top-level `provenance` field is gone (the source message is in the draft's evidence or `verifyBy`).
 - The 0.1 truth reader took any JSONL line as truth; 1.0 reads stenographer's truth format v2 — see [Everyone: truth format v2](#everyone-truth-format-v2).
 - Literals on TBs are validated with stenographer's write-time rule, and a TB with invalid literals is rejected like stenographer rejects it.
+
+### Benchmark
+
+The 0.1 benchmark's numbers measured its fixtures, not interpretation (SH-18), and its live mode hid failures (SH-19). Results from 0.1 are not comparable with 1.0 runs.
+
+- **Starter fixtures** all use one neutral template (`STARTER_TEMPLATE`, `Earlier note, still relevant: {{payload}}`). The 0.1 templates spelled out each expected answer. The offline run now ties on every fixture (`wins=0 ties=6`) where 0.1 printed `winRate=1.000`; that is the correct result for the regex tier. If you copied the starter fixtures into your own suite, rewrite their templates the same way: a template is written before the read context exists.
+- **The gate is `report.gate`** (`{ passed, reasons }`, from `evaluateGate`), not a Wilson bound you check yourself. It requires an interpreting tier (not `regex`), a downstream answerer (not `echoAnswerer`), no failed interpretations, tied calibration fixtures, at least 30 decided fixtures (`GateOptions.minDecided`) and a Wilson 95% lower bound above 0.5. The starter set never passes it. Code that asserted `report.aggregate.wilson95[0] > 0.5` on the offline run should drop the assertion; it only ever measured the templates.
+- **Calibration fixtures must tie.** An `expectRawWins` fixture used to pass whenever raw won or tied; an interpreted arm that loses it (the interpretation dropped the fact) now fails the gate, like one that wins it.
+- **Interpretation failures are recorded.** A fixture whose interpretation throws gets `interpretError`, `aggregate.interpretFailures` counts it, and the gate fails; the arm still injects the raw payload. Don't wrap the interpreter in `withFallback` for a benchmark: a fallback inside it is invisible to the report.
+- **`LMJudge`** takes a client, not an interpreter:
+
+  ```diff
+  - new LMJudge({ interpreter: hostInterpreter })
+  + new LMJudge({ client: anthropicClient, model: 'claude-haiku-4-5' })
+  ```
+
+  It grades with its own system prompt and a JSON schema (`output_config`), and throws `ModelCallError` where it used to return 0 (failed call, unparseable grade) or clamp (score outside [0, 1]).
+- **Live runs**: `npm run benchmark:live` defaults to `claude-haiku-4-5` (`DEFAULT_LIVE_MODEL`; 0.1 defaulted to the retired `claude-3-5-haiku-latest`), and `SHORTHAND_BENCHMARK_MODEL` still overrides it. There is no regex fallback, the answerer is its own call (`createAnthropicAnswerer`) and its failures stop the run instead of echoing the injected text. `createLiveBenchmark({ client, model })` builds the same wiring in code; pass `{ interpretOpts: LIVE_INTERPRET_OPTIONS }` to `run`.
+- **CLI exit codes**: a live run exits 1 when any interpretation failed; `--require-gate` exits 1 unless the gate passed. The output adds an answerer column, failed-interpretation and calibration markers, and the gate with its reasons; `--out` JSON adds `mode` (and `model` for live runs), `answerer`, `gate`, `aggregate.calibrationFailures` and `aggregate.interpretFailures`.
 
 ### New in 1.0 for short-hand users
 

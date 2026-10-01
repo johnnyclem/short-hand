@@ -8,9 +8,10 @@
  *    dependencies, the release metadata (engines, publishConfig).
  * 2. Install the tarball into a fresh project with nothing else in it.
  * 3. Import every subpath export at runtime (test/smoke/runtime.mjs).
- * 4. Typecheck a consumer (test/smoke/consumer.ts) with skipLibCheck off
- *    under moduleResolution Node16 (with Node's types) and Bundler (DOM
- *    lib, no Node types), using this repo's TypeScript.
+ * 4. Typecheck a consumer (test/smoke/consumer.ts), plus every name the
+ *    README's TypeScript examples import, with skipLibCheck off under
+ *    moduleResolution Node16 (with Node's types) and Bundler (DOM lib, no
+ *    Node types), using this repo's TypeScript.
  *
  * Nothing here touches the network: the tarball has no dependencies, and
  * TypeScript and @types/node come from this repo's node_modules.
@@ -27,6 +28,42 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 function run(cmd, args, cwd) {
   return execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+}
+
+/**
+ * One module importing every name the README's ```typescript blocks import
+ * from this package (values and types), so a renamed or moved export can't
+ * leave a stale example behind. Names imported from several subpaths are
+ * aliased per subpath.
+ */
+function readmeImportFile(readme, name) {
+  const blocks = [...readme.matchAll(/```(?:typescript|ts)\n([\s\S]*?)```/g)].map((m) => m[1]);
+  const importRe = /import\s+(type\s+)?\{([^}]*)\}\s+from\s+'([^']+)'/g;
+  const byModule = new Map();
+  for (const block of blocks) {
+    for (const m of block.matchAll(importRe)) {
+      const [, typeOnly, names, from] = m;
+      if (from !== name && !from.startsWith(`${name}/`)) continue;
+      const set = byModule.get(from) ?? new Map();
+      const list = names.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '');
+      for (const raw of list.split(',').map((n) => n.trim()).filter(Boolean)) {
+        const isType = Boolean(typeOnly) || raw.startsWith('type ');
+        const imported = raw.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+        set.set(imported, (set.get(imported) ?? true) && isType);
+      }
+      byModule.set(from, set);
+    }
+  }
+  const lines = [];
+  let count = 0;
+  for (const [from, names] of byModule) {
+    const suffix = from === name ? 'root' : from.slice(name.length + 1).replace(/\W/g, '_');
+    const specs = [...names].map(([n, isType]) => `${isType ? 'type ' : ''}${n} as ${n}__${suffix}`);
+    count += specs.length;
+    lines.push(`import { ${specs.join(', ')} } from '${from}';`);
+    lines.push(`export type { ${[...names.keys()].map((n) => `${n}__${suffix}`).join(', ')} };`);
+  }
+  return { source: lines.join('\n') + '\n', count };
 }
 
 function fail(message) {
@@ -90,6 +127,9 @@ try {
 
   // 4. Types: Node16 and Bundler consumers, skipLibCheck off.
   copyFileSync(join(repo, 'test', 'smoke', 'consumer.ts'), join(consumer, 'consumer.ts'));
+  const readmeImports = readmeImportFile(readFileSync(join(repo, 'README.md'), 'utf8'), pkg.name);
+  writeFileSync(join(consumer, 'readme-imports.ts'), readmeImports.source);
+  console.log(`ok collected ${readmeImports.count} names imported by the README's examples`);
   const tsc = join(repo, 'node_modules', 'typescript', 'bin', 'tsc');
   const common = { target: 'ES2022', strict: true, noEmit: true, skipLibCheck: false, isolatedModules: true };
   const configs = {
@@ -98,7 +138,7 @@ try {
   };
   for (const [name, compilerOptions] of Object.entries(configs)) {
     const config = `tsconfig.${name}.json`;
-    writeFileSync(join(consumer, config), JSON.stringify({ compilerOptions, files: ['consumer.ts'] }, null, 2));
+    writeFileSync(join(consumer, config), JSON.stringify({ compilerOptions, files: ['consumer.ts', 'readme-imports.ts'] }, null, 2));
     try {
       run(process.execPath, [tsc, '-p', config], consumer);
     } catch (err) {
