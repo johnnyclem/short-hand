@@ -141,6 +141,36 @@ describe('appendProposalsFile: one writer’s chained stream, deduped by (target
     expect(() => appendProposalsFile(broken, fresh)).toThrow(/chain broken|first line/);
   });
 
+  it('an id names one envelope: a different envelope under an id the file holds is refused, the same one is skipped', () => {
+    const path = join(dir, 'proposals.jsonl');
+    const first = uvProposal(uvDraft('A.'), { targetRef: 'a', detail: 'd' }, { author: 'johnny' });
+    appendProposalsFile(path, [first]);
+    const before = readFileSync(path, 'utf8');
+
+    // Stenographer's intake files a line once by its id, and refuses a different envelope under a filed id
+    const reused = { ...uvProposal(uvDraft('B.'), { targetRef: 'b', detail: 'd' }, { author: 'johnny' }), id: first.id };
+    expect(() => appendProposalsFile(path, [reused])).toThrow(/an id names one envelope/);
+    // Even when the rest of the batch is new, and when its claim matches what the file holds
+    const fresh = uvProposal(uvDraft('C.'), { targetRef: 'c', detail: 'd' }, { author: 'johnny' });
+    const retimed = { ...first, ts: '2026-09-02T00:00:00.000Z' };
+    expect(() => appendProposalsFile(path, [fresh, retimed])).toThrow(/an id names one envelope/);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+
+    // The same envelope, from another stream with its own chain fields, is the same envelope
+    const [elsewhere] = serializeProposals([first], { head: { seq: 7, hash: 'a'.repeat(64) } });
+    expect(appendProposalsFile(path, [JSON.parse(elsewhere)])).toMatchObject({ written: 0, skipped: 1 });
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+
+  it('a stream never writes two different envelopes under one id', () => {
+    const a = uvProposal(uvDraft('A.'), { targetRef: 'a', detail: 'd' }, { author: 'johnny' });
+    const b = { ...uvProposal(uvDraft('B.'), { targetRef: 'b', detail: 'd' }, { author: 'johnny' }), id: a.id };
+    expect(() => serializeProposals([a, b])).toThrow(/an id names one envelope/);
+    const resumed = ProposalStream.resume(serializeProposals([a]));
+    expect(() => resumed.append(b)).toThrow(/an id names one envelope/);
+    expect(resumed.head?.seq).toBe(1);
+  });
+
   it('ProposalStream.resume continues the file it read', () => {
     const lines = serializeProposals([uvProposal(uvDraft('A.'), { targetRef: 'a', detail: 'd' }, { author: 'johnny' })]);
     const stream = ProposalStream.resume(lines);
@@ -174,6 +204,18 @@ describe('reading proposals: the suite envelope, and the bare format as read-onl
       ['uv', 'bare', null],
     ]);
     expect(result.proposals.map((p) => p.text)).toEqual([bareTb, vendored]);
+  });
+
+  it('skips blank lines and counts them in line numbers', () => {
+    const lines = serializeProposals([
+      uvProposal(uvDraft('A.'), { targetRef: 'a', detail: 'd' }, { author: 'johnny' }),
+      uvProposal(uvDraft('B.'), { targetRef: 'b', detail: 'd' }, { author: 'johnny' }),
+    ]);
+    const read = parseProposalLines(['', lines[0], '  ', lines[1]]);
+    expect(read.errors).toEqual([]);
+    expect(read.proposals.map((p) => p.line)).toEqual([2, 4]);
+    const edited = JSON.stringify({ ...JSON.parse(lines[1]), targetRef: 'z' });
+    expect(parseProposalLines(`${lines[0]}\n\n${edited}\n`).errors).toMatchObject([{ line: 3, error: expect.stringMatching(/^hash mismatch/) }]);
   });
 
   it('refuses a stream with a bare line slipped into it', () => {

@@ -140,6 +140,23 @@ describe('valid/proposals.jsonl: the suite PROPOSAL envelope', () => {
     expect(result.proposals.map((p) => p.text)).toEqual(fixture);
   });
 
+  it('reads every envelope, those sharing a targetRef too, and keeps values it does not know as written', () => {
+    const result = parseProposalLines(lines('valid/proposals.jsonl'));
+    const want = expected<Array<{ line: number; unknown?: string[] }>>('valid/proposals.expected.json');
+    const targets = result.proposals.map((p) => p.targetRef).filter((t) => t !== null);
+    expect(new Set(targets).size).toBeLessThan(targets.length);
+    // `unknown` lists them as stenographer records them: "signal.source 'x'", "evidence kind 'x'", "verifyBy kind 'x'"
+    for (const w of want.filter((w) => w.unknown)) {
+      const p = result.proposals.find((p) => p.line === w.line)!;
+      const kept: string[] = [
+        `signal.source '${p.signal.source}'`,
+        ...((p.draft.evidence as Array<{ kind: string }> | undefined) ?? []).map((e) => `evidence kind '${e.kind}'`),
+        ...(p.draft.verifyBy ? [`verifyBy kind '${(p.draft.verifyBy as { kind: string }).kind}'`] : []),
+      ];
+      for (const value of w.unknown!) expect(kept, `line ${w.line}`).toContain(value);
+    }
+  });
+
   it('is refused as a wiki stream: proposals never travel in one', () => {
     const result = parseWikiLines(lines('valid/proposals.jsonl'));
     expect(result.refused).toBe(true);
@@ -316,7 +333,15 @@ describe('timestamps (SH-REV-C5)', () => {
   it('refuses impossible dates and accepts ordinary ones', () => {
     expect(() => decodeTruthLine(withTs('2026-02-30T00:00:00Z'))).toThrow(/^ts:/);
     expect(() => decodeTruthLine(withTs('2026-09-01T24:00:00Z'))).toThrow(/^ts:/);
+    expect(() => decodeTruthLine(withTs('2026-09-01T10:00:00+24:00'))).toThrow(/^ts:/);
     expect(decodeTruthLine(withTs('2028-02-29T23:59:59.999+05:30')).version).toBe(2);
+  });
+
+  it('refuses a lower-case t or z, as the schema’s pattern and stenographer’s codec do', () => {
+    for (const ts of ['2026-09-01t10:00:00.000Z', '2026-09-01T10:00:00.000z']) {
+      expect(schemaValid(withTs(ts)), ts).toBe(false);
+      expect(() => decodeTruthLine(withTs(ts)), ts).toThrow(/^ts:/);
+    }
   });
 });
 
@@ -329,7 +354,7 @@ describe('the zero-dependency codec agrees with the JSON Schema', () => {
   // refuses (SH-REV-C5).
   const CODEC_ONLY = /anonymous|reserved|control character|cannot carry the link|only the links it writes|contests link|contests field|each link once|hash mismatch|canonicalized|leap second/;
   const valid = ['valid/ledger.jsonl', 'valid/proposals.jsonl', 'valid/unknown.jsonl', 'valid/routing.jsonl'].flatMap((f) => lines(f));
-  const POOL: unknown[] = [null, '', ' ', 0, -1, 1, 1.5, 'x', 'Assistant', 'migration', [], {}, true, '2026-13-01T00:00:00Z', '2026-02-30T00:00:00Z', '2026-09-01T10:00:60.000Z', '2026-09-01T23:59:60Z', '2026-09-01T23:59:60+01:00', 'a'.repeat(300), 'ab'.repeat(32), '\u0007'];
+  const POOL: unknown[] = [null, '', ' ', 0, -1, 1, 1.5, 'x', 'Assistant', 'migration', [], {}, true, '2026-13-01T00:00:00Z', '2026-02-30T00:00:00Z', '2026-09-01T10:00:60.000Z', '2026-09-01T23:59:60Z', '2026-09-01T23:59:60+01:00', '2026-09-01t10:00:00z', 'a'.repeat(300), 'ab'.repeat(32), '\u0007'];
 
   function paths(value: unknown, prefix: Array<string | number> = [], depth = 0): Array<Array<string | number>> {
     if (depth > 3 || typeof value !== 'object' || value === null) return [];

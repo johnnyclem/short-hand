@@ -152,9 +152,10 @@ function daysIn(year: number, month: number): number {
 }
 
 /**
- * RFC 3339 date-time, as the schema's pattern and `format: date-time`
- * require, and as stenographer's codec reads it: no leap second (`:60`),
- * which `Date.parse` refuses there.
+ * RFC 3339 date-time naming a real time (no February 30, no 24:00, no
+ * offset past 23:59), as the schema's pattern and `format: date-time`
+ * require, and as stenographer's codec reads it: `T` and `Z` upper case,
+ * and no leap second (`:60`), which the spec lets a codec refuse.
  */
 export function isRfc3339(ts: string): boolean {
   const m = RFC3339_RE.exec(ts);
@@ -226,7 +227,7 @@ function status(o: Obj): void {
   if (has(o, 'status') && (typeof o.status !== 'string' || o.status.length === 0)) fail('status', 'must be a non-empty string');
 }
 
-function identity(o: Obj, key: string, options: { reserved?: 'detector' | 'any' } = {}): void {
+function identity(o: Obj, key: string, options: { reserved?: 'detector' } = {}): void {
   const issue = identityIssue(o[key], options);
   if (issue) fail(key, issue);
 }
@@ -362,8 +363,8 @@ function decodeV2(o: Obj, raw: string): DecodedTruthLine {
       text(o.cause, 'kind', 'cause.kind');
       if (!has(o.cause, 'ref')) fail('cause.ref', 'is required (the causing entry id, or null)');
       if (o.cause.ref !== null) id(o.cause, 'ref', 'cause.ref');
-      // A transition's author is its cause's, which may be the backfill's 'migration'
-      identity(o, 'author', { reserved: 'any' });
+      // A transition's author is its cause's: a person or an agent, never 'migration' or a detector
+      identity(o, 'author');
       break;
     }
   }

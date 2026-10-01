@@ -45,7 +45,7 @@ L4 invariants (drafted as **UVs** — an invariant is usually tribal knowledge t
 
 - Proposals only — there is no external write path to TB or UV.
 - Every line names an accountable `author`; generic identities (`system`, `assistant`, `agent`, …) throw before a line is emitted, and nothing the compactor emits is signed.
-- `appendProposalsFile` skips a proposal the file already holds by (kind, `targetRef`, normalized claim or assertion): a repeated round files nothing, a corrected value is proposed again. `targetRef` is `shorthand:invariant:<key>` / `shorthand:tombstone:<msgId>`, or `entity:` / `decision:` refs for snapshots; stenographer's intake files each envelope `id` once.
+- `appendProposalsFile` skips a proposal the file already holds by (kind, `targetRef`, normalized claim or assertion): a repeated round files nothing, a corrected value is proposed again. `targetRef` is `shorthand:invariant:<key>` / `shorthand:tombstone:<msgId>`, or `entity:` / `decision:` refs for snapshots; stenographer's intake files each envelope `id` once and refuses a different envelope under an `id` it filed, so `appendProposalsFile` and `ProposalStream` refuse to write one.
 - Invariants that were themselves projected from the ledger are never proposed back (corroboration loop).
 
 ## What would justify revisiting Option A

@@ -12,7 +12,9 @@
  * `appendProposalsFile` only appends to a file that is a valid run of its
  * stream, in one write. Duplicates are recognized by (kind, targetRef,
  * normalized claim or assertion), so a corrected value is proposed again
- * while a repeated round files nothing (SAT-10).
+ * while a repeated round files nothing (SAT-10). An id names one envelope:
+ * stenographer's intake files a line once by its id and refuses a different
+ * envelope under an id it filed, so neither writes one.
  *
  * The pre-1.0 bare short-hand line (`{kind: "tombstone", draft, signal,
  * targetRef?}`) and the `shorthand-compaction` source are read
@@ -74,6 +76,36 @@ export function proposalDraftIssue(proposal: Pick<ProposalLine, 'kind' | 'draft'
   return `kind is 'tb' or 'uv' (got ${JSON.stringify(proposal.kind)})`;
 }
 
+/** The envelope `ProposalStream.append` writes for a proposal, without its chain fields. */
+function envelopeOf(proposal: ProposalLine) {
+  return {
+    schemaVersion: TRUTH_SCHEMA_VERSION,
+    id: proposal.id,
+    type: 'PROPOSAL' as const,
+    ts: proposal.ts,
+    author: proposal.author,
+    kind: proposal.kind,
+    draft: proposal.draft,
+    targetRef: proposal.targetRef ?? null,
+    signal: proposal.signal,
+    agentSessionId: proposal.agentSessionId ?? null,
+  };
+}
+
+/**
+ * What an envelope is compared by when its id comes back: its JCS form
+ * without `seq`, `prevHash` and `hash`, so the same envelope at another
+ * place in another stream is the same envelope (stenographer's intake rule).
+ */
+function envelopeKey(line: Record<string, unknown>): string {
+  const { seq: _seq, prevHash: _prev, hash: _hash, ...envelope } = line;
+  return canonicalize(envelope);
+}
+
+function idConflict(id: string): string {
+  return `proposal ${id}: a different envelope already has this id — an id names one envelope, and stenographer's intake refuses a second one`;
+}
+
 /**
  * One writer's hash-chained PROPOSAL stream. `append` writes the envelope
  * exactly as the spec gives it — nothing else — and checks the result with
@@ -82,6 +114,8 @@ export function proposalDraftIssue(proposal: Pick<ProposalLine, 'kind' | 'draft'
 export class ProposalStream {
   private seq: number;
   private prevHash: string | null;
+  /** The envelope each id names, for the lines this stream wrote or (`resume`) read. */
+  private readonly envelopes = new Map<string, string>();
 
   /** A stream continuing from `head` (the last line written), or a new one. */
   constructor(head: StreamHead | null = null) {
@@ -96,7 +130,10 @@ export class ProposalStream {
    * file is never extended into something readers refuse.
    */
   static resume(input: string | string[]): ProposalStream {
-    return streamFor(parseProposalLines(input));
+    const parsed = parseProposalLines(input);
+    const stream = streamFor(parsed);
+    for (const p of parsed.proposals) stream.envelopes.set(p.id!, envelopeKey(JSON.parse(p.text) as Record<string, unknown>));
+    return stream;
   }
 
   /** The last line written, or null for an empty stream. */
@@ -104,29 +141,25 @@ export class ProposalStream {
     return this.prevHash === null ? null : { seq: this.seq, hash: this.prevHash };
   }
 
-  /** Chain one proposal into the stream; returns the line as written. */
+  /**
+   * Chain one proposal into the stream; returns the line as written. Throws
+   * when the stream already gave its id a different envelope.
+   */
   append(proposal: ProposalLine): WrittenProposalLine {
     assertAccountableAuthor(proposal.author);
     const issue = proposalDraftIssue(proposal);
     if (issue) throw new TypeError(`proposal ${proposal.id}: ${issue}`);
-    const unhashed = {
-      schemaVersion: TRUTH_SCHEMA_VERSION,
-      seq: this.seq + 1,
-      id: proposal.id,
-      type: 'PROPOSAL' as const,
-      ts: proposal.ts,
-      author: proposal.author,
-      kind: proposal.kind,
-      draft: proposal.draft,
-      targetRef: proposal.targetRef ?? null,
-      signal: proposal.signal,
-      agentSessionId: proposal.agentSessionId ?? null,
-      prevHash: this.prevHash,
-    };
+    const envelope = envelopeOf(proposal);
+    const key = canonicalize(envelope);
+    const named = this.envelopes.get(proposal.id);
+    if (named !== undefined && named !== key) throw new TruthLineError(idConflict(proposal.id));
+    const { schemaVersion, ...body } = envelope;
+    const unhashed = { schemaVersion, seq: this.seq + 1, ...body, prevHash: this.prevHash };
     const line = { ...unhashed, hash: truthLineHash(unhashed) } as WrittenProposalLine;
     decodeTruthLine(JSON.stringify(line)); // the line readers will see: refuse it here rather than there
     this.seq = line.seq;
     this.prevHash = line.hash;
+    this.envelopes.set(proposal.id, key);
     return line;
   }
 }
@@ -181,9 +214,11 @@ export function proposalDedupeKey(proposal: { kind: string; targetRef?: string |
 /**
  * Append proposals to a proposals file (created if absent) as the next
  * lines of its stream, in one write, skipping any the file already holds
- * (or that repeat within the batch) by `proposalDedupeKey`. Throws, leaving
- * the file untouched, when the file is not one valid proposals stream (for
- * example a pre-1.0 file of bare lines).
+ * (or that repeat within the batch): the same envelope under its id, or
+ * the same `proposalDedupeKey`. Throws, leaving the file untouched, when
+ * the file is not one valid proposals stream (for example a pre-1.0 file
+ * of bare lines), or when a proposal reuses an id the file or the batch
+ * gives a different envelope.
  */
 export function appendProposalsFile(
   path: string,
@@ -193,16 +228,22 @@ export function appendProposalsFile(
   const parsed = parseProposalLines(existing);
   const stream = streamFor(parsed);
   const seen = new Set(parsed.proposals.map(proposalDedupeKey));
+  const envelopes = new Map(parsed.proposals.map((p) => [p.id!, envelopeKey(JSON.parse(p.text) as Record<string, unknown>)]));
 
   const fresh: string[] = [];
   let skipped = 0;
   for (const proposal of proposals) {
+    // An id names one envelope: checked before the dedupe, which would hide a reused id
+    const envelope = canonicalize(envelopeOf(proposal));
+    const named = envelopes.get(proposal.id);
+    if (named !== undefined && named !== envelope) throw new TruthLineError(`${idConflict(proposal.id)}; nothing was written`);
     const key = proposalDedupeKey(proposal);
-    if (seen.has(key)) {
+    if (named !== undefined || seen.has(key)) {
       skipped++;
       continue;
     }
     seen.add(key);
+    envelopes.set(proposal.id, envelope);
     fresh.push(JSON.stringify(stream.append(proposal)));
   }
   if (fresh.length > 0) {

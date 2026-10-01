@@ -8,6 +8,7 @@
  * or missing statuses).
  */
 
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
@@ -194,6 +195,64 @@ describe('status is a fold over TRANSITION lines (SH-03, SAT-08)', () => {
   });
 });
 
+describe('TRANSITIONs as stenographer writes them since its 1.0 review (spec: TRANSITION)', () => {
+  it('a TRANSITION id is opaque: the transition:<sha256> form written past 256 characters reads and folds', () => {
+    const tbId = `TB${'x'.repeat(200)}`;
+    const adId = `AD${'y'.repeat(100)}`;
+    const composed = `${adId}:${tbId}`;
+    expect(composed.length).toBeGreaterThan(256);
+    const override = {
+      ...transition(adId, tbId, 'overridden', 'override'),
+      id: `transition:${createHash('sha256').update(composed).digest('hex')}`,
+    };
+    const stream = chainTruthLines([tb(tbId, 'The queue is FIFO.'), addendum(adId, [[tbId, 'overrides']]), override]);
+    const result = parseWikiLines(stream);
+    expect(result.errors).toEqual([]);
+    expect(result.entries[0].status).toBe('overridden');
+    expect(result.entries[0].source?.transition).toMatchObject({ id: override.id, cause: { kind: 'override', ref: adId } });
+    // The readable form would break the id rule, which is why stenographer hashes it
+    expect(() => decodeTruthLine(chainTruthLines([{ ...override, id: composed }])[0])).toThrow(/^id: an id is 1–256 characters/);
+  });
+
+  it('a struck contest stops counting: its TB is active again (cause strike) and nothing cites the struck UV', () => {
+    const stream = chainTruthLines([
+      tb('TB1', 'Deploys need two approvals.'),
+      uv('UV1', 'One approval is enough now.', 'TB1'),
+      transition('UV1', 'TB1', 'contested', 'contest', 'sam'),
+      strike('R1', 'UV1'),
+      transition('R1', 'UV1', 'struck', 'strike', 'judge'),
+      transition('R1', 'TB1', 'active', 'strike', 'judge'),
+    ]);
+    const selection = selectCurrentTruth(parseWikiLines(stream).entries);
+    expect(selection.groundTruth.map((t) => t.id)).toEqual(['TB1']);
+    expect(selection.contested).toEqual([]);
+    expect(selection.unverified).toEqual([]);
+    expect(selection.history.map((e) => [e.id, e.status])).toEqual([['UV1', 'struck']]);
+    expect(renderTruthSection(selection)).not.toContain('One approval');
+  });
+
+  it('a TB with another open contest stays contested, citing only that one', () => {
+    const stream = chainTruthLines([
+      tb('TB1', 'Deploys need two approvals.'),
+      uv('UV1', 'One approval is enough now.', 'TB1'),
+      transition('UV1', 'TB1', 'contested', 'contest', 'sam'),
+      uv('UV2', 'Hotfixes skip approval.', 'TB1', { author: 'alex' }),
+      strike('R1', 'UV1'),
+      transition('R1', 'UV1', 'struck', 'strike', 'judge'),
+    ]);
+    const selection = selectCurrentTruth(parseWikiLines(stream).entries);
+    expect(selection.contested.map((c) => [c.tombstone.id, c.contestedBy.map((u) => u.id)])).toEqual([['TB1', ['UV2']]]);
+  });
+
+  it('blank lines are skipped and counted in the line numbers errors report', () => {
+    const [line] = chainTruthLines([tb('TB1', 'x')]);
+    const edited = JSON.stringify({ ...JSON.parse(line), claim: 'y' });
+    const result = parseWikiLines(['', '   ', edited, '']);
+    expect(result.errors).toMatchObject([{ line: 3, id: 'TB1', error: expect.stringMatching(/^hash mismatch/) }]);
+    expect(parseWikiLines(`\n${line}\n\n`).lines.map((l) => l.line)).toEqual([2]);
+  });
+});
+
 describe('open contesting UVs are attached to their TB whatever its recorded status (SAT-07)', () => {
   it('an active TB with an open contest is carried as contested, with the UV beside it', () => {
     // A stream read before stenographer's TRANSITION reached it
@@ -320,9 +379,11 @@ describe('identities (spec: Identities)', () => {
     expect(refused(uv('UV1', 'x', null, { author: 'Detector:wiki-sync' }))).toThrow(/reserved/);
     expect(refused(tb('TB1', 'x', { author: 'MIGRATION' }))).toThrow(/reserved/);
     expect(refused(tb('TB1', 'x', { signedBy: 'migration' }))).toThrow(/reserved/);
-    // The backfill's unsigned TB, and a TRANSITION carrying its cause's author, are allowed
+    // The backfill's unsigned TB is allowed
     expect(refused(tb('TB1', 'x', { author: 'migration', signedBy: null }))).not.toThrow();
-    expect(refused(transition('C1', 'TB1', 'struck', 'strike', 'migration'))).not.toThrow();
+    // A TRANSITION carries its cause's author, and no cause is written by the backfill or a detector
+    expect(refused(transition('C1', 'TB1', 'struck', 'strike', 'migration'))).toThrow(/reserved/);
+    expect(refused(transition('C1', 'TB1', 'struck', 'strike', 'Detector:wiki-sync'))).toThrow(/reserved/);
   });
 });
 

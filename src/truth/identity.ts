@@ -5,10 +5,11 @@
  * refuses a line whose identity is anonymous or generic, contains a control
  * character, or is reserved where it doesn't belong (`migration` authors
  * only an unsigned backfilled TB; `detector:*` authors only PROPOSAL lines;
- * a TRANSITION takes its cause's author). Identities compare by key —
- * Unicode NFKC, default-ignorable code points removed, trimmed, lowercased —
- * so `Assistant`, `ａｓｓｉｓｔａｎｔ` and `assis​tant` are all refused, and
- * `Alice` and `alice` are one person. Lines keep identities as written.
+ * a TRANSITION takes its cause's author, so it is never reserved).
+ * Identities compare by key — Unicode NFKC, default-ignorable code points
+ * removed, trimmed, lowercased — so `Assistant`, `ａｓｓｉｓｔａｎｔ` and
+ * `assis​tant` are all refused, and `Alice` and `alice` are one person.
+ * Lines keep identities as written.
  *
  * The optional signer registry is the one stenographer's import uses
  * (`signers.json`): an allowlist of names and roles, not a credential
@@ -69,10 +70,9 @@ export function hasControlCharacters(identity: string): boolean {
 
 /**
  * Why `identity` can't stand behind a line, or null when it can.
- * `reserved: 'detector'` admits `detector:*` (PROPOSAL authors);
- * `reserved: 'any'` admits both reserved forms (TRANSITION authors).
+ * `reserved: 'detector'` admits `detector:*` (PROPOSAL authors).
  */
-export function identityIssue(identity: unknown, options: { reserved?: 'detector' | 'any' } = {}): string | null {
+export function identityIssue(identity: unknown, options: { reserved?: 'detector' } = {}): string | null {
   if (typeof identity !== 'string') return 'an identity is a string';
   if (isAnonymousIdentity(identity)) {
     return `anonymous or generic identities cannot assert truth (got ${JSON.stringify(identity)}) — use a registered human handle or agent identity`;
@@ -80,7 +80,7 @@ export function identityIssue(identity: unknown, options: { reserved?: 'detector
   if (hasControlCharacters(identity)) return `identities cannot contain control characters (got ${JSON.stringify(identity)})`;
   if (isReservedIdentity(identity)) {
     const detector = identityKey(identity).startsWith(DETECTOR_PREFIX);
-    if (options.reserved === 'any' || (options.reserved === 'detector' && detector)) return null;
+    if (options.reserved === 'detector' && detector) return null;
     return `'${MIGRATION_AUTHOR}' and '${DETECTOR_PREFIX}*' are reserved for the backfill and detector paths (got ${JSON.stringify(identity)})`;
   }
   return null;
