@@ -42,7 +42,7 @@ Every module is also available on its own subpath:
 ## Quick Start
 
 ```typescript
-import { CompactionEngine } from '@shorthand/core';
+import { CompactionEngine, renderContextFrame } from '@shorthand/core';
 
 const engine = new CompactionEngine({
   memtableSize: 10,   // messages to keep verbatim
@@ -70,11 +70,12 @@ await engine.flush();
 
 // Build a token-budgeted context frame for your next LLM call
 const frame = engine.buildContextFrame(2000);
-// frame.sections is ordered L4 invariants → L3 graph → L2 summaries → L1 compacted → L0 raw,
-// with any tombstone corrections and active-engram recalls surfaced first when present.
-// frame.tokenUsage stays within your budget.
-// frame.sections contains L4 invariants → L3 graph → L2 summaries → L1 compacted → L0 raw
-// frame.tokenUsage stays within your budget
+// frame.sections: ledger truth → corrections → L4 invariants → memories → pinned code
+// → L3 graph → L2 summaries → L1 history → L0 raw, each with a `kind`, its `items`
+// (with source ids) and an `omitted` count.
+// frame.tokenUsage === estimateTokens(renderContextFrame(frame)) <= 2000
+// (estimateTokens is a ~4 chars/token heuristic, not a model tokenizer).
+const prompt = renderContextFrame(frame);
 ```
 
 ## Architecture
@@ -84,16 +85,52 @@ Short-hand models conversation memory as a five-level LSM-tree:
 | Level | Name | Contents | Fidelity |
 |-------|------|----------|----------|
 | **L0** | Memtable | Raw recent messages | Verbatim |
-| **L1** | Compacted | Noise-stripped, deduplicated | High |
+| **L1** | Compacted | Messages kept verbatim (pure acks dropped, short replies folded into their question); code indexed by hash | High |
 | **L2** | Summaries | Topic-clustered with entity/decision extraction | Medium |
 | **L3** | Graph | Entity-relationship knowledge graph | Structural |
 | **L4** | Invariants | Core facts that must survive indefinitely | Minimal |
 
-Messages enter L0 and progressively compact into deeper levels as the conversation grows. When building a context frame, levels are prioritized L4 → L0 (invariants first, recent messages last) within your token budget. Corrections (tombstones) are budgeted ahead of every derived level, and up to 25% of the budget is reserved for the most recent raw messages so compacted history can't crowd them out.
+Messages enter L0 and progressively compact into deeper levels as the conversation grows. L1 never rewrites a message: no words are stripped, and fenced code blocks stay byte-for-byte (they are also stored in a content-addressed span store, `state.spans`). Recompacting L1 into L2 moves the summarized entries to `state.archive`, so repeated recompaction is idempotent. Mutations (`addMessage` compaction, `flush`, `recompact`, `correct`, …) run on one internal queue, so concurrent callers never lose messages.
+
+### Context frames
+
+`buildContextFrame(budget)` fills sections in priority order — synced ledger truth, corrections, L4 invariants, then (after holding back up to 25% of the budget for the newest raw messages) memories, pinned code, L3, L2 and L1 — **item by item**: an item that does not fit is skipped and counted in `section.omitted`, and the next one is tried. A contested TB and the UVs disputing it are one item. L0 fills newest-first and stays contiguous.
+
+The budget is a hard ceiling on the rendered frame: `frame.tokenUsage` is `estimateTokens(renderContextFrame(frame))` and never exceeds the budget (the estimate is the package's ~4 characters per token heuristic, not a model tokenizer count).
+
+Each section has a `kind` with one fixed marker:
+
+| kind | marker | from |
+|---|---|---|
+| `truth` | `## Asserted Truth (ledger)`, `[TB]`, `[TB ⚠ CONTESTED]`, `[UV — UNVERIFIED]` | synced ledger |
+| `correction` | `[correction]` | tombstones (`(inferred)` when pattern-detected) |
+| `invariant` | `[invariant]` | L4 |
+| `memory` | `[memory]` | active engrams |
+| `code` | `[code sha256:…]` | pinned code spans |
+| `graph` | `[entity]`, `[edge]` | L3 |
+| `summary` | `[summary]` | L2 |
+| `history` | (message text) | L1 |
+| `recent` | `role: text` | L0 |
+
+Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker, any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` and can never pass for ledger truth. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
+
+An L1 entry whose code does not fit is shown with `[code sha256:<12 hex> — N tokens, not shown]` references; `engine.getSpan(hash)` returns the exact text, and `engine.pinSpan(hash)` gives a span its own frame section.
 
 ### Tombstones
 
-When a correction is detected ("Actually, we're using Postgres, not MySQL"), short-hand creates a **tombstone** that tracks the superseded information. This prevents stale facts from resurfacing during compaction, and `InvariantChecker` (see [Verification](#verification)) mechanically checks that correction propagation actually held.
+A correction creates a **tombstone** that records the superseded value, and every level that still states only that value is updated: L1 entries, L2 summaries and decisions, L3 entities and the edges touching them, and L4 invariants are moved to `state.archive` under the tombstone's id — archived, never deleted. `InvariantChecker` (see [Verification](#verification)) checks all of L1–L4, and optionally the rendered frame, for values that should have been superseded.
+
+Corrections come from two places:
+
+- **Declared by the host** (`confidence: 'explicit'`) — the deterministic path:
+
+  ```typescript
+  const tombstone = await engine.correct({ key: 'region', from: 'us-east-1', to: 'eu-west-1', sourceMessageId: 'msg-42' });
+  await engine.revertCorrection(tombstone.id!); // restores everything it archived
+  ```
+
+  The tombstone id derives from the inputs, so declaring the same correction twice is a no-op. Older messages still in L0 get the correction when they compact.
+- **Inferred by `RegexCompactor`** (`confidence: 'inferred'`) from phrasing such as "Actually, use Postgres instead of MySQL" or "switch MySQL to Postgres". These are low-confidence suggestions: applied reversibly, rendered as `(inferred)`, and not proposed to the truth ledger unless you pass `includeInferred: true`. Keyword-only corrections ("Wait, …") and corrections whose superseded value is empty, a pronoun or a function word ("change it to blue") never produce a tombstone.
 
 ### Importance Scoring
 
@@ -162,7 +199,7 @@ engine.attachActiveEngrams(store);
 
 ## Interpreter Tiers
 
-The interpreter step is a **bounded LM call made at retrieval time** — separate from the [compactor tiers](#compactor-tiers) that govern L0→L1 write-time compaction. All three implementations share one contract: a hard `maxOutputTokens`/`timeoutMs` budget, and a promise to throw `InterpreterBudgetError` or `InterpreterUnavailableError` (never to hang or silently truncate) so `withFallback()` can route deterministically.
+The interpreter step is a **bounded LM call made at retrieval time** — separate from the [compactor tiers](#compactor-tiers) that govern L0→L1 write-time compaction. All three implementations share one contract: a hard `maxOutputTokens`/`timeoutMs` budget, and a promise to throw `InterpreterBudgetError` or `InterpreterUnavailableError` (never to hang or silently truncate) so `withFallback()` can route deterministically. Output the backend cut off — Anthropic `stop_reason` `max_tokens` or `model_context_window_exceeded`, Ollama `done_reason: "length"` — throws `InterpreterBudgetError('output_too_long')`; an Anthropic `refusal` throws `InterpreterUnavailableError`.
 
 | Tier | Class | Backend | Status |
 |------|-------|---------|--------|
@@ -244,8 +281,10 @@ const event = await ingester.ingest(
   },
   engine,
 );
-// { sourceId: 'doc-1', chunkCount: 4, entitiesDiscovered: ['PagerDuty', 'Postgres'], ... }
+// { sourceId: 'doc-1', chunkCount: 4, entitiesDiscovered: ['PagerDuty', 'Postgres'], version: '3f1c…', retractedChunks: 0 }
 ```
+
+Every chunk is at most `chunkSize` tokens (paragraphs, then sentences, then whitespace or hard cuts; no text is dropped), and chunking is linear in document size. `entitiesDiscovered` lists only the L3 entities this ingestion added. Sources are versioned by content hash (chunk ids are `<sourceId>@<version>-chunk-<n>`): re-ingesting an unchanged source returns `{ skipped: true }`, and ingesting an edited one first retracts the previous version's chunks (`engine.retract`) so stale text does not stay live beside the update.
 
 `ingestAll(sources, engine)` ingests a batch sequentially; `getEvents()` returns the full ingestion log for use with `WikiRenderer` below.
 
@@ -288,6 +327,10 @@ const frame = engine.buildContextFrame(budget); // build context within token bu
 const state = engine.getState();               // inspect current compacted state
 engine.setCompactor(customCompactor);           // swap in a different Compactor
 engine.attachActiveEngrams(activeEngramStore);  // fold active engrams into context frames
+await engine.correct({ from, to, sourceMessageId }); // declare a correction (explicit tombstone)
+await engine.revertCorrection(tombstoneId);     // undo one, restoring what it archived
+await engine.retract(messageIds);               // revert their corrections, archive what derives only from them
+engine.getSpan(hash); engine.pinSpan(hash);     // exact code spans; pin one into every frame
   memtableSize: 10,       // L0 capacity before auto-flush (default: 10)
   contextBudget: 8000,    // token budget for context frames (default: 8000)
   preferredTier: 'regex', // compaction strategy (default: 'regex')
@@ -332,7 +375,7 @@ const result = new VerificationHarness({ minRecallScore: 0.85 }).verify(deeper, 
 const report = checkInvariants(deeper, history, [...BUILTIN_INVARIANTS, myInvariant]);
 ```
 
-These checks are heuristics over extracted entities, decisions and tombstones, not proofs: a pass means the checked properties held for what the extractors found.
+These checks are heuristics over extracted entities, decisions and tombstones, not proofs: a pass means the checked properties held for what the extractors found. Recall, decision completeness and entity retention are scored against the snapshot's `summary` — the text the model receives — with the entities to retain extracted from the original history, so a snapshot whose summary dropped the facts fails even when its structured fields still list them.
 
 ### ImportanceDetector
 
@@ -450,19 +493,24 @@ Safety checks and recall testing for compacted state.
 ```typescript
 import { InvariantChecker, RecallTester } from '@shorthand/core';
 
-// Five structural safety checks against compacted state
+// Structural safety checks against compacted state: correction propagation
+// across L1–L4, entity provenance, decision completeness, tombstone
+// consistency, temporal ordering — plus frame staleness when given a frame
 const checker = new InvariantChecker();
-const result = checker.verify(compactedState);
+const frame = engine.buildContextFrame(4000);
+const result = checker.verify(engine.getState(), { frame });
 // { passed: true, checks: [{ name: 'correction-propagation', passed: true, message: '...' }, ...] }
 
-// Generate quiz questions from the full history, then test whether the
-// compacted state still holds enough information to answer them
+// Generate quiz questions from the full history, then test whether what the
+// model will see — the frame, so budget truncation counts — answers them.
+// Superseded values never count as recalled.
 const tester = new RecallTester();
 const questions = tester.generateQuestions(originalMessages);
-const recall = tester.evaluateRecall(questions, compactedState);
+const recall = tester.evaluateRecall(questions, frame, { tombstones: engine.getState().tombstones });
 // { passed: true, checks: [...], recallScore: 0.85 }
-// recall.recallScore → 0.85 (85% recall)
 ```
+
+Both checks are heuristic string matching (whole-word, case-insensitive), not proofs: a passing run means no superseded value or missing answer was found by that matcher.
 
 ### Source Ingestion & Wiki Rendering
 

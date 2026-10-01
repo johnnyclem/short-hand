@@ -166,3 +166,54 @@ The serialized formats changed (Lamport timestamps are `{ counter, agentId }`, O
 - The snapshot pipeline: `DefaultCompactor` and its verification strategies (`runRecallTest`, `checkInvariants` with pluggable invariants, `analyzeInformationTheoretic`, `VerificationHarness`), and `TruthAwareCompactor`.
 - CRDT: `LamportClock`, vector clocks, `RGA`, `MemoryMerge`, `ConflictDetector`.
 - Importance: `EntityGraph`, `ReferenceGraph`, `TrajectoryTracker`, `RunningStats`, cosine helpers.
+
+## Everyone: compaction correctness, corrections and context frames
+
+These changes apply whichever codebase you come from.
+
+### Context frames
+
+- `ContextSection` gains `kind` (`'truth' | 'correction' | 'invariant' | 'memory' | 'code' | 'graph' | 'summary' | 'history' | 'recent'`), `items` (`{ text, sources }[]`) and `omitted`; `ContextFrame` gains `omitted` (per kind). Several kinds share `level: L4_INVARIANTS`, so select sections by `kind`, not `level`:
+
+  ```diff
+  - frame.sections.filter((s) => s.level === CompactionLevel.L1_COMPACTED)
+  + frame.sections.filter((s) => s.kind === 'history')
+  ```
+
+- `tokenUsage` is now `estimateTokens(renderContextFrame(frame))` — the frame rendered as one string, newlines included — and is never above the budget. It used to be the sum of per-section estimates, and corrections could overflow by 5%. For the same budget a frame can hold slightly less.
+- Sections fill item by item; an item that does not fit is skipped (`omitted`), not the whole section. Ledger truth, invariant and graph sections no longer disappear when they outgrow the budget.
+- Line formats: L2 summaries render as `[summary] <topic>: <text>` (was `[<topic>] <text>`); pattern-inferred corrections end their quoted pair with ` (inferred)`; pinned code renders as `[code sha256:<12 hex>]` plus the code; an L1 entry whose code does not fit shows `[code sha256:… — N tokens, not shown]` (`engine.getSpan` returns the text).
+- Untrusted text (messages, tool output, ledger fields, engrams) is escaped: `[TB…` / `[UV…` anywhere, section markers at a line start and a reproduced `## Asserted Truth` heading get a leading `\`. Use `renderContextFrame(frame)` (or join `section.content`) — the content is already escaped.
+- Active engrams: a frame counts a retrieval (`maxRetrievals`) only for memories it includes. The default interpreter template is now `Earlier note, still relevant: {{payload}}` (it used to paste the recent conversation into every memory); pass `interpreterTemplate` to keep the old one. `ActiveEngramStore.select` / `markSurfaced` split `retrieve` into its pure and counting halves.
+
+### LSM compaction
+
+- **L1 is verbatim.** `RegexCompactor` no longer strips "I think", "maybe", "probably", "just" and similar words, no longer replaces code blocks with `[code block]`, and no longer drops messages under 5 characters (only pure acknowledgements and greetings are dropped; "8080", "v2" are kept, and a short reply to the other role's question is folded in as `question → answer`). Expect longer L1 text.
+- `CompactedState.l1_compacted` entries are `CompactedEntry` (adds optional `timestamp`, `role`, `spanIds`, `foldedMessageIds`). `CompactedState` gains optional `archive` (`ArchivedItem[]`) and `spans` (code spans keyed by sha256). States you build by hand need neither.
+- **Corrections archive instead of delete, at every level.** A tombstone now also displaces L4 invariants (archived with `displacedBy`) and L3 entities and their edges, not just L1/L2. Items go to `state.archive` with `by: <tombstone id>`; `engine.revertCorrection(id)` restores them.
+- `RegexCompactor` tombstones have an `id` and `confidence: 'inferred'`. It no longer records a tombstone without a superseded value (keyword-only "Wait, …" corrections), with a pronoun or function word as the value ("change it to blue"), or from a question; the keywords are whole words (`await`, `Factually` no longer match). Questions no longer become decisions or invariants. A rejection-only decision's topic is `Rejected: <option>` (was `Decision: undefined`).
+- Prefer host-declared corrections: `await engine.correct({ from, to, sourceMessageId, key? })` returns an `explicit` tombstone; it throws `TypeError` for an empty or pronoun `from`.
+- `recompact(L2_SUMMARIES)` moves the L1 entries it summarizes into the archive (`reason: 'summarized'`), so repeated calls are idempotent. Discussion-block summaries have ids `l2:<first>..<last>` and stable numbers; L3 edges are deduplicated by (source, relation, target).
+- `addMessage` adds the message to L0 synchronously and queues compaction behind earlier operations; all state changes run on one queue. Concurrent calls no longer lose messages.
+- Extraction reads at most 16 KB of prose per message (code blocks excluded), in sentence windows of at most 400 characters. Decisions, corrections, entities and constraints past that point are no longer extracted (the text itself is kept).
+
+### Proposals
+
+`exportProposalDrafts` / `tombstonesToProposalDrafts` skip tombstones with `confidence: 'inferred'` unless you pass `includeInferred: true`, and never propose a tombstone without a superseded value. Hand-built tombstones (no `confidence`) are proposed as before.
+
+### Verification
+
+- `InvariantChecker.verify(state, { frame? })` checks correction propagation across L1–L4 (it checked only L1/L2 by substring) using the compactor's whole-word matcher, ignoring items restated after the correction; with a frame it adds a `frame-staleness` check. `tombstone-consistency` fails on a tombstone with an empty superseded value; `temporal-ordering` now checks order, not just field presence. States that passed before can fail.
+- `RecallTester.evaluateRecall(questions, stateOrFrame, { tombstones? })` accepts a `ContextFrame`; tombstone text no longer counts as recall, and questions whose answer is a superseded value are reported as `recall:superseded` and left out of the score.
+- Snapshot pipeline: `DefaultQuizEvaluator` answers from `summary` only (no fallback to `entities` / `decisions`), `decisionCompleteness` (INV-003) checks the summary only, and `measureEntityRetention` takes the entities to retain from the original history. Recall and retention scores can drop for snapshots whose summary omits facts.
+- `applyTruthToSnapshot` strips only the truth section it appended (the trailing one matching `state.truth`), not everything after the first `## Asserted Truth (ledger)` in the summary.
+
+### Ingestion
+
+- Chunk message ids are `<sourceId>@<version>-chunk-<n>` (was `<sourceId>-chunk-<n>`); `metadata.sourceVersion` carries the version (first 12 hex of the content's sha256).
+- `IngestionEvent` gains `version`, `retractedChunks` and `skipped`; `entitiesDiscovered` lists only the entities this ingestion added. Re-ingesting an unchanged source is a no-op (`skipped: true`, not logged); re-ingesting a changed one retracts the previous version's chunks first (`engine.retract`).
+- Every chunk is now at most `chunkSize` tokens (oversized paragraphs are split by sentence, then whitespace, then hard cuts), and trailing text without a sentence terminator is kept.
+
+### Interpreters
+
+`HostInterpreter` throws `InterpreterBudgetError('output_too_long')` when the response's `stop_reason` is `max_tokens` or `model_context_window_exceeded`, and `InterpreterUnavailableError` on `refusal`; `LocalInterpreter` throws `InterpreterBudgetError` on Ollama's `done_reason: 'length'`. `withFallback` routes both. Stubs that return truncated text with those stop reasons now fail.
