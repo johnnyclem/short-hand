@@ -8,7 +8,8 @@
  *    dependencies, the release metadata (engines, publishConfig).
  * 2. Install the tarball into a fresh project with nothing else in it.
  * 3. Import every subpath export at runtime (test/smoke/runtime.mjs).
- * 4. Typecheck a consumer (test/smoke/consumer.ts), plus every name the
+ * 4. Typecheck a consumer (test/smoke/consumer.ts), smallchat's exact
+ *    re-export blocks (test/smoke/smallchat-*.ts), and every name the
  *    README's TypeScript examples import, with skipLibCheck off under
  *    moduleResolution Node16 (with Node's types) and Bundler (DOM lib, no
  *    Node types), using this repo's TypeScript.
@@ -126,7 +127,8 @@ try {
   process.stdout.write(run(process.execPath, ['runtime.mjs'], consumer));
 
   // 4. Types: Node16 and Bundler consumers, skipLibCheck off.
-  copyFileSync(join(repo, 'test', 'smoke', 'consumer.ts'), join(consumer, 'consumer.ts'));
+  const typed = ['consumer.ts', 'smallchat-reexports.ts', 'smallchat-importance.ts'];
+  for (const file of typed) copyFileSync(join(repo, 'test', 'smoke', file), join(consumer, file));
   const readmeImports = readmeImportFile(readFileSync(join(repo, 'README.md'), 'utf8'), pkg.name);
   writeFileSync(join(consumer, 'readme-imports.ts'), readmeImports.source);
   console.log(`ok collected ${readmeImports.count} names imported by the README's examples`);
@@ -138,7 +140,7 @@ try {
   };
   for (const [name, compilerOptions] of Object.entries(configs)) {
     const config = `tsconfig.${name}.json`;
-    writeFileSync(join(consumer, config), JSON.stringify({ compilerOptions, files: ['consumer.ts', 'readme-imports.ts'] }, null, 2));
+    writeFileSync(join(consumer, config), JSON.stringify({ compilerOptions, files: [...typed, 'readme-imports.ts'] }, null, 2));
     try {
       run(process.execPath, [tsc, '-p', config], consumer);
     } catch (err) {

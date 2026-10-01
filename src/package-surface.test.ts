@@ -10,6 +10,8 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { describe, it, expect } from 'vitest';
 import * as root from './index.js';
 import * as compaction from './compaction/index.js';
@@ -199,4 +201,29 @@ describe('root barrel', () => {
       expect((root as Record<string, unknown>)[name], name).toBeUndefined();
     }
   });
+});
+
+describe('smallchat’s type re-exports (SH-REV-C3)', () => {
+  it('its exact re-export blocks typecheck against this source, and the renamed names mean what MIGRATION says', () => {
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const files = ['test/smoke/smallchat-reexports.ts', 'test/smoke/smallchat-importance.ts'].map((f) => `${root}${f}`);
+    const program = ts.createProgram(files, {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler,
+      lib: ['lib.es2022.d.ts'],
+      types: ['node'],
+      strict: true,
+      noEmit: true,
+      isolatedModules: true,
+      skipLibCheck: true,
+      baseUrl: root,
+      paths: { '@shorthand/core': ['src/index.ts'], '@shorthand/core/*': ['src/*/index.ts'] },
+    });
+    const diagnostics = ts.getPreEmitDiagnostics(program).map((d) => {
+      const where = d.file ? `${d.file.fileName.slice(root.length)}:${d.file.getLineAndCharacterOfPosition(d.start ?? 0).line + 1}: ` : '';
+      return where + ts.flattenDiagnosticMessageText(d.messageText, '\n');
+    });
+    expect(diagnostics).toEqual([]);
+  }, 60_000);
 });
