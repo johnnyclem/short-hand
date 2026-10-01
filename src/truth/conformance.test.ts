@@ -298,14 +298,38 @@ describe('invalid fixtures', () => {
   });
 });
 
+describe('timestamps (SH-REV-C5)', () => {
+  const withTs = (ts: string) => {
+    const line = parse(lines('valid/ledger.jsonl')[0]);
+    line.ts = ts;
+    line.hash = truthLineHash(line);
+    return JSON.stringify(line);
+  };
+
+  it('refuses a leap second, as stenographer does, and never one the schema refuses', () => {
+    for (const ts of ['2026-09-01T10:00:60.000Z', '2026-09-01T23:59:60Z', '2026-09-01T23:59:60.5+00:00']) {
+      expect(() => decodeTruthLine(withTs(ts)), ts).toThrow(/leap second/);
+    }
+    expect(schemaValid(withTs('2026-09-01T10:00:60.000Z'))).toBe(false);
+  });
+
+  it('refuses impossible dates and accepts ordinary ones', () => {
+    expect(() => decodeTruthLine(withTs('2026-02-30T00:00:00Z'))).toThrow(/^ts:/);
+    expect(() => decodeTruthLine(withTs('2026-09-01T24:00:00Z'))).toThrow(/^ts:/);
+    expect(decodeTruthLine(withTs('2028-02-29T23:59:59.999+05:30')).version).toBe(2);
+  });
+});
+
 describe('the zero-dependency codec agrees with the JSON Schema', () => {
   // Mutate valid fixture lines one field at a time (re-hashed, so only the
   // mutation is wrong): whatever the codec accepts, the schema must accept,
   // and whatever the schema accepts but the codec refuses must be one of the
-  // rules JSON Schema can't express (hash, identity, links).
-  const CODEC_ONLY = /anonymous|reserved|control character|cannot carry the link|only the links it writes|contests link|contests field|each link once|hash mismatch|canonicalized/;
+  // rules JSON Schema can't express (hash, identity, links), or a leap
+  // second, which date-time allows at 23:59 UTC and stenographer's codec
+  // refuses (SH-REV-C5).
+  const CODEC_ONLY = /anonymous|reserved|control character|cannot carry the link|only the links it writes|contests link|contests field|each link once|hash mismatch|canonicalized|leap second/;
   const valid = ['valid/ledger.jsonl', 'valid/proposals.jsonl', 'valid/unknown.jsonl', 'valid/routing.jsonl'].flatMap((f) => lines(f));
-  const POOL: unknown[] = [null, '', ' ', 0, -1, 1, 1.5, 'x', 'Assistant', 'migration', [], {}, true, '2026-13-01T00:00:00Z', 'a'.repeat(300), 'ab'.repeat(32), '\u0007'];
+  const POOL: unknown[] = [null, '', ' ', 0, -1, 1, 1.5, 'x', 'Assistant', 'migration', [], {}, true, '2026-13-01T00:00:00Z', '2026-02-30T00:00:00Z', '2026-09-01T10:00:60.000Z', '2026-09-01T23:59:60Z', '2026-09-01T23:59:60+01:00', 'a'.repeat(300), 'ab'.repeat(32), '\u0007'];
 
   function paths(value: unknown, prefix: Array<string | number> = [], depth = 0): Array<Array<string | number>> {
     if (depth > 3 || typeof value !== 'object' || value === null) return [];

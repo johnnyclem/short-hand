@@ -151,12 +151,16 @@ function daysIn(year: number, month: number): number {
   return [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
 }
 
-/** RFC 3339 date-time, as the schema's pattern and `format: date-time` require. */
+/**
+ * RFC 3339 date-time, as the schema's pattern and `format: date-time`
+ * require, and as stenographer's codec reads it: no leap second (`:60`),
+ * which `Date.parse` refuses there.
+ */
 export function isRfc3339(ts: string): boolean {
   const m = RFC3339_RE.exec(ts);
   if (!m) return false;
   const [y, mo, d, h, mi, s] = m.slice(1, 7).map(Number);
-  if (mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo) || h > 23 || mi > 59 || s > 60) return false;
+  if (mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo) || h > 23 || mi > 59 || s > 59) return false;
   return m[9] === undefined || (Number(m[9]) <= 23 && Number(m[10]) <= 59);
 }
 
@@ -297,7 +301,11 @@ function decodeV2(o: Obj, raw: string): DecodedTruthLine {
     fail('type', `${JSON.stringify(o.type)} is not a truth line type (${TRUTH_LINE_TYPES.join(', ')})`);
   }
   const type = o.type as TruthLineType;
-  if (typeof o.ts !== 'string' || !isRfc3339(o.ts)) fail('ts', 'must be an RFC 3339 date-time');
+  if (typeof o.ts !== 'string' || !isRfc3339(o.ts)) {
+    // JSON Schema's date-time takes 23:59:60 UTC; stenographer's codec (Date.parse) refuses every leap second
+    if (typeof o.ts === 'string' && RFC3339_RE.exec(o.ts)?.[6] === '60') fail('ts', 'a leap second (:60) is not a time this codec reads');
+    fail('ts', 'must be an RFC 3339 date-time');
+  }
   if (typeof o.author !== 'string' || o.author.length === 0) fail('author', 'must be a non-empty string');
   if (o.prevHash !== null && (typeof o.prevHash !== 'string' || !HEX64_RE.test(o.prevHash))) fail('prevHash', 'a hash is 64 lowercase hex digits, or null');
   if (typeof o.hash !== 'string' || !HEX64_RE.test(o.hash)) fail('hash', 'a hash is 64 lowercase hex digits');
@@ -432,8 +440,10 @@ export function decodeTruthLine(raw: string): DecodedTruthLine {
  * part-way (an incremental export), but not skip, repeat, reorder or
  * interleave two writers. With `previous` (the head a reader kept from its
  * last read), the lines must also continue, or still contain, that head —
- * which is how a reader notices lines removed from the end. Returns the
- * index and error of each break; null entries (refused lines) are skipped.
+ * which is how a reader notices lines removed from the end; lines with no
+ * v2 line among them (none at all, or only version 1 lines) do neither.
+ * Returns the index and error of each break (index -1: the lines as a
+ * whole); null entries (refused lines) are skipped.
  */
 export function checkTruthChain(
   lines: Array<DecodedTruthLine | null>,
@@ -477,6 +487,12 @@ export function checkTruthChain(
     }
     prev = { seq, hash: d.hash! };
   });
+  if (previous && firstIndex === -1 && !lines.some((d) => d === null)) {
+    breaks.push({
+      index: -1,
+      error: `chain broken: the input holds no line of the stream read before (it ended at seq ${previous.seq}) — it was emptied or rewritten`,
+    });
+  }
   if (previous && firstIndex !== -1 && !sawPrevious) {
     if (lines[firstIndex]!.seq! <= previous.seq) {
       breaks.push({

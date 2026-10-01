@@ -8,7 +8,14 @@
  * later lines for an id superseding earlier ones) are still read.
  *
  * - **Status is a fold.** An entry's current status is the status of the
- *   highest-seq TRANSITION that targets it, else the entry line's own.
+ *   highest-seq TRANSITION that targets it, else the entry line's own —
+ *   among the TRANSITIONs a reader honours. Overridden and struck TBs, and
+ *   verified, refuted and struck UVs, are final: a later TRANSITION can
+ *   only move them up the lattice. With a signer registry, a TRANSITION by
+ *   someone it doesn't list is not honoured either (both are `held`). A
+ *   TRANSITION's `cause.ref` must name an earlier line of the stream.
+ * - **Incremental reads** pass the earlier result as `base`: the increment
+ *   folds into it as one stream.
  * - **Fail closed.** A missing or unknown status means not current truth;
  *   the line is kept as history and written back verbatim. A v2 stream
  *   with any refused line (bad hash, identity, structure) or a broken
@@ -79,9 +86,22 @@ export interface TruthReadOptions {
   /**
    * The head of the stream as last read (`result.head`). The input must
    * continue it or still hold it, which is how a reader notices lines
-   * removed from the end or a rewritten stream.
+   * removed from the end or a rewritten stream; an input with no version 2
+   * line (an empty one, or one rewritten as version 1 lines) is refused.
+   * Without `base`, the result holds only the input's entries: a check that
+   * a chunk continues the stream, not a fold of the whole stream.
    */
   previous?: StreamHead | null;
+  /**
+   * The read this input continues: an earlier `parseWikiLines` result (one
+   * stream, not a `parseWikiFiles` merge). The result is the whole stream
+   * so far — the base's lines, then the input's, folded as one — so the
+   * input's TRANSITIONs apply to the base's entries. Keep it and pass it as
+   * the next `base`. `previous` defaults to `base.head`; an empty input is
+   * the base again. A refused base refuses the read. Line numbers count
+   * within the input each line was read from.
+   */
+  base?: WikiParseResult | null;
 }
 
 /** One line of the input, as read. */
@@ -104,12 +124,22 @@ export interface WikiParseResult {
    * status. Empty when the stream was refused.
    */
   entries: TruthLedgerEntry[];
-  /** Refused lines and chain breaks, by line. With a v2 stream, any of them refuses it. */
+  /**
+   * Refused lines and chain breaks, by line (line 0: the input as a whole).
+   * With a v2 stream, any of them refuses it.
+   */
   errors: Array<{ line: number; error: string; id?: string; file?: string }>;
   /** True when the input was refused: nothing it says is truth. */
   refused: boolean;
   /** Every TRANSITION read, in order, including ones whose target is not in the input (a partial stream). */
   transitions: TruthTransition[];
+  /**
+   * TRANSITIONs read but not honoured, with the reason: one that would move
+   * a final status (TB overridden or struck; UV verified, refuted or struck)
+   * back down the lattice, or, with a signer registry, one whose author it
+   * doesn't list. They change no status; the lines are kept in `lines`.
+   */
+  held: Array<{ line: number; id: string; reason: string; file?: string }>;
   /** Every line read, verbatim — the whole stream, to write back or forward. Empty when refused. */
   lines: TruthLineRecord[];
   /** The last v2 line read: keep it and pass it as `previous` next time. */
@@ -286,18 +316,55 @@ interface FileRead {
   entries: Map<string, TruthLedgerEntry>;
   conflicts: Map<string, string>;
   transitions: TruthTransition[];
+  held: WikiParseResult['held'];
   errors: WikiParseResult['errors'];
   refused: boolean;
   lines: TruthLineRecord[];
   head: StreamHead | null;
 }
 
+interface Item {
+  line: number;
+  d: DecodedTruthLine | null;
+}
+
+/** Statuses that never change again, except up the lattice (a strike after an override). */
+const FINAL_STATUSES: Record<'TB' | 'UV', readonly string[]> = { TB: ['overridden', 'struck'], UV: ['verified', 'refuted', 'struck'] };
+
+/** A line of an earlier read, decoded again without re-checking what that read checked. */
+function redecode(record: TruthLineRecord): DecodedTruthLine {
+  const line = JSON.parse(record.text) as Record<string, unknown>;
+  return {
+    version: record.version,
+    type: record.type,
+    line,
+    text: record.text,
+    seq: record.seq,
+    prevHash: record.version === 2 ? (line.prevHash as string | null) : null,
+    hash: record.hash,
+  };
+}
+
+function refusedRead(errors: WikiParseResult['errors']): FileRead {
+  return { entries: new Map(), conflicts: new Map(), transitions: [], held: [], errors, refused: true, lines: [], head: null };
+}
+
 function readFile(input: string | string[], options: TruthReadOptions, file?: string): FileRead {
   const raw = Array.isArray(input) ? input : input.split('\n');
   const tag = file !== undefined ? { file } : {};
-  const items: Array<{ line: number; d: DecodedTruthLine | null }> = [];
-  const errors: WikiParseResult['errors'] = [];
-  let v2 = false;
+  const base = options.base ?? null;
+  if (base?.refused) return refusedRead([{ line: 0, error: 'the base read was refused: there is no stream to continue', ...tag }]);
+  if (base?.lines.some((l) => l.file !== undefined)) {
+    return refusedRead([{ line: 0, error: 'the base is a merge of several files (parseWikiFiles): an increment continues one stream', ...tag }]);
+  }
+  const previous = options.previous ?? base?.head ?? null;
+
+  // The base's lines were checked when it was read; they come first in the stream
+  const baseItems: Item[] = (base?.lines ?? []).map((record) => ({ line: record.line, d: redecode(record) }));
+  const items: Item[] = [];
+  const errors: WikiParseResult['errors'] = [...(base?.errors ?? [])];
+  // A stream read before as v2 (a head) stays one: a version 1 line can't continue it
+  let v2 = previous !== null || baseItems.some((i) => i.d!.version === 2);
 
   for (let i = 0; i < raw.length; i++) {
     const text = raw[i];
@@ -316,9 +383,10 @@ function readFile(input: string | string[], options: TruthReadOptions, file?: st
       errors.push({ line: i + 1, error: err instanceof Error ? err.message : String(err), ...idOf(text), ...tag });
     }
   }
+  const all = [...baseItems, ...items];
   if (v2) {
     // One writer's v2 stream holds only v2 lines: a version 1 line in it was not written by that writer
-    for (const item of items) {
+    for (const item of all) {
       if (item.d?.version !== 1) continue;
       errors.push({
         line: item.line,
@@ -329,32 +397,47 @@ function readFile(input: string | string[], options: TruthReadOptions, file?: st
       item.d = null;
     }
   }
-  for (const { index, error } of checkTruthChain(items.map((i) => i.d), options.previous ?? null)) {
-    errors.push({ line: items[index].line, error, ...(items[index].d ? { id: items[index].d!.line.id as string } : {}), ...tag });
+  for (const { index, error } of checkTruthChain(all.map((i) => i.d), previous)) {
+    const item = all[index];
+    errors.push({ line: item?.line ?? 0, error, ...(item?.d ? { id: item.d.line.id as string } : {}), ...tag });
   }
-  errors.sort((a, b) => a.line - b.line);
 
   // A v2 stream is one unit: a refused line or a broken chain refuses all of it.
   // A pure v1 file keeps its old per-line tolerance (it has no chain to break).
-  const refused = errors.length > 0 && v2;
-  const result: FileRead = { entries: new Map(), conflicts: new Map(), transitions: [], errors, refused, lines: [], head: null };
-  if (refused) return result;
+  if (errors.length > 0 && v2) return refusedRead(errors.sort((a, b) => a.line - b.line));
+  const result = fold(all, options, file);
+  result.errors.unshift(...errors);
+  result.errors.sort((a, b) => a.line - b.line);
+  if (result.errors.length > 0 && v2) return refusedRead(result.errors);
+  return result;
+}
 
-  for (const { line, d } of items) {
-    if (!d) continue;
-    result.lines.push({ line, text: d.text, version: d.version, type: d.type, id: d.line.id as string, seq: d.seq, hash: d.hash, ...tag });
+/** The fold over a checked stream: entries, then the TRANSITIONs a reader honours, in stream (seq) order. */
+function fold(items: Item[], options: TruthReadOptions, file?: string): FileRead {
+  const tag = file !== undefined ? { file } : {};
+  const result: FileRead = { entries: new Map(), conflicts: new Map(), transitions: [], held: [], errors: [], refused: false, lines: [], head: null };
+  const position = new Map<string, number>(); // first stream position of each line id: what a cause.ref may name
+  const transitions: Array<{ t: TruthTransition; at: number }> = [];
+
+  items.forEach(({ line, d }, at) => {
+    if (!d) return;
+    const id = d.line.id as string;
+    if (!position.has(id)) position.set(id, at);
+    result.lines.push({ line, text: d.text, version: d.version, type: d.type, id, seq: d.seq, hash: d.hash, ...tag });
     if (d.version === 2) result.head = { seq: d.seq!, hash: d.hash! };
     if (d.type === 'TRANSITION') {
-      result.transitions.push(transitionOf(d, line, file));
-      continue;
+      const t = transitionOf(d, line, file);
+      result.transitions.push(t);
+      transitions.push({ t, at });
+      return;
     }
-    if (d.type !== 'TB' && d.type !== 'UV') continue; // ADDENDUM / RULING: causes, kept in `lines`; TRANSITIONs carry their effect
+    if (d.type !== 'TB' && d.type !== 'UV') return; // ADDENDUM / RULING: causes, kept in `lines`; TRANSITIONs carry their effect
 
     const entry = entryOf(d, line, file);
     const prior = result.entries.get(entry.id);
     if (!prior) {
       result.entries.set(entry.id, entry);
-      continue;
+      return;
     }
     if (bodyKey(prior) !== bodyKey(entry)) {
       result.conflicts.set(entry.id, `lines ${prior.source!.line} and ${line} give ${entry.id} different content`);
@@ -365,19 +448,37 @@ function readFile(input: string | string[], options: TruthReadOptions, file?: st
       result.entries.delete(entry.id);
       result.entries.set(entry.id, entry);
     }
-  }
+  });
 
-  // The fold: the highest-seq TRANSITION that targets an entry sets its status
-  const latest = new Map<string, TruthTransition>();
-  for (const t of result.transitions) {
-    const seen = latest.get(t.target);
-    if (!seen || t.seq > seen.seq) latest.set(t.target, t);
-  }
-  for (const [target, t] of latest) {
-    const entry = result.entries.get(target);
-    if (!entry) continue;
+  // The fold: the last honoured TRANSITION that targets an entry sets its status
+  const registry = registryOf(options);
+  const floors = new Map<string, string>(); // the final status an entry reached, if any
+  const isFinal = (entry: TruthLedgerEntry, status: string | null) => status !== null && FINAL_STATUSES[entry.type].includes(status);
+  const rankOf = (entry: TruthLedgerEntry, status: string) => (TRUTH_STATUSES[entry.type] as readonly string[]).indexOf(status);
+  for (const entry of result.entries.values()) if (isFinal(entry, entry.status)) floors.set(entry.id, entry.status!);
+
+  for (const { t, at } of transitions) {
+    const entry = result.entries.get(t.target);
+    if (!entry) continue; // its target is not in the stream read (it starts part-way)
+    const hold = (reason: string) => result.held.push({ line: t.line, id: t.id, reason, ...tag });
+    // Stenographer writes the cause's line first, or names no cause (ref null)
+    if (t.cause.ref !== null && !((position.get(t.cause.ref) ?? Infinity) < at)) {
+      result.errors.push({ line: t.line, id: t.id, error: `TRANSITION ${t.id} names cause ${t.cause.ref}, which is not an earlier line of the stream`, ...tag });
+      continue;
+    }
+    if (registry && !listed(registry, t.author)) {
+      hold(`TRANSITION ${t.id} is by '${t.author}', whom the signer registry doesn't list: not applied`);
+      continue;
+    }
+    const floor = floors.get(entry.id);
+    const rank = rankOf(entry, t.status);
+    if (floor !== undefined && rank !== -1 && rank < rankOf(entry, floor)) {
+      hold(`${entry.type} ${entry.id} is ${floor}, which is final: its TRANSITION to '${t.status}' is not applied`);
+      continue;
+    }
     entry.status = t.status;
     entry.source!.transition = { id: t.id, seq: t.seq, ts: t.ts, author: t.author, cause: t.cause };
+    if (isFinal(entry, t.status) && (floor === undefined || rank > rankOf(entry, floor))) floors.set(entry.id, t.status);
   }
   return result;
 }
@@ -417,7 +518,7 @@ function admit(
 }
 
 function emptyResult(errors: WikiParseResult['errors']): WikiParseResult {
-  return { entries: [], errors, refused: true, transitions: [], lines: [], head: null, conflicts: [] };
+  return { entries: [], errors, refused: true, transitions: [], held: [], lines: [], head: null, conflicts: [] };
 }
 
 /**
@@ -439,6 +540,7 @@ export function parseWikiLines(input: string | string[], options: TruthReadOptio
     errors: read.errors,
     refused: false,
     transitions: read.transitions,
+    held: read.held,
     lines: read.lines,
     head: read.head,
     conflicts: [...read.conflicts.keys()].map((id) => ({ id, files: [] })),
@@ -464,9 +566,9 @@ function rank(entry: TruthLedgerEntry): number {
  */
 export function parseWikiFiles(
   files: Array<{ name: string; text: string | string[] }>,
-  options: Omit<TruthReadOptions, 'previous'> = {},
+  options: Omit<TruthReadOptions, 'previous' | 'base'> = {},
 ): WikiParseResult {
-  const reads = files.map((f) => ({ name: f.name, read: readFile(f.text, { ...options, previous: null }, f.name) }));
+  const reads = files.map((f) => ({ name: f.name, read: readFile(f.text, { ...options, previous: null, base: null }, f.name) }));
   const errors = reads.flatMap((r) => r.read.errors);
   if (reads.some((r) => r.read.refused)) return emptyResult(errors);
 
@@ -505,6 +607,7 @@ export function parseWikiFiles(
     errors,
     refused: false,
     transitions: reads.flatMap((r) => r.read.transitions),
+    held: reads.flatMap((r) => r.read.held),
     lines: reads.flatMap((r) => r.read.lines),
     head: null,
     conflicts,

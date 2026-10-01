@@ -79,6 +79,17 @@ function line(text: string): string {
   return escapeUntrusted(text, { singleLine: true });
 }
 
+/** The seq a read's stream (or one of its files) starts at, when it starts part-way. */
+function partialStart(read: WikiParseResult): number | undefined {
+  const seen = new Set<string | undefined>();
+  for (const l of read.lines) {
+    if (l.version !== 2 || seen.has(l.file)) continue;
+    seen.add(l.file);
+    if (l.seq !== 1) return l.seq!;
+  }
+  return undefined;
+}
+
 function uniq(ids: Array<string | undefined>): string[] {
   return [...new Set(ids.filter((id): id is string => !!id))];
 }
@@ -306,6 +317,11 @@ export class CompactionEngine {
    * Sync the truth ledger: a stenographer truth stream (JSONL text or
    * lines, read with `parseWikiLines(input, options)`), a stream or merged
    * files already read (`parseWikiLines` / `parseWikiFiles`), or entries.
+   * Each sync replaces the selection, so it needs the whole stream: to sync
+   * only the lines after the last sync (stenographer's `sinceSeq` export),
+   * pass that sync's `read` as `{ base }`, and the increment folds into it.
+   * A stream that starts part-way without its base is refused: its
+   * TRANSITIONs would miss the entries they change.
    *
    * The synced selection lives beside the LSM levels, not inside them:
    * recompaction can rewrite L4, but it can never rewrite ledger truth,
@@ -323,6 +339,7 @@ export class CompactionEngine {
     let entries: TruthLedgerEntry[];
     let errors: TruthSyncResult['errors'] = [];
     let refused = false;
+    let read: WikiParseResult | null = null;
 
     if (typeof input === 'string' || (Array.isArray(input) && (input.length === 0 || typeof input[0] === 'string'))) {
       input = parseWikiLines(input as string | string[], options);
@@ -330,9 +347,18 @@ export class CompactionEngine {
     if (Array.isArray(input)) {
       entries = input as TruthLedgerEntry[];
     } else {
+      read = input;
       entries = input.entries;
       errors = input.errors;
       refused = input.refused;
+      const start = refused ? undefined : partialStart(input);
+      if (start !== undefined) {
+        refused = true;
+        errors = [
+          ...errors,
+          { line: 0, error: `the stream starts at seq ${start}, part-way: pass the read it continues as { base } (or the whole stream)` },
+        ];
+      }
     }
 
     const selection = selectCurrentTruth(refused ? [] : entries);
@@ -340,7 +366,7 @@ export class CompactionEngine {
     this.state.l4_invariants = kept;
     this.truthSelection = selection;
 
-    return { selection, displacedInvariantKeys: displacedKeys, errors, refused };
+    return { selection, displacedInvariantKeys: displacedKeys, errors, refused, read: refused ? null : read };
   }
 
   /** The most recently synced truth-ledger selection, if any. */

@@ -18,6 +18,8 @@
  * round-trips) but never counts as current truth.
  */
 
+import type { WikiParseResult } from './wiki.js';
+
 // ---------------------------------------------------------------------------
 // Confidence types & statuses
 // ---------------------------------------------------------------------------
@@ -302,6 +304,11 @@ export interface TruthSyncResult {
   errors: Array<{ line: number; error: string; id?: string; file?: string }>;
   /** True when the stream was refused: the selection is empty and nothing it said is truth. */
   refused: boolean;
+  /**
+   * The stream this sync read (null when it was given entries, or refused).
+   * To sync only the lines after it next time, pass it as `{ base }`.
+   */
+  read: WikiParseResult | null;
 }
 
 // ---------------------------------------------------------------------------

@@ -8,8 +8,10 @@
  * or missing statuses).
  */
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
+import { renderContextFrame } from '../compaction/frame.js';
 import { renderTruthSection, truthToInvariantRecords } from './compaction-bridge.js';
 import { chainTruthLines, decodeTruthLine } from './format.js';
 import { identityKey, isAnonymousIdentity } from './identity.js';
@@ -21,6 +23,7 @@ import {
   parseWikiLines,
   selectCurrentTruth,
   serializeWikiEntries,
+  truthStatusTable,
 } from './wiki.js';
 import type { TruthTbEntry } from './types.js';
 
@@ -60,6 +63,17 @@ const transition = (cause: string, target: string, status: string, kind: string,
   target,
   status,
   cause: { kind, ref: cause },
+});
+
+/** An ADDENDUM that writes `links` (e.g. `[['UV1', 'verifies']]`). */
+const addendum = (id: string, links: Array<[string, string]>) => ({
+  id,
+  type: 'ADDENDUM',
+  ts: T(3),
+  author: 'kim',
+  evidence: [{ kind: 'file', ref: 'config.ts:3' }],
+  note: null,
+  'x-steno': { links: links.map(([toId, type]) => ({ fromId: id, toId, type })) },
 });
 
 const strike = (id: string, target: string) => ({
@@ -134,6 +148,8 @@ describe('status is a fold over TRANSITION lines (SH-03, SAT-08)', () => {
       tb('TB1', 'Deploys need two approvals.'),
       uv('UV1', 'One approval is enough now.', 'TB1'),
       transition('UV1', 'TB1', 'contested', 'contest', 'sam'),
+      addendum('AD9', [['UV1', 'refutes']]),
+      transition('AD9', 'UV1', 'refuted', 'refute'),
       transition('AD9', 'TB1', 'active', 'refute'),
     ]);
     const [tb1] = parseWikiLines(stream).entries;
@@ -195,6 +211,7 @@ describe('open contesting UVs are attached to their TB whatever its recorded sta
     const stream = chainTruthLines([
       tb('TB1', 'The cache is per-tenant.'),
       uv('UV1', 'The cache is shared.', 'TB1'),
+      addendum('AD1', [['TB1', 'overrides']]),
       transition('AD1', 'TB1', 'overridden', 'override'),
     ]);
     const selection = selectCurrentTruth(parseWikiLines(stream).entries);
@@ -215,7 +232,9 @@ describe('fail closed on unknown or missing statuses (SAT-09)', () => {
   });
 
   it('a TRANSITION to a status no one knows takes the entry out of current truth', () => {
-    const stream = chainTruthLines([tb('TB1', 'x'), transition('X1', 'TB1', 'archived', 'archive', 'johnny')]);
+    // A cause a newer writer's stream can't carry is named as none (ref null)
+    const archive = { ...transition('X1', 'TB1', 'archived', 'archive', 'johnny'), cause: { kind: 'archive', ref: null } };
+    const stream = chainTruthLines([tb('TB1', 'x'), archive]);
     const [entry] = parseWikiLines(stream).entries;
     expect(entry.status).toBe('archived');
     expect(classifyEntry(entry)).toBe('history');
@@ -226,6 +245,7 @@ describe('fail closed on unknown or missing statuses (SAT-09)', () => {
       tb('TB1', 'x', { status: 'struck' }),
       uv('UV1', 'y', null, { status: 'struck' }),
       uv('UV2', 'z'),
+      strike('R1', 'UV2'),
       transition('R1', 'UV2', 'struck', 'strike', 'judge'),
     ]);
     const selection = selectCurrentTruth(parseWikiLines(stream).entries);
@@ -350,6 +370,7 @@ describe('re-serialization never rewrites a line', () => {
   it('writes back the line as read, whatever the fold made of its status', () => {
     const stream = chainTruthLines([
       tb('TB1', 'x', { reviewers: ['sam'], 'x-other': { n: 1.5 } }),
+      strike('R1', 'TB1'),
       transition('R1', 'TB1', 'struck', 'strike', 'judge'),
     ]);
     const { entries } = parseWikiLines(stream);
@@ -366,6 +387,7 @@ describe('several files: each folds alone, then the most advanced status wins', 
     uv('UV1', 'Retries are idempotent.'),
     strike('R1', 'TB1'),
     transition('R1', 'TB1', 'struck', 'strike', 'judge'),
+    addendum('AD1', [['UV1', 'verifies']]),
     transition('AD1', 'UV1', 'verified', 'verify'),
   ]);
 
@@ -413,5 +435,164 @@ describe('several files: each folds alone, then the most advanced status wins', 
     expect(merged.refused).toBe(true);
     expect(merged.entries).toEqual([]);
     expect(merged.errors[0]).toMatchObject({ file: 'b.jsonl', line: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review findings SH-R1, SH-R2 / SH-REV-C1, SH-R9 (golden ledger fixture)
+// ---------------------------------------------------------------------------
+
+const FIXTURES = new URL('../../test/fixtures/truth-format/', import.meta.url);
+const ledgerLines = readFileSync(new URL('valid/ledger.jsonl', FIXTURES), 'utf8').split('\n').filter((l) => l.length > 0);
+const ledgerExpected = JSON.parse(readFileSync(new URL('valid/ledger.expected.json', FIXTURES), 'utf8'));
+const fixtureSigners = JSON.parse(readFileSync(new URL('signers.json', FIXTURES), 'utf8'));
+const OVERRIDDEN_TB = '01M1E6JK80P9Y3CMA9HBZEND9H';
+const STRUCK_TB = '01M1E6JK8605J7H4P2BYWD97SN';
+const OPEN_UV = '01M1E6JK81TR57BA191BG8Y0Q3';
+const ACTIVE_TB = '01M1E6JK84NECBQZ8GX9C7H1KA';
+const ADDENDUM = '01M1E6JK8334CZN2ND29RFBWSK';
+const fullRead = () => parseWikiLines(ledgerLines);
+
+/** The fixture ledger with bodies appended, chained onto its head as a writer would. */
+const appended = (...bodies: Array<Record<string, unknown>>) => [...ledgerLines, ...chainTruthLines(bodies, fullRead().head)];
+
+describe('a TRANSITION cannot bring back what is final, or come from someone the registry does not list (SH-R1)', () => {
+  const revive = (author: string, ref: string | null = null) =>
+    appended({ id: `revive-${author}`, type: 'TRANSITION', ts: T(30), author, target: OVERRIDDEN_TB, status: 'active', cause: { kind: 'verify', ref } });
+
+  it('an unlisted author cannot revive an overridden TB as ground truth', () => {
+    const read = parseWikiLines(revive('mallory'), { signers: fixtureSigners, previous: fullRead().head });
+    expect(read.refused).toBe(false);
+    const tb = read.entries.find((e) => e.id === OVERRIDDEN_TB)!;
+    expect(tb.status).toBe('overridden');
+    expect(selectCurrentTruth(read.entries).groundTruth.map((t) => t.id)).not.toContain(OVERRIDDEN_TB);
+    expect(read.held).toMatchObject([{ line: 16, id: 'revive-mallory', reason: expect.stringMatching(/mallory.*signer registry/) }]);
+  });
+
+  it('a listed author cannot either: overridden and struck never change again', () => {
+    const read = parseWikiLines(revive('kim', ADDENDUM), { signers: fixtureSigners });
+    expect(read.entries.find((e) => e.id === OVERRIDDEN_TB)!.status).toBe('overridden');
+    expect(read.held).toMatchObject([{ id: 'revive-kim', reason: expect.stringMatching(/overridden.*final/) }]);
+
+    const unstrike = parseWikiLines(
+      appended({ id: 'unstrike', type: 'TRANSITION', ts: T(30), author: 'lee', target: STRUCK_TB, status: 'active', cause: { kind: 'verify', ref: null } }),
+    );
+    expect(unstrike.entries.find((e) => e.id === STRUCK_TB)!.status).toBe('struck');
+    expect(selectCurrentTruth(unstrike.entries).groundTruth.map((t) => t.id)).not.toContain(STRUCK_TB);
+  });
+
+  it('a final status can still advance on the lattice (overridden, then struck)', () => {
+    const read = parseWikiLines(
+      appended(strike('R9', OVERRIDDEN_TB), { ...transition('R9', OVERRIDDEN_TB, 'struck', 'strike', 'johnnyclem') }),
+    );
+    expect(read.errors).toEqual([]);
+    expect(read.held).toEqual([]);
+    expect(read.entries.find((e) => e.id === OVERRIDDEN_TB)!.status).toBe('struck');
+  });
+
+  it('an unlisted author cannot close an open contest, so the dispute stays visible', () => {
+    const lines = appended(
+      uv('UVC', 'LOG_BUDGET is 30 again.', ACTIVE_TB, { author: 'sam' }),
+      transition('UVC', ACTIVE_TB, 'contested', 'contest', 'sam'),
+      { id: 'close', type: 'TRANSITION', ts: T(31), author: 'mallory', target: 'UVC', status: 'verified', cause: { kind: 'verify', ref: null } },
+    );
+    const read = parseWikiLines(lines, { signers: fixtureSigners });
+    expect(read.refused).toBe(false);
+    expect(read.entries.find((e) => e.id === 'UVC')!.status).toBe('open');
+    const contested = selectCurrentTruth(read.entries).contested.map((c) => [c.tombstone.id, c.contestedBy.map((u) => u.id)]);
+    expect(contested).toEqual([[ACTIVE_TB, ['UVC']]]);
+    expect(read.held.map((h) => h.id)).toEqual(['close']);
+  });
+
+  it('a verified or refuted UV stays closed', () => {
+    const read = parseWikiLines(
+      appended({ id: 'reopen', type: 'TRANSITION', ts: T(30), author: 'kim', target: '01M1E6JK82QWPK6VS437JKMJPZ', status: 'open', cause: { kind: 'contest', ref: null } }),
+    );
+    expect(read.entries.find((e) => e.id === '01M1E6JK82QWPK6VS437JKMJPZ')!.status).toBe('verified');
+    expect(read.held.map((h) => h.id)).toEqual(['reopen']);
+  });
+
+  it('a TRANSITION whose cause is not an earlier line refuses the stream', () => {
+    const read = parseWikiLines(
+      appended({ id: 'ghost', type: 'TRANSITION', ts: T(30), author: 'kim', target: OPEN_UV, status: 'verified', cause: { kind: 'verify', ref: 'AD-NOWHERE' } }),
+    );
+    expect(read.refused).toBe(true);
+    expect(read.errors).toMatchObject([{ line: 16, id: 'ghost', error: expect.stringMatching(/cause AD-NOWHERE.*not an earlier line/) }]);
+  });
+});
+
+describe('incremental reads fold the increment into what was read before (SH-R2, SH-REV-C1)', () => {
+  it('a strike that arrives in an increment demotes a TB from the earlier read', () => {
+    const read = parseWikiLines(ledgerLines.slice(0, 9));
+    expect(read.entries.find((e) => e.id === STRUCK_TB)!.status).toBe('active');
+    const next = parseWikiLines(ledgerLines.slice(9), { base: read });
+    expect(next.refused).toBe(false);
+    expect(next.errors).toEqual([]);
+    expect(truthStatusTable(next.entries)).toEqual(ledgerExpected);
+    expect(selectCurrentTruth(next.entries).groundTruth.map((t) => t.id)).not.toContain(STRUCK_TB);
+    // The result is the whole stream so far: keep it as the next base
+    expect(next.lines.map((l) => l.text)).toEqual(ledgerLines);
+    expect(next.head).toEqual(fullRead().head);
+    expect(next.transitions.map((t) => t.id)).toEqual(fullRead().transitions.map((t) => t.id));
+    // The earlier read is not changed
+    expect(read.entries.find((e) => e.id === STRUCK_TB)!.status).toBe('active');
+  });
+
+  it('chunk by chunk gives the whole-file fold, whatever the cut', () => {
+    for (const cut of [1, 3, 4, 6, 10, 11, 14]) {
+      const first = parseWikiLines(ledgerLines.slice(0, cut));
+      const next = parseWikiLines(ledgerLines.slice(cut), { base: first });
+      expect(truthStatusTable(next.entries), `cut at ${cut}`).toEqual(ledgerExpected);
+    }
+    // An empty increment (nothing new since the last read) is the base again
+    expect(truthStatusTable(parseWikiLines([], { base: fullRead() }).entries)).toEqual(ledgerExpected);
+  });
+
+  it('an increment that does not continue its base is refused, as is a refused base', () => {
+    const read = parseWikiLines(ledgerLines.slice(0, 9));
+    expect(parseWikiLines(ledgerLines.slice(10), { base: read }).refused).toBe(true);
+    const refusedBase = parseWikiLines([ledgerLines[1]]);
+    expect(refusedBase.refused).toBe(false); // a partial stream on its own is fine…
+    const broken = parseWikiLines([ledgerLines[0], ledgerLines[2]]);
+    expect(broken.refused).toBe(true);
+    expect(parseWikiLines(ledgerLines.slice(3), { base: broken })).toMatchObject({ refused: true, errors: [{ line: 0 }] });
+  });
+
+  it('the engine syncs an increment onto what it synced before', () => {
+    const engine = new CompactionEngine();
+    const first = engine.syncTruthLedger(ledgerLines.slice(0, 9));
+    expect(first.selection.groundTruth.map((t) => t.id)).toEqual([ACTIVE_TB, STRUCK_TB]);
+    const second = engine.syncTruthLedger(ledgerLines.slice(9), { base: first.read! });
+    expect(second.refused).toBe(false);
+    expect(second.selection.groundTruth.map((t) => t.id)).toEqual([ACTIVE_TB, '01M1E6JK8BVGAAP733SN0VCW9W']);
+    const frame = renderContextFrame(engine.buildContextFrame(4000));
+    expect(frame).not.toContain('The cron box is decommissioned.');
+    expect(frame).toContain('fetchV1 is superseded by fetchV2.');
+  });
+
+  it('the engine refuses a stream that starts part-way without the read it continues', () => {
+    const engine = new CompactionEngine();
+    engine.syncTruthLedger(ledgerLines.slice(0, 9));
+    const partial = engine.syncTruthLedger(ledgerLines.slice(9), { previous: parseWikiLines(ledgerLines.slice(0, 9)).head });
+    expect(partial.refused).toBe(true);
+    expect(partial.errors[0].error).toMatch(/starts at seq 10.*base/);
+    expect(partial.selection.groundTruth).toEqual([]);
+  });
+});
+
+describe('a previous head needs the stream it names (SH-R9)', () => {
+  const head = () => fullRead().head!;
+
+  it('an empty input is not a continuation of the stream read before', () => {
+    const read = parseWikiLines('', { previous: head() });
+    expect(read.refused).toBe(true);
+    expect(read.errors).toMatchObject([{ line: 0, error: expect.stringMatching(/holds no line of the stream.*seq 15/) }]);
+  });
+
+  it('a stream rewritten as version 1 lines is refused, and its UVs are not heads-ups', () => {
+    const v1 = JSON.stringify(uv('UVX', 'LOG_BUDGET is 30 again.', null, { author: 'mallory' }));
+    const read = parseWikiLines([v1], { previous: head() });
+    expect(read.refused).toBe(true);
+    expect(selectCurrentTruth(read.entries).unverified).toEqual([]);
   });
 });
