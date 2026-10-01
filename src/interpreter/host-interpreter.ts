@@ -28,6 +28,13 @@ export interface AnthropicMessageRequest {
   max_tokens: number;
   system: string;
   messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+  /**
+   * Structured output (JSON schema). HostInterpreter never sets it; the
+   * benchmark's LMJudge does, to get its grade back as JSON.
+   */
+  output_config?: {
+    format: { type: 'json_schema'; schema: Record<string, unknown> };
+  };
 }
 
 export interface AnthropicMessageResponse {

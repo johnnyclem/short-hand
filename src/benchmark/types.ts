@@ -25,9 +25,12 @@ export interface BenchmarkFixture {
     rubric?: string;
   };
   /**
-   * Calibration fixtures: raw payload-dump should win this one. If
-   * interpretation wins here, the judge is rewarding fluff over fidelity.
-   * Excluded from win-rate / mean-lift aggregation.
+   * Calibration fixture: the question needs the payload verbatim (a
+   * fingerprint, an id), so interpretation cannot help. The interpreted arm
+   * must tie the raw arm: losing means the interpretation dropped the fact,
+   * winning means the judge rewards restatement over fidelity. Excluded from
+   * win-rate / mean-lift aggregation; a calibration fixture that does not tie
+   * fails the gate.
    */
   expectRawWins?: boolean;
 }
@@ -46,6 +49,11 @@ export interface FixtureResult {
   raw: ArmResult;
   interp: ArmResult;
   delta: number;
+  /**
+   * Set when interpretation threw. The interpreted arm then injected the raw
+   * payload, so its score says nothing about interpretation.
+   */
+  interpretError?: string;
 }
 
 export interface BenchmarkAggregate {
@@ -56,8 +64,24 @@ export interface BenchmarkAggregate {
   losses: number;
   /** Wilson 95% CI on wins / (wins + losses). */
   wilson95: [number, number];
+  /** Estimated tokens in + out over every fixture (both arms, calibration included). */
   tokensRaw: number;
   tokensInterp: number;
+  /** Ids of calibration fixtures whose arms did not tie. */
+  calibrationFailures: string[];
+  /** Fixtures whose interpretation threw (see `FixtureResult.interpretError`). */
+  interpretFailures: number;
+}
+
+/**
+ * Whether a run could support "interpreting a memory for the current context
+ * beats injecting it raw". It does not say the claim is true: it says the run
+ * was not structurally unable to show it.
+ */
+export interface BenchmarkGate {
+  passed: boolean;
+  /** Every condition that was not met (empty when `passed`). */
+  reasons: string[];
 }
 
 export interface BenchmarkReport {
@@ -66,6 +90,9 @@ export interface BenchmarkReport {
   finishedAt: number;
   judge: 'keyword' | 'lm';
   interpreterTier: InterpreterTier;
+  /** 'echo' when the injected text was scored directly (no downstream answer). */
+  answerer: 'echo' | 'custom';
   results: FixtureResult[];
   aggregate: BenchmarkAggregate;
+  gate: BenchmarkGate;
 }

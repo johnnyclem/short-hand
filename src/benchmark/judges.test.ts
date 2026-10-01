@@ -1,6 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { KeywordJudge, LMJudge } from './judges.js';
-import type { Interpreter } from '../interpreter/types.js';
+import { ModelCallError } from './model-call.js';
+import type {
+  AnthropicLikeClient,
+  AnthropicMessageResponse,
+} from '../interpreter/host-interpreter.js';
 
 describe('KeywordJudge', () => {
   const judge = new KeywordJudge();
@@ -38,41 +42,80 @@ describe('KeywordJudge', () => {
   });
 });
 
-function stubInterpreter(out: string): Interpreter {
-  return { tier: 'host', interpret: async () => out };
+type Request = Parameters<AnthropicLikeClient['messages']['create']>[0];
+
+function stubClient(
+  respond: (req: Request) => Promise<AnthropicMessageResponse>,
+): AnthropicLikeClient & { requests: Request[] } {
+  const requests: Request[] = [];
+  return {
+    requests,
+    messages: {
+      create: async (req) => {
+        requests.push(req);
+        return respond(req);
+      },
+    },
+  };
 }
+
+const reply = (text: string, stop_reason = 'end_turn') => async () => ({
+  content: [{ type: 'text', text }],
+  stop_reason,
+});
 
 describe('LMJudge', () => {
   it('parses a JSON score response', async () => {
-    const j = new LMJudge({
-      interpreter: stubInterpreter('{"score": 0.7, "reason": "ok"}'),
-    });
+    const j = new LMJudge({ client: stubClient(reply('{"score": 0.7, "reason": "ok"}')), model: 'm' });
     const score = await j.score({ answer: 'a', readContext: 'c', rubric: 'r' });
     expect(score).toBe(0.7);
   });
 
-  it('clamps to [0, 1]', async () => {
-    const j = new LMJudge({
-      interpreter: stubInterpreter('{"score": 1.5, "reason": "x"}'),
+  it('makes its own grading call with structured output, not the interpreter prompt (SH-19)', async () => {
+    const client = stubClient(reply('{"score": 1, "reason": "ok"}'));
+    await new LMJudge({ client, model: 'judge-model' }).score({
+      answer: 'the answer',
+      expectedAnswer: 'expected',
+      readContext: 'ctx',
     });
-    expect(await j.score({ answer: 'a', readContext: 'c' })).toBe(1);
+    const req = client.requests[0];
+    expect(req.model).toBe('judge-model');
+    expect(req.system).toMatch(/grader/i);
+    expect(req.system).not.toMatch(/plain prose sentence/);
+    expect(req.output_config?.format.type).toBe('json_schema');
+    expect(req.output_config?.format.schema).toMatchObject({
+      type: 'object',
+      required: ['score', 'reason'],
+      additionalProperties: false,
+    });
+    expect(req.messages[0].content).toContain('the answer');
+    expect(req.messages[0].content).toContain('expected');
   });
 
-  it('returns 0 on malformed JSON', async () => {
-    const warn = vi.fn();
-    const j = new LMJudge({
-      interpreter: stubInterpreter('not json at all'),
-      logger: { warn },
-    });
-    const score = await j.score({ answer: 'a', readContext: 'c' });
-    expect(score).toBe(0);
-    expect(warn).toHaveBeenCalled();
+  it('throws on a score outside [0, 1] instead of clamping it', async () => {
+    const j = new LMJudge({ client: stubClient(reply('{"score": 1.5, "reason": "x"}')), model: 'm' });
+    await expect(j.score({ answer: 'a', readContext: 'c' })).rejects.toBeInstanceOf(ModelCallError);
   });
 
-  it('returns 0 when interpreter throws', async () => {
+  it('throws on malformed JSON instead of scoring 0 (SH-19)', async () => {
+    const j = new LMJudge({ client: stubClient(reply('not json at all')), model: 'm' });
+    await expect(j.score({ answer: 'a', readContext: 'c' })).rejects.toThrow(/judge/);
+  });
+
+  it('throws when the call fails instead of scoring 0 (SH-19)', async () => {
     const j = new LMJudge({
-      interpreter: { tier: 'host', interpret: async () => { throw new Error('x'); } },
+      client: stubClient(async () => {
+        throw new Error('404 model not found');
+      }),
+      model: 'retired',
     });
-    expect(await j.score({ answer: 'a', readContext: 'c' })).toBe(0);
+    await expect(j.score({ answer: 'a', readContext: 'c' })).rejects.toThrow(/404 model not found/);
+  });
+
+  it('throws on a truncated or refused grade', async () => {
+    const cut = new LMJudge({ client: stubClient(reply('{"score": 0.', 'max_tokens')), model: 'm' });
+    await expect(cut.score({ answer: 'a', readContext: 'c' })).rejects.toThrow(/max_tokens/);
+    const refused = new LMJudge({ client: stubClient(reply('', 'refusal')), model: 'm' });
+    await expect(refused.score({ answer: 'a', readContext: 'c' })).rejects.toThrow(/refus/);
   });
 });
