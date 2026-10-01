@@ -114,7 +114,7 @@ Each section has a `kind` with one fixed marker:
 | `history` | (message text) | L1 |
 | `recent` | `role: text` | L0 |
 
-Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker (and its full-width or invisible-character look-alikes), any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` in the frame instead of reading as a ledger line. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
+Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker, any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` in the frame instead of reading as a ledger line. Markers are matched on a folded copy of the text — NFKC, invisible code points and combining marks dropped, any case, and Cyrillic, Greek, Armenian, Cherokee and Lisu look-alikes of T, B, U and V read as Latin — so `[ＴB]`, `[T\u200BB]`, `[tb]`, `﹇TB]` and Cyrillic `[ТВ]` are escaped too, as is a marker behind a non-breaking or invisible line prefix. Brackets and homoglyphs outside those sets (`【TB】`, other scripts) are not. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
 
 An L1 entry whose code does not fit is shown with `[code sha256:<12 hex> — N tokens, not shown]` references; `engine.getSpan(hash)` returns the exact text, and `engine.pinSpan(hash)` gives a span its own frame section.
 
@@ -128,10 +128,10 @@ Corrections come from two places:
 
   ```typescript
   const tombstone = await engine.correct({ key: 'region', from: 'us-east-1', to: 'eu-west-1', sourceMessageId: 'msg-42' });
-  await engine.revertCorrection(tombstone.id!); // restores everything it archived
+  await engine.revertCorrection(tombstone.id!); // restores what it archived, unless another correction supersedes it too
   ```
 
-  The tombstone id derives from the inputs, so declaring the same correction twice is a no-op. Older messages still in L0 get the correction when they compact.
+  The tombstone id derives from the inputs, so declaring the same correction twice is a no-op. Older messages still in L0 get the correction when they compact; messages added after `correct()` is called are after the correction and may restate the old value. A text is stale when it mentions `from` and names `to` nowhere outside those mentions (so `v2.1.0-beta` → `v2.1.0` works), matching whole tokens: `20` does not match inside `20.11`.
 - **Inferred by `RegexCompactor`** (`confidence: 'inferred'`) from phrasing such as "Actually, use Postgres instead of MySQL" or "switch MySQL to Postgres". These are low-confidence suggestions: applied reversibly, rendered as `(inferred)`, and not proposed to the truth ledger unless you pass `includeInferred: true`. Keyword-only corrections ("Wait, …") and corrections whose superseded value is empty, a pronoun or a function word ("change it to blue") never produce a tombstone.
 
 ### Importance scoring
@@ -313,7 +313,7 @@ const event = await ingester.ingest(
 // { sourceId: 'doc-1', chunkCount: 4, entitiesDiscovered: ['PagerDuty', 'Postgres'], version: '3f1c…', retractedChunks: 0 }
 ```
 
-Every chunk is at most `chunkSize` tokens (paragraphs, then sentences, then whitespace or hard cuts; no text is dropped), and chunking is linear in document size. `entitiesDiscovered` lists only the L3 entities this ingestion added. Sources are versioned by content hash (chunk ids are `<sourceId>@<version>-chunk-<n>`): re-ingesting an unchanged source returns `{ skipped: true }`, and ingesting an edited one first retracts the previous version's chunks (`engine.retract`) so stale text does not stay live beside the update.
+Every chunk is at most `chunkSize` tokens (paragraphs, then sentences, then whitespace or hard cuts; no text is dropped), and chunking is linear in document size. `entitiesDiscovered` lists only the L3 entities this ingestion added. Sources are versioned by content hash (chunk ids are `<sourceId>@<version>-chunk-<n>`): re-ingesting an unchanged source returns `{ skipped: true }`, and ingesting an edited one first retracts the previous version's chunks (`engine.retract`) so stale text does not stay live beside the update. Ingests of one source run one at a time, in call order.
 
 `ingestAll(sources, engine)` ingests a batch sequentially; `getEvents()` returns the full ingestion log for use with `WikiRenderer` below.
 
@@ -664,14 +664,15 @@ npm run sync:truth-fixtures -- ../stenographer   # re-copy the truth-format gold
 import { parseWikiLines, parseWikiFiles, selectCurrentTruth, renderTruthSection, appendProposalsFile, exportProposalDrafts } from '@shorthand/core';
 
 // Read: stenographer's export (one writer's hash-chained stream) as high-priority context
-const result = engine.syncTruthLedger(jsonl);       // { selection, displacedInvariantKeys, errors, refused }
+let sync = engine.syncTruthLedger(jsonl);           // { selection, displacedInvariantKeys, errors, refused, read }
+sync = engine.syncTruthLedger(moreLines, { base: sync.read! }); // later: only the lines after sync.read.head (sinceSeq)
 const frame = engine.buildContextFrame();           // asserted truth renders first
 
 // Or work with the stream directly
 const read = parseWikiLines(jsonl, { signers });    // signers: stenographer's signers.json, optional
 const selection = selectCurrentTruth(read.entries); // groundTruth / contested / unverified / history
 const section = renderTruthSection(selection);      // '## Asserted Truth (ledger)' + marked lines
-const next = parseWikiLines(moreLines, { previous: read.head }); // incremental: must continue what you read
+const next = parseWikiLines(moreLines, { base: read, signers }); // incremental: the whole stream so far, new TRANSITIONs applied
 const team = parseWikiFiles([{ name: 'wiki/alex.jsonl', text: a }, { name: 'wiki/sam.jsonl', text: b }]);
 
 // Write: candidates go out as PROPOSAL lines (proposals only — nothing becomes
@@ -682,8 +683,8 @@ const proposalLines = exportProposalDrafts(engine.getState(), { author: 'detecto
 
 What the reader guarantees, and where that stops:
 
-- **Integrity of a stream, not authorship.** Every v2 line carries `seq`, `prevHash` and `hash` (SHA-256 of its RFC 8785 JCS form). A stream with a line whose hash doesn't match, a broken chain, or an identity the spec refuses is refused whole (`refused: true`, no entries). An accepted stream shows that no line was edited, removed, reordered or inserted between its first and last line, and that the lines come from one stream. A valid chain does not show who wrote the lines — anyone can compute the hashes — and it does not show lines removed from the end unless you pass back the `head` you kept (`{ previous }`).
-- **Status is a fold.** An entry's status is the highest-seq `TRANSITION` that targets it, else its line's own. Active TBs render as `[TB]`; contested TBs as `[TB ⚠ CONTESTED]` with every open UV disputing them beside them (an open contest attaches to its TB whatever the TB's recorded status); open UVs as `[UV — UNVERIFIED]`, which never read as proven. Overridden, struck, refuted and verified entries are history, and a sync displaces any L4 invariant projected from them.
+- **Integrity of a stream, not authorship.** Every v2 line carries `seq`, `prevHash` and `hash` (SHA-256 of its RFC 8785 JCS form). A stream with a line whose hash doesn't match, a broken chain, or an identity the spec refuses is refused whole (`refused: true`, no entries). An accepted stream shows that no line was edited, removed, reordered or inserted between its first and last line, and that the lines come from one stream. A valid chain does not show who wrote the lines — anyone can compute the hashes — and it does not show lines removed from the end unless you pass back the `head` you kept (`{ previous }`, or the read itself as `{ base }`); with one, an emptied stream or one rewritten as version 1 lines is refused too.
+- **Status is a fold.** An entry's status is the highest-seq `TRANSITION` that targets it, else its line's own — among the TRANSITIONs a reader honours. Overridden and struck TBs and verified, refuted and struck UVs are final: a later TRANSITION can only move them up the lattice, never revive them. With `{ signers }`, a TRANSITION by someone the registry doesn't list changes nothing. Both are reported in `result.held`. A TRANSITION must name a cause that is an earlier line of the stream (or none), or the stream is refused. An increment read with `{ base }` folds into the earlier read; `engine.syncTruthLedger` refuses a stream that starts part-way without one. Active TBs render as `[TB]`; contested TBs as `[TB ⚠ CONTESTED]` with every open UV disputing them beside them (an open contest attaches to its TB whatever the TB's recorded status); open UVs as `[UV — UNVERIFIED]`, which never read as proven. Overridden, struck, refuted and verified entries are history, and a sync displaces any L4 invariant projected from them.
 - **Fail closed.** A missing or unknown status, an unsigned TB, a version 1 TB (no hash; pass `{ admitV1Tbs: true }` to read a stenographer 0.x export's TBs as truth), an author or signer a given signer registry doesn't list, and an id two lines or files disagree about are never current truth. Unknown fields and values are kept, never coerced, and an entry is always written back as the exact line it was read from.
 - **Several files**, one per teammate, fold one by one; each entry then takes the most advanced status any file reached (`active < contested < overridden < struck`, `open < verified < refuted < struck`).
 - **Proposals** use the suite's single PROPOSAL envelope, written as this writer's own hash-chained stream; a corrected value is proposed again, a repeated one is skipped (dedupe by kind, `targetRef` and the claim or assertion). Pre-1.0 bare proposal lines are read, never written.

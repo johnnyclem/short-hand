@@ -97,9 +97,11 @@ export interface TruthReadOptions {
    * stream, not a `parseWikiFiles` merge). The result is the whole stream
    * so far — the base's lines, then the input's, folded as one — so the
    * input's TRANSITIONs apply to the base's entries. Keep it and pass it as
-   * the next `base`. `previous` defaults to `base.head`; an empty input is
-   * the base again. A refused base refuses the read. Line numbers count
-   * within the input each line was read from.
+   * the next `base`. The whole stream is admitted again with this call's
+   * options, so pass the same `signers` and `admitV1Tbs` as the base read.
+   * `previous` defaults to `base.head`; an empty input is the base again. A
+   * refused base refuses the read. Line numbers count within the input each
+   * line was read from.
    */
   base?: WikiParseResult | null;
 }
