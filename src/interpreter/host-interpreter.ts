@@ -3,7 +3,11 @@
  *
  * Structural client: no @anthropic-ai/sdk import. Callers construct their own
  * client (any shape with `messages.create({ model, max_tokens, system,
- * messages }) => Promise<{ content: Array<{ text: string }> }>`) and inject it.
+ * messages }) => Promise<{ content: Array<{ text: string }>, stop_reason }>`)
+ * and inject it. A `max_tokens` / `model_context_window_exceeded` stop
+ * throws InterpreterBudgetError('output_too_long'); a `refusal` throws
+ * InterpreterUnavailableError — so withFallback() routes on, and truncated
+ * text is never returned.
  *
  * Wire-level safety: the request body never carries importanceScore,
  * activationPolicy, id, or retrievalCount. Only template / payload / context.
@@ -28,7 +32,16 @@ export interface AnthropicMessageRequest {
 
 export interface AnthropicMessageResponse {
   content: Array<{ type?: string; text: string }>;
+  /**
+   * Why generation stopped (`end_turn`, `max_tokens`, `stop_sequence`,
+   * `refusal`, `model_context_window_exceeded`, …). Truncated output is
+   * never returned as a memory.
+   */
+  stop_reason?: string | null;
 }
+
+/** Stop reasons that mean the text was cut off before the model finished. */
+const TRUNCATED_STOP_REASONS = new Set(['max_tokens', 'model_context_window_exceeded']);
 
 export interface AnthropicLikeClient {
   messages: {
@@ -112,6 +125,16 @@ export class HostInterpreter implements Interpreter {
         timeoutPromise,
       ]);
 
+      const stopReason = result.stop_reason ?? undefined;
+      if (stopReason && TRUNCATED_STOP_REASONS.has(stopReason)) {
+        // A memory cut off mid-sentence can invert its meaning
+        // ("the rate limit does" vs "does not apply")
+        throw new InterpreterBudgetError('output_too_long', { stopReason, cap: maxOutputTokens });
+      }
+      if (stopReason === 'refusal') {
+        throw new InterpreterUnavailableError('host interpreter refused the request', { stopReason });
+      }
+
       const text = (result.content ?? [])
         .map((c) => c.text ?? '')
         .join('')
@@ -128,6 +151,7 @@ export class HostInterpreter implements Interpreter {
       return text;
     } catch (err) {
       if (err instanceof InterpreterBudgetError) throw err;
+      if (err instanceof InterpreterUnavailableError) throw err;
       if (err instanceof Error && err.name === 'AbortError') {
         // Caller-supplied signal aborted; propagate.
         if (opts.signal?.aborted) throw err;
