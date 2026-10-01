@@ -7,7 +7,8 @@
  * dismiss) on the stenographer side. An L4 invariant is very often
  * actually a UV — tribal knowledge that compacted well but was never
  * verified — so candidates are drafted as UVs, and corrections as
- * unsigned TBs.
+ * unsigned TBs. Pattern-inferred corrections are left out unless asked
+ * for (`includeInferred`).
  *
  * Entries that were themselves projected from the ledger are skipped:
  * proposing the ledger's own truth back to it would be a corroboration
@@ -33,6 +34,13 @@ export interface ProposeInvariantsOptions {
   agentSessionId?: string | null;
   /** Clock injection for deterministic tests. */
   now?: Date;
+  /**
+   * Also propose corrections that were only inferred by pattern matching
+   * (`Tombstone.confidence === 'inferred'`). Default false: inferred
+   * corrections are low-confidence suggestions, and filing them would flood
+   * the ledger's proposal queue with false positives.
+   */
+  includeInferred?: boolean;
 }
 
 interface ProposalSpec {
@@ -114,7 +122,12 @@ export function invariantsToProposalDrafts(
   return drafts;
 }
 
-/** Drafts one (unsigned) TB proposal per detected correction. */
+/**
+ * Drafts one (unsigned) TB proposal per correction: explicit ones (and
+ * hand-built ones without a confidence), plus inferred ones only with
+ * `includeInferred`. A tombstone without a superseded value is never
+ * proposed.
+ */
 export function tombstonesToProposalDrafts(
   state: CompactedState,
   options: ProposeInvariantsOptions,
@@ -123,6 +136,8 @@ export function tombstonesToProposalDrafts(
   const drafts: TbProposalLine[] = [];
 
   for (const tomb of state.tombstones) {
+    if (!tomb.supersededContent.trim()) continue;
+    if (tomb.confidence === 'inferred' && !options.includeInferred) continue;
     const replacement = tomb.correctedValue ? ` — superseded by "${tomb.correctedValue}"` : '';
     drafts.push(
       tbProposal(

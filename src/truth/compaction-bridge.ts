@@ -31,6 +31,7 @@ import type {
   ConversationHistory,
 } from '../compaction/snapshot/types.js';
 import { estimateTokens } from '../utils.js';
+import { escapeUntrusted } from '../compaction/frame.js';
 import type {
   CompactedTruth,
   ProposalLine,
@@ -52,17 +53,22 @@ export type { ProposeInvariantsOptions } from './proposal-export.js';
 /** Heading of the rendered truth section. */
 export const TRUTH_SECTION_HEADING = '## Asserted Truth (ledger)';
 
+/** Ledger fields are untrusted text: one line, no forged markers. */
+function field(text: string): string {
+  return escapeUntrusted(String(text), { singleLine: true });
+}
+
 function signature(tb: TruthTbEntry): string {
-  return tb.signedBy ? `signed: ${tb.signedBy}` : 'unsigned';
+  return tb.signedBy ? `signed: ${field(tb.signedBy)}` : 'unsigned';
 }
 
 function renderTb(tb: TruthTbEntry): string {
-  return `- [TB] ${tb.claim} (${signature(tb)}, evidence: ${tb.evidence.length})`;
+  return `- [TB] ${field(tb.claim)} (${signature(tb)}, evidence: ${tb.evidence.length})`;
 }
 
 function renderUv(uv: TruthUvEntry): string {
-  const contests = uv.contests ? `; contests ${uv.contests}` : '';
-  return `- [UV — UNVERIFIED] ${uv.assertion} (basis: ${uv.basis}; verify by ${uv.verifyBy.kind}: ${uv.verifyBy.value}${contests})`;
+  const contests = uv.contests ? `; contests ${field(uv.contests)}` : '';
+  return `- [UV — UNVERIFIED] ${field(uv.assertion)} (basis: ${field(uv.basis)}; verify by ${field(uv.verifyBy.kind)}: ${field(uv.verifyBy.value)}${contests})`;
 }
 
 /** Ids of open UVs that ride a contested TB in this selection. */
@@ -75,32 +81,53 @@ function attachedUvIds(selection: TruthSelection): Set<string> {
 }
 
 /**
- * Render a truth selection as marked lines, without the heading. Each
- * open UV appears exactly once: beside its TB when that TB is contested in
- * the selection, standalone otherwise — including a UV contesting a TB the
- * ledger has not (yet) re-emitted as contested.
+ * One budgetable unit of the truth section: a ground-truth TB, a contested
+ * TB together with every UV disputing it (kept atomic — the dispute is
+ * never shown without the TB, nor the TB without its dispute), or a
+ * standalone open UV. `text` may span several lines; `sources` are ledger
+ * entry ids.
  */
-export function renderTruthLines(selection: TruthSelection): string[] {
-  const lines: string[] = [];
+export interface TruthItem {
+  kind: 'ground-truth' | 'contested' | 'unverified';
+  text: string;
+  sources: string[];
+}
+
+/**
+ * Render a truth selection as budgetable items, in priority order: ground
+ * truth, contested groups, open UVs. Each open UV appears exactly once:
+ * beside its TB when that TB is contested in the selection, standalone
+ * otherwise — including a UV contesting a TB the ledger has not (yet)
+ * re-emitted as contested. Ledger fields are escaped (`escapeUntrusted`),
+ * so a field can never forge a marker or a line.
+ */
+export function renderTruthItems(selection: TruthSelection): TruthItem[] {
+  const items: TruthItem[] = [];
 
   for (const tb of selection.groundTruth) {
-    lines.push(renderTb(tb));
+    items.push({ kind: 'ground-truth', text: renderTb(tb), sources: [tb.id] });
   }
 
   for (const { tombstone, contestedBy } of selection.contested) {
-    lines.push(`- [TB ⚠ CONTESTED] ${tombstone.claim} (${signature(tombstone)})`);
+    const lines = [`- [TB ⚠ CONTESTED] ${field(tombstone.claim)} (${signature(tombstone)})`];
     for (const uv of contestedBy) {
-      lines.push(`  - disputed by [UV — UNVERIFIED] ${uv.assertion} (${uv.author})`);
+      lines.push(`  - disputed by [UV — UNVERIFIED] ${field(uv.assertion)} (${field(uv.author)})`);
     }
+    items.push({ kind: 'contested', text: lines.join('\n'), sources: [tombstone.id, ...contestedBy.map((uv) => uv.id)] });
   }
 
   const attached = attachedUvIds(selection);
   for (const uv of selection.unverified) {
     if (attached.has(uv.id)) continue;
-    lines.push(renderUv(uv));
+    items.push({ kind: 'unverified', text: renderUv(uv), sources: [uv.id] });
   }
 
-  return lines;
+  return items;
+}
+
+/** Render a truth selection as marked lines, without the heading (see `renderTruthItems`). */
+export function renderTruthLines(selection: TruthSelection): string[] {
+  return renderTruthItems(selection).flatMap((item) => item.text.split('\n'));
 }
 
 /**
@@ -138,10 +165,12 @@ export function applyTruthToSnapshot(
       selection.history.length,
   };
 
-  // Strip any truth section a previous round attached — it is always
+  // Strip the truth section a previous round appended — it is always
   // rebuilt from the current selection, never carried forward as text.
-  const markerIdx = state.summary.indexOf(TRUTH_SECTION_HEADING);
-  const baseSummary = markerIdx >= 0 ? state.summary.slice(0, markerIdx).trimEnd() : state.summary;
+  // Only that exact trailing section goes: the heading can also appear
+  // inside conversation text (a pasted summary), and everything around it
+  // must survive.
+  const baseSummary = stripAppendedTruth(state);
 
   const summary = `${baseSummary}\n\n${renderTruthSection(selection)}`;
 
@@ -151,6 +180,18 @@ export function applyTruthToSnapshot(
     truth,
     compactedTokenCount: estimateTokens(summary),
   };
+}
+
+function stripAppendedTruth(state: CompactedSnapshot): string {
+  if (!state.truth) return state.summary;
+  const previous = renderTruthSection({
+    groundTruth: state.truth.groundTruth,
+    contested: state.truth.contested,
+    unverified: state.truth.unverified,
+    history: [],
+  });
+  const suffix = `\n\n${previous}`;
+  return state.summary.endsWith(suffix) ? state.summary.slice(0, -suffix.length) : state.summary;
 }
 
 /** @deprecated Renamed to `applyTruthToSnapshot` (it takes a `CompactedSnapshot`). */
@@ -214,17 +255,17 @@ export function truthToInvariantRecords(selection: TruthSelection): TruthInvaria
   for (const tb of selection.groundTruth) {
     records.push({
       key: `${TRUTH_SOURCE_PREFIX}${tb.id}`,
-      value: `[TB] ${tb.claim}`,
+      value: `[TB] ${field(tb.claim)}`,
       confidence: 'tb',
       contested: false,
     });
   }
 
   for (const { tombstone, contestedBy } of selection.contested) {
-    const disputes = contestedBy.map((uv) => uv.assertion).join(' | ');
+    const disputes = contestedBy.map((uv) => field(uv.assertion)).join(' | ');
     records.push({
       key: `${TRUTH_SOURCE_PREFIX}${tombstone.id}`,
-      value: `[TB ⚠ CONTESTED] ${tombstone.claim}${disputes ? ` — disputed: ${disputes}` : ''}`,
+      value: `[TB ⚠ CONTESTED] ${field(tombstone.claim)}${disputes ? ` — disputed: ${disputes}` : ''}`,
       confidence: 'tb',
       contested: true,
     });
@@ -235,7 +276,7 @@ export function truthToInvariantRecords(selection: TruthSelection): TruthInvaria
     if (attached.has(uv.id)) continue;
     records.push({
       key: `${TRUTH_SOURCE_PREFIX}${uv.id}`,
-      value: `[UV — UNVERIFIED] ${uv.assertion}`,
+      value: `[UV — UNVERIFIED] ${field(uv.assertion)}`,
       confidence: 'uv',
       contested: false,
     });

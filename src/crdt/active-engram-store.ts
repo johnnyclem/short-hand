@@ -27,8 +27,13 @@ import {
 // Default interpreter template
 // ---------------------------------------------------------------------------
 
-const DEFAULT_INTERPRETER_TEMPLATE =
-  'In the context of {{context}}, the earlier note "{{payload}}" remains relevant as: {{payload}}';
+/**
+ * The default restates the payload once and never interpolates the
+ * current context: a template that pastes {{context}} into every memory
+ * duplicates the recent conversation once per engram. Supply your own
+ * template to use {{context}}.
+ */
+const DEFAULT_INTERPRETER_TEMPLATE = 'Earlier note, still relevant: {{payload}}';
 
 const DEFAULT_INTERPRET_OPTIONS: InterpretOptions = {
   maxOutputTokens: 120,
@@ -178,22 +183,42 @@ export class ActiveEngramStore {
    * Shadow resolution: if engram B shadows engram A, A's result is replaced
    * by B's result in the output — same slot, new interpretation.
    *
-   * Results are sorted descending by importanceScore.
+   * Results are sorted descending by importanceScore. Every returned
+   * engram counts as surfaced (`select` + `markSurfaced`).
    */
   retrieve(context: string, now: number = Date.now()): ActiveEngramResult[] {
+    const results = this.select(context, now);
+    this.markSurfaced(results);
+    return results;
+  }
+
+  /**
+   * The pure half of `retrieve`: the same results, with no side effects —
+   * retrieval counts are untouched. Callers that may not show every result
+   * (a token-budgeted context frame) call `markSurfaced` with the ones they
+   * actually used, so `maxRetrievals` is only spent on memories that were
+   * surfaced.
+   *
+   * `maxContextChars` bounds the context interpolated into templates
+   * (eligibility still matches against the whole context).
+   */
+  select(
+    context: string,
+    now: number = Date.now(),
+    options: { maxContextChars?: number } = {},
+  ): ActiveEngramResult[] {
     const eligible = Array.from(this.engrams.values()).filter((e) =>
       isEligible(e, context, now),
     );
-
-    // Bump retrieval counts (side-effect owned by the store, not the policy)
-    for (const e of eligible) {
-      e.retrievalCount += 1;
-    }
+    const templateContext =
+      options.maxContextChars !== undefined && context.length > options.maxContextChars
+        ? context.slice(context.length - options.maxContextChars)
+        : context;
 
     // Build raw results
     const resultsById = new Map<string, ActiveEngramResult>();
     for (const e of eligible) {
-      const interpreted = resolveTemplate(e.interpreterTemplate, e.payload, context);
+      const interpreted = resolveTemplate(e.interpreterTemplate, e.payload, templateContext);
       resultsById.set(e.id, {
         engramId: e.id,
         interpreted,
@@ -219,6 +244,23 @@ export class ActiveEngramStore {
     return Array.from(resultsById.values()).sort(
       (a, b) => b.importanceScore - a.importanceScore,
     );
+  }
+
+  /**
+   * Count results as surfaced: bumps retrievalCount once for each engram a
+   * result came from — the slot's engram and, for a shadowed slot, the
+   * shadowing engram too (side effect owned by the store, not the policy).
+   */
+  markSurfaced(results: ActiveEngramResult[]): void {
+    const ids = new Set<string>();
+    for (const r of results) {
+      ids.add(r.engramId);
+      if (r.shadows) ids.add(r.shadows);
+    }
+    for (const id of ids) {
+      const engram = this.engrams.get(id);
+      if (engram) engram.retrievalCount += 1;
+    }
   }
 
   /**

@@ -56,9 +56,10 @@ export {
 } from './wiki.js';
 
 // Rendering + snapshot compaction bridge
-export type { TruthInvariantRecord, ProposeInvariantsOptions } from './compaction-bridge.js';
+export type { TruthInvariantRecord, ProposeInvariantsOptions, TruthItem } from './compaction-bridge.js';
 export {
   TRUTH_SECTION_HEADING,
+  renderTruthItems,
   renderTruthLines,
   renderTruthSection,
   applyTruthToSnapshot,

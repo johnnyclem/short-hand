@@ -2,7 +2,8 @@
  * SourceIngester — adapts raw documents into the compaction pipeline.
  *
  * Accepts Source documents (markdown, plain text), chunks them into
- * ConversationMessages, and feeds them through the CompactionEngine.
+ * ConversationMessages (ids `<sourceId>@<version>-chunk-<n>`), and feeds
+ * them through the CompactionEngine.
  * This bridges Karpathy's "raw sources" layer with short-hand's LSM-tree.
  */
 
@@ -13,7 +14,7 @@ import type {
   Source,
 } from '../types.js';
 import { DEFAULT_INGESTION_CONFIG } from '../types.js';
-import { estimateTokens } from '../utils.js';
+import { estimateTokens, sha256Hex, splitSentences } from '../utils.js';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
 
 // ---------------------------------------------------------------------------
@@ -75,56 +76,54 @@ function splitByHeadings(text: string): Array<{ heading: string; body: string }>
 }
 
 /**
- * Split a text block into chunks that fit within a token budget.
- * Splits on paragraph boundaries (double newline), falling back to
- * sentence boundaries, then hard character splits.
+ * Split a text block into chunks of at most `maxTokens` (estimated) each.
+ * Splits on paragraph boundaries (blank lines), then — for any paragraph
+ * over budget — on sentence boundaries, then at whitespace, then hard
+ * character cuts. Linear in the text length; no text is dropped (trailing
+ * text without a sentence terminator included).
  */
 function chunkText(text: string, maxTokens: number, overlapTokens: number): string[] {
   if (estimateTokens(text) <= maxTokens) {
     return [text];
   }
 
-  const paragraphs = text.split(/\n\s*\n/);
+  const maxChars = Math.max(1, maxTokens * 4);
+  const overlapChars = Math.max(0, overlapTokens * 4);
+
+  // Units no longer than maxChars, each with the separator that joins it
+  // to the previous unit in the original text.
+  const units: Array<{ text: string; joiner: string }> = [];
+  for (const para of text.split(/\n[ \t]*\n/)) {
+    if (para.length <= maxChars) {
+      units.push({ text: para, joiner: '\n\n' });
+      continue;
+    }
+    splitSentences(para, maxChars).forEach((sentence, i) => {
+      units.push({ text: sentence, joiner: i === 0 ? '\n\n' : '' });
+    });
+  }
+
   const chunks: string[] = [];
   let current = '';
+  const flush = () => {
+    const trimmed = current.trim();
+    if (trimmed) chunks.push(trimmed);
+  };
 
-  for (const para of paragraphs) {
-    const combined = current ? `${current}\n\n${para}` : para;
-    if (estimateTokens(combined) <= maxTokens) {
+  for (const unit of units) {
+    const combined = current ? `${current}${unit.joiner}${unit.text}` : unit.text;
+    if (combined.length <= maxChars) {
       current = combined;
-    } else {
-      if (current) {
-        chunks.push(current);
-        // Overlap: keep the tail of the current chunk
-        if (overlapTokens > 0) {
-          const overlapChars = overlapTokens * 4; // inverse of token estimation
-          current = current.slice(-overlapChars) + '\n\n' + para;
-          // If even with overlap it's too big, just start fresh with para
-          if (estimateTokens(current) > maxTokens) {
-            current = para;
-          }
-        } else {
-          current = para;
-        }
-      } else {
-        // Single paragraph exceeds budget — split by sentences
-        const sentences = para.match(/[^.!?]+[.!?]+\s*/g) ?? [para];
-        for (const sentence of sentences) {
-          const combined2 = current ? `${current} ${sentence}` : sentence;
-          if (estimateTokens(combined2) <= maxTokens) {
-            current = combined2;
-          } else {
-            if (current) chunks.push(current);
-            current = sentence;
-          }
-        }
-      }
+      continue;
     }
+    flush();
+    // Overlap: start the next chunk with the tail of the previous one when
+    // it still fits; otherwise start fresh with the unit.
+    const tail = overlapChars > 0 ? current.slice(-overlapChars) : '';
+    const withOverlap = tail ? `${tail}${unit.joiner || ' '}${unit.text}` : '';
+    current = withOverlap && withOverlap.length <= maxChars ? withOverlap : unit.text;
   }
-
-  if (current.trim()) {
-    chunks.push(current);
-  }
+  flush();
 
   return chunks;
 }
@@ -136,6 +135,8 @@ function chunkText(text: string, maxTokens: number, overlapTokens: number): stri
 export class SourceIngester {
   private config: IngestionConfig;
   private events: IngestionEvent[] = [];
+  /** Last ingested version of each source, and the message ids it produced. */
+  private versions = new Map<string, { version: string; messageIds: string[] }>();
 
   constructor(config: Partial<IngestionConfig> = {}) {
     this.config = { ...DEFAULT_INGESTION_CONFIG, ...config };
@@ -148,8 +149,36 @@ export class SourceIngester {
    * 2. Converts chunks to ConversationMessages with source metadata
    * 3. Feeds them into the engine (triggering auto-flush/compaction)
    * 4. Records an ingestion event for the wiki log
+   *
+   * Sources are versioned by content hash. Re-ingesting the same version
+   * is a no-op (`skipped: true`); ingesting a new version of a source this
+   * ingester has seen first retracts the previous version's chunks
+   * (`CompactionEngine.retract`), so stale text does not stay live beside
+   * the update.
    */
   async ingest(source: Source, engine: CompactionEngine): Promise<IngestionEvent> {
+    const version = this.versionOf(source);
+    const previous = this.versions.get(source.id);
+    if (previous?.version === version) {
+      return {
+        timestamp: Date.now(),
+        sourceId: source.id,
+        sourceTitle: source.title,
+        chunkCount: 0,
+        entitiesDiscovered: [],
+        version,
+        retractedChunks: 0,
+        skipped: true,
+      };
+    }
+
+    let retractedChunks = 0;
+    if (previous) {
+      await engine.retract(previous.messageIds, `source ${source.id}@${previous.version} superseded by @${version}`);
+      retractedChunks = previous.messageIds.length;
+    }
+
+    const knownEntities = new Set(engine.getState().l3_graph.entities.keys());
     const chunks = this.chunkSource(source);
     const messages = this.chunksToMessages(chunks, source);
 
@@ -157,21 +186,30 @@ export class SourceIngester {
 
     // Flush to ensure content moves through the pipeline
     await engine.flush();
+    this.versions.set(source.id, { version, messageIds: messages.map((m) => m.id) });
 
-    // Record the entities discovered
-    const state = engine.getState();
-    const entityNames = Array.from(state.l3_graph.entities.keys());
+    // Only entities this source added — not everything the engine knows
+    const entitiesDiscovered = Array.from(engine.getState().l3_graph.entities.keys()).filter(
+      (name) => !knownEntities.has(name),
+    );
 
     const event: IngestionEvent = {
       timestamp: Date.now(),
       sourceId: source.id,
       sourceTitle: source.title,
       chunkCount: chunks.length,
-      entitiesDiscovered: entityNames,
+      entitiesDiscovered,
+      version,
+      retractedChunks,
     };
 
     this.events.push(event);
     return event;
+  }
+
+  /** Content version of a source: the first 12 hex digits of the sha256 of its content. */
+  versionOf(source: Source): string {
+    return sha256Hex(source.content).slice(0, 12);
   }
 
   /**
@@ -212,9 +250,10 @@ export class SourceIngester {
    */
   chunksToMessages(chunks: string[], source: Source): ConversationMessage[] {
     const baseTimestamp = source.createdAt ?? Date.now();
+    const version = this.versionOf(source);
 
     return chunks.map((chunk, index) => ({
-      id: `${source.id}-chunk-${index}`,
+      id: `${source.id}@${version}-chunk-${index}`,
       role: 'system' as const,
       content: chunk,
       timestamp: baseTimestamp + index, // Monotonic ordering within source
@@ -224,6 +263,7 @@ export class SourceIngester {
         sourceUri: source.uri,
         chunkIndex: index,
         totalChunks: chunks.length,
+        sourceVersion: version,
       },
     }));
   }
@@ -250,6 +290,8 @@ export class SourceIngester {
 
   private looksLikeMarkdown(content: string): boolean {
     // Quick heuristic: contains headings, links, or code fences
-    return /^#{1,6}\s/m.test(content) || /\[.+\]\(.+\)/.test(content) || /```/.test(content);
+    // Bounded link pattern: `\[.+\]\(.+\)` backtracks quadratically on a
+    // long line full of brackets (minified JSON)
+    return /^#{1,6}\s/m.test(content) || /\[[^\]\n]{1,200}\]\([^)\n]{1,500}\)/.test(content) || /```/.test(content);
   }
 }

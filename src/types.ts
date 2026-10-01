@@ -71,6 +71,12 @@ export enum CompactionLevel {
 // ---------------------------------------------------------------------------
 
 export interface Tombstone {
+  /**
+   * Stable, content-derived id. Archived items point at it (`by`), and
+   * `CompactionEngine.revertCorrection` takes it. Set by `RegexCompactor`
+   * and `CompactionEngine.correct`.
+   */
+  id?: string;
   /** The content that was superseded. */
   supersededContent: string;
   /** Message ID where the original (now-wrong) statement was made. */
@@ -85,6 +91,14 @@ export interface Tombstone {
   key?: string;
   /** The new/corrected value. */
   correctedValue?: string;
+  /**
+   * How the correction is known. `explicit`: declared by the host through
+   * `CompactionEngine.correct` — authoritative. `inferred`: detected by
+   * `RegexCompactor` pattern matching — a low-confidence suggestion that is
+   * applied (reversibly) but not proposed to the truth ledger by default.
+   * Absent on tombstones built by hand or by the snapshot pipeline.
+   */
+  confidence?: 'explicit' | 'inferred';
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +200,62 @@ export interface Invariant {
   sourceMessage: string;
   /** Lamport timestamp for CRDT ordering. */
   timestamp: number;
+  /** Set on archived invariants: the id of the tombstone that displaced it. */
+  displacedBy?: string;
 }
+
+// ---------------------------------------------------------------------------
+// L1 entries, code spans and the archive
+// ---------------------------------------------------------------------------
+
+/** One L1 entry: a message kept verbatim (noise dropped, never reworded). */
+export interface CompactedEntry {
+  originalMessageId: string;
+  /** The message text, verbatim. Short replies may be folded in as `question → answer`. */
+  compacted: string;
+  importance: number;
+  /** Epoch ms of the source message. */
+  timestamp?: number;
+  /** Role of the source message. */
+  role?: MessageRole;
+  /** Content hashes of the fenced code spans this entry contains (see `CompactedState.spans`). */
+  spanIds?: string[];
+  /** Short replies folded into this entry (`question → answer`). */
+  foldedMessageIds?: string[];
+}
+
+/**
+ * A fenced code block kept byte-for-byte in a content-addressed store.
+ * Compacted levels reference it by hash; frames that cannot afford it show
+ * a `[code sha256:…]` reference that `CompactionEngine.getSpan` resolves.
+ */
+export interface CodeSpan {
+  /** sha256 hex of `text`. */
+  hash: string;
+  /** The exact span, fences included. */
+  text: string;
+  /** Message the span was first seen in. */
+  sourceMessageId: string;
+  /** Pinned spans get their own frame section, budgeted before L3–L1. */
+  pinned?: boolean;
+}
+
+/** Why an item left its level. */
+export type ArchiveReason = 'superseded' | 'summarized' | 'retracted';
+
+/**
+ * Items removed from a live level are archived, never deleted: a
+ * correction can be reverted, and a summarized L1 entry stays retrievable.
+ * `by` is the tombstone id (superseded), the L2 summary id (summarized) or
+ * the retraction label (retracted).
+ */
+export type ArchivedItem =
+  | { kind: 'message'; reason: ArchiveReason; by: string; message: ConversationMessage }
+  | { kind: 'l1'; reason: ArchiveReason; by: string; entry: CompactedEntry }
+  | { kind: 'summary'; reason: ArchiveReason; by: string; summary: TopicSummary }
+  | { kind: 'entity'; reason: ArchiveReason; by: string; entity: Entity }
+  | { kind: 'edge'; reason: ArchiveReason; by: string; edge: Edge }
+  | { kind: 'invariant'; reason: ArchiveReason; by: string; invariant: Invariant };
 
 // ---------------------------------------------------------------------------
 // Compacted state (the full picture across all levels)
@@ -196,11 +265,7 @@ export interface CompactedState {
   /** L0: Raw recent messages. */
   l0_messages: ConversationMessage[];
   /** L1: Compacted recent history entries. */
-  l1_compacted: Array<{
-    originalMessageId: string;
-    compacted: string;
-    importance: number;
-  }>;
+  l1_compacted: CompactedEntry[];
   /** L2: Topic-clustered summaries. */
   l2_summaries: TopicSummary[];
   /** L3: Entity-relationship graph. */
@@ -211,25 +276,74 @@ export interface CompactedState {
   tombstones: Tombstone[];
   /** Total token estimate for the compacted state. */
   totalTokenEstimate: number;
+  /** Superseded, summarized and retracted items (see `ArchivedItem`). */
+  archive?: ArchivedItem[];
+  /** Content-addressed code spans, keyed by sha256 hex. */
+  spans?: Record<string, CodeSpan>;
 }
 
 // ---------------------------------------------------------------------------
 // Context frame (token-budgeted slice for the next LLM call)
 // ---------------------------------------------------------------------------
 
+/**
+ * What a frame section holds. Each kind has one fixed marker, and text
+ * from messages, ledger fields, engrams or tools is escaped so it can
+ * never produce another kind's marker (see `escapeUntrusted`).
+ */
+export type ContextSectionKind =
+  /** Synced truth-ledger entries (`[TB]`, `[TB ⚠ CONTESTED]`, `[UV — UNVERIFIED]`). */
+  | 'truth'
+  /** Tombstones (`[correction]`). */
+  | 'correction'
+  /** L4 invariants (`[invariant]`). */
+  | 'invariant'
+  /** Active-engram recalls (`[memory]`). */
+  | 'memory'
+  /** Pinned code spans (`[code sha256:…]`). */
+  | 'code'
+  /** L3 entities and edges (`[entity]`, `[edge]`). */
+  | 'graph'
+  /** L2 topic summaries (`[summary]`). */
+  | 'summary'
+  /** L1 compacted history (verbatim message text). */
+  | 'history'
+  /** L0 raw recent messages (`role: text`). */
+  | 'recent';
+
+/** One budgeted unit of a section, with its provenance. */
+export interface ContextItem {
+  /** The item exactly as rendered in the section content (escaped). */
+  text: string;
+  /** Ids it derives from: message ids, ledger entry ids, tombstone ids, engram ids, span hashes. */
+  sources: string[];
+}
+
 export interface ContextFrame {
   /** Token budget this frame was built for. */
   tokenBudget: number;
-  /** Actual token usage. */
+  /**
+   * Tokens used: `estimateTokens(renderContextFrame(frame))`. Never more
+   * than `tokenBudget`.
+   */
   tokenUsage: number;
-  /** Content sections from each level, ordered L4 → L0. */
+  /** Sections in emission order: truth, corrections, L4, memories, code, L3, L2, L1, L0. */
   sections: ContextSection[];
+  /** Items left out for budget, per section kind (kinds with none omitted are absent). */
+  omitted: Partial<Record<ContextSectionKind, number>>;
 }
 
 export interface ContextSection {
+  kind: ContextSectionKind;
   level: CompactionLevel;
+  /** Rendered items (plus the truth heading), one per line group, joined by newlines. */
   content: string;
+  /** `estimateTokens(content)`. */
   tokenEstimate: number;
+  /** The items in `content`, in order, with provenance. */
+  items: ContextItem[];
+  /** Candidate items that did not fit the budget. */
+  omitted: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,8 +564,14 @@ export interface IngestionEvent {
   sourceTitle: string;
   /** Number of chunks produced. */
   chunkCount: number;
-  /** Entities discovered during ingestion. */
+  /** L3 entities this ingestion added to the engine (not ones already known). */
   entitiesDiscovered: string[];
+  /** Content version (first 12 hex of the sha256 of the source content). */
+  version: string;
+  /** Chunks of the previous version of this source that were retracted. */
+  retractedChunks: number;
+  /** True when this exact version was already ingested; nothing was added. */
+  skipped?: boolean;
 }
 
 // ---------------------------------------------------------------------------
