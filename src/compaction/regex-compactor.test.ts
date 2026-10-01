@@ -315,3 +315,39 @@ describe('RegexCompactor extraction cost (SH-21)', () => {
     expect(large).toBeLessThan(Math.max(small * 8, 150));
   });
 });
+
+describe('extraction keeps versions, decimals, addresses and file names whole (SH-R3)', () => {
+  const run = (...contents: string[]) =>
+    new RegexCompactor().compact(
+      contents.map((c, i) => msg(`m${i + 1}`, 'user', c, 1000 * (i + 1))),
+      CompactionLevel.L1_COMPACTED,
+    );
+
+  it('in constraints (L4 invariants)', async () => {
+    const state = await run('The API must listen on 10.0.0.5 only.', 'Builds must target ES2022 and Node 22.4.1.');
+    expect(state.l4_invariants.map((i) => i.key)).toEqual(['listen on 10.0.0.5 only', 'target ES2022 and Node 22.4.1']);
+    expect(state.l4_invariants[0].value).toBe('must listen on 10.0.0.5 only.');
+  });
+
+  it('in decisions (L2)', async () => {
+    const state = await run("Let's use Python 3.12 for the worker.", 'We decided on config.prod.yaml over config.yaml.');
+    expect(state.l2_summaries.map((s) => s.topic)).toEqual(['Decision: Python 3.12 for the worker', 'Decision: config.prod.yaml']);
+    expect(state.l2_summaries[1].decisions[0].alternatives).toEqual([{ option: 'config.yaml', reason: '' }]);
+  });
+
+  it('in corrections, so a correction never archives a statement about another value', async () => {
+    const state = await run('Node 20 is the CI floor for the docs site.', 'Switch the timeout from 2.5s to 4.0s.', 'Use Node 22.4 instead of Node 20.11.');
+    expect(state.tombstones.map((t) => [t.supersededContent, t.correctedValue])).toEqual([
+      ['the timeout from 2.5s', '4.0s'],
+      ['Node 20.11', 'Node 22.4'],
+    ]);
+    expect(state.archive ?? []).toEqual([]);
+    expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('a value is matched as a whole token: 20 is not 20.11, and 10.0.0 is not 10.0.0.5', async () => {
+    const state = await run('We pin Node 20.11 in the lockfile.', 'The VPC range starts at 10.0.0.5 today.', 'Use Node 22 instead of Node 20.', 'Use 10.0.1 instead of 10.0.0.');
+    expect(state.archive ?? []).toEqual([]);
+    expect(state.tombstones.map((t) => t.originalMessageId)).toEqual(['m3', 'm4']);
+  });
+});

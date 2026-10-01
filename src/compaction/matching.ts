@@ -17,10 +17,15 @@ export function normalizeForMatch(text: string): string {
     .replace(/^(?:the|a|an)\s+/, '');
 }
 
-/** Case-sensitive whole-word matcher for an already-normalized phrase. */
-export function wholeWordRe(phrase: string): RegExp {
+/**
+ * Case-sensitive whole-word matcher for an already-normalized phrase. A
+ * dot between word characters is part of the token, so `20` does not
+ * match inside `20.11` and `10.0.0` does not match inside `10.0.0.5`; a
+ * sentence-ending dot is not.
+ */
+export function wholeWordRe(phrase: string, flags = ''): RegExp {
   const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?<![\\w])${escaped}(?![\\w])`);
+  return new RegExp(`(?<!\\w|\\w\\.)${escaped}(?!\\w|\\.\\w)`, flags);
 }
 
 /**
@@ -59,18 +64,22 @@ export function isValidCorrectionSubject(text: string | undefined): boolean {
 /**
  * Returns a predicate that is true when a text mentions the tombstone's
  * superseded value (whole word, case-insensitive) without also mentioning
- * the corrected value. A tombstone without a superseded value matches
- * nothing.
+ * the corrected value outside those mentions — so when the new value is
+ * part of the old one (`v2.1.0-beta` → `v2.1.0`, `postgres 15` →
+ * `postgres`), a statement of the old value is still stale. A tombstone
+ * without a superseded value matches nothing.
  */
 export function supersededMatcher(tombstone: Pick<Tombstone, 'supersededContent' | 'correctedValue'>): (text: string) => boolean {
   const old = normalizeForMatch(tombstone.supersededContent ?? '');
   if (!old) return () => false;
-  const oldRe = wholeWordRe(old);
+  const oldRe = wholeWordRe(old, 'g');
   const corrected = normalizeForMatch(tombstone.correctedValue ?? '');
   const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
   return (raw: string) => {
     const text = normalizeForMatch(raw);
-    return oldRe.test(text) && !correctedRe?.test(text);
+    oldRe.lastIndex = 0;
+    if (!oldRe.test(text)) return false;
+    return !correctedRe?.test(text.replace(oldRe, ' '));
   };
 }
 

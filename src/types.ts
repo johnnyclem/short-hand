@@ -166,6 +166,11 @@ export interface Decision {
   superseded: boolean;
   /** If superseded, the tombstone that invalidated it. */
   tombstoneId?: string;
+  /**
+   * Other tombstones that supersede it too. Reverting `tombstoneId` hands
+   * the decision to the first of them still present instead of reviving it.
+   */
+  alsoBy?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -249,13 +254,21 @@ export type ArchiveReason = 'superseded' | 'summarized' | 'retracted';
  * `by` is the tombstone id (superseded), the L2 summary id (summarized) or
  * the retraction label (retracted).
  */
-export type ArchivedItem =
+export type ArchivedItem = (
   | { kind: 'message'; reason: ArchiveReason; by: string; message: ConversationMessage }
   | { kind: 'l1'; reason: ArchiveReason; by: string; entry: CompactedEntry }
   | { kind: 'summary'; reason: ArchiveReason; by: string; summary: TopicSummary }
   | { kind: 'entity'; reason: ArchiveReason; by: string; entity: Entity }
   | { kind: 'edge'; reason: ArchiveReason; by: string; edge: Edge }
-  | { kind: 'invariant'; reason: ArchiveReason; by: string; invariant: Invariant };
+  | { kind: 'invariant'; reason: ArchiveReason; by: string; invariant: Invariant }
+) & {
+  /**
+   * Superseded items: other tombstones that supersede the item too (it was
+   * already archived when they were applied). Reverting `by` re-archives
+   * it under the first of them still present instead of restoring it.
+   */
+  alsoBy?: string[];
+};
 
 // ---------------------------------------------------------------------------
 // Compacted state (the full picture across all levels)

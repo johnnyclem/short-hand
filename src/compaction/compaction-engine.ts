@@ -188,6 +188,10 @@ export class CompactionEngine {
     if (!input.sourceMessageId) {
       return Promise.reject(new TypeError('correct(): "sourceMessageId" is required'));
     }
+    // Messages after the correction may legitimately restate the old value.
+    // The cutoff is where correct() was called: a message added right after
+    // it, before the queued job runs, is after the correction.
+    const seq = this.seqOf.get(input.sourceMessageId) ?? this.nextSeq;
 
     return this.enqueue(async () => {
       const key = input.key?.trim() || from;
@@ -195,8 +199,6 @@ export class CompactionEngine {
       const existing = this.state.tombstones.find((t) => t.id === id);
       if (existing) return existing;
 
-      // Messages after the correction may legitimately restate the old value
-      const seq = this.seqOf.get(input.sourceMessageId) ?? this.nextSeq;
       const appliesToSource = (msgId: string) => this.isBefore(msgId, seq);
 
       const tombstone: Tombstone = {

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { CompactionEngine } from './compaction-engine.js';
 import { RegexCompactor } from './regex-compactor.js';
 import { InvariantChecker } from '../verification/invariant-checker.js';
+import { applyTombstone, revertTombstone } from './corrections.js';
 import { exportProposalDrafts } from '../truth/proposal-export.js';
 import { CompactionLevel, type CompactedState, type ConversationMessage } from '../types.js';
 
@@ -236,5 +237,125 @@ describe('over-eager extraction (SH-16)', () => {
     const kinds = (lines: string[]) => lines.map((l) => JSON.parse(l).kind);
     expect(kinds(exportProposalDrafts(state, { author: 'johnny' }))).not.toContain('tb');
     expect(kinds(exportProposalDrafts(state, { author: 'johnny', includeInferred: true }))).toContain('tb');
+  });
+});
+
+describe('a correction whose new value is part of the old one (SH-R4)', () => {
+  it('still archives the statements of the old value', async () => {
+    const engine = new CompactionEngine({ memtableSize: 0 });
+    await engine.addMessage({ id: 'r1', role: 'user', content: 'We deploy release v2.1.0-beta to production on Friday.', timestamp: 1 });
+    await engine.addMessage({ id: 'r2', role: 'user', content: 'The service must run v2.1.0-beta in prod.', timestamp: 2 });
+    await engine.addMessage({ id: 'r3', role: 'user', content: 'Release v2.1.0-beta replaced v2.0.9 last week; v2.1.0 is next.', timestamp: 3 });
+    const tombstone = await engine.correct({ from: 'v2.1.0-beta', to: 'v2.1.0', sourceMessageId: 'ext-1' });
+
+    const state = engine.getState();
+    expect(tombstone.originalMessageId).toBe('r2');
+    expect(state.archive!.filter((a) => a.kind === 'l1').map((a) => a.kind === 'l1' && a.entry.originalMessageId)).toEqual(['r1', 'r2']);
+    // A text that names both values is not stale
+    expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['r3']);
+    expect(state.l4_invariants.some((i) => i.value.includes('beta'))).toBe(false);
+    expect(frameText(engine)).not.toContain('production on Friday');
+  });
+
+  it('the compactor finds the corrected statement the same way', async () => {
+    const state = await new RegexCompactor().compact(
+      [
+        { id: 'p1', role: 'user', content: 'We run postgres 15 on the primary.', timestamp: 1 },
+        { id: 'p2', role: 'user', content: 'Change postgres 15 to postgres.', timestamp: 2 },
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+    expect(state.tombstones.map((t) => [t.supersededContent, t.correctedValue, t.originalMessageId])).toEqual([['postgres 15', 'postgres', 'p1']]);
+    expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['p2']);
+  });
+});
+
+describe('a correction takes effect where it was declared (SH-R5)', () => {
+  it('a message added right after correct(), without an await, is not before it', async () => {
+    const engine = new CompactionEngine({ memtableSize: 1 });
+    await engine.addMessage({ id: 'c1', role: 'user', content: 'Deploy the API to us-east-1 tonight.', timestamp: 1 });
+    const p = engine.correct({ from: 'us-east-1', to: 'us-west-2', sourceMessageId: 'ticket-7' });
+    const q = engine.addMessage({ id: 'c2', role: 'user', content: 'Rollback done: the API is on us-east-1 again.', timestamp: 2 });
+    await Promise.all([p, q]);
+    await engine.addMessage({ id: 'c3', role: 'user', content: 'Logs are quiet.', timestamp: 3 });
+    await engine.flush();
+
+    const state = engine.getState();
+    expect(state.archive!.filter((a) => a.kind === 'l1').map((a) => a.kind === 'l1' && a.entry.originalMessageId)).toEqual(['c1']);
+    expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['c2', 'c3']);
+  });
+});
+
+describe('reverting one of two corrections of a value (SH-R8)', () => {
+  it('keeps archived what the remaining correction supersedes, under that correction', async () => {
+    const engine = new CompactionEngine({ memtableSize: 0 });
+    await engine.addMessage({ id: 'v1', role: 'user', content: 'Deploy the API to us-east-1 tonight.', timestamp: 1 });
+    await engine.addMessage({ id: 'v2', role: 'user', content: 'Retries are capped at 3.', timestamp: 2 });
+    const first = await engine.correct({ from: 'us-east-1', to: 'us-west-2', sourceMessageId: 'v2' });
+    await engine.addMessage({ id: 'v3', role: 'user', content: 'Logs ship to the central bucket.', timestamp: 3 });
+    const second = await engine.correct({ from: 'us-east-1', to: 'eu-west-1', sourceMessageId: 'v3' });
+
+    expect(await engine.revertCorrection(first.id!)).toBe(true);
+    const state = engine.getState();
+    expect(state.tombstones.map((t) => t.id)).toEqual([second.id]);
+    expect(state.l1_compacted.map((e) => e.compacted)).not.toContain('Deploy the API to us-east-1 tonight.');
+    expect(state.archive!.filter((a) => a.kind === 'l1').map((a) => [a.by, a.kind === 'l1' && a.entry.originalMessageId])).toEqual([
+      [second.id, 'v1'],
+    ]);
+
+    // Reverting the second too brings the statement back
+    expect(await engine.revertCorrection(second.id!)).toBe(true);
+    expect(engine.getState().l1_compacted.map((e) => e.originalMessageId)).toEqual(['v1', 'v2', 'v3']);
+  });
+
+  it('the remaining correction keeps its own cutoff: a later restatement it did not cover comes back', async () => {
+    const engine = new CompactionEngine({ memtableSize: 0 });
+    await engine.addMessage({ id: 'w1', role: 'user', content: 'Primary DB is Redis.', timestamp: 1 });
+    const early = await engine.correct({ from: 'Redis', to: 'Valkey', sourceMessageId: 'w1' });
+    await engine.addMessage({ id: 'w2', role: 'user', content: 'Cache tier: Redis cluster, still.', timestamp: 2 });
+    const late = await engine.correct({ from: 'Redis', to: 'Dragonfly', sourceMessageId: 'w-ext' });
+    expect(engine.getState().l1_compacted).toEqual([]);
+
+    // w1 was the early correction's own message: only the late one superseded it
+    expect(await engine.revertCorrection(late.id!)).toBe(true);
+    expect(engine.getState().l1_compacted.map((e) => e.originalMessageId)).toEqual(['w1', 'w2']);
+    expect(engine.getState().tombstones.map((t) => t.id)).toEqual([early.id]);
+  });
+});
+
+describe('reverting a correction with decisions and graph items another correction also covers (SH-R8)', () => {
+  it('keeps the L2 decision, L3 entity and L4 invariant superseded under the remaining correction', async () => {
+    const state = await new RegexCompactor().compact(
+      [
+        { id: 'd1', role: 'user', content: "Let's use MySQL. The service must use MySQL for persistence.", timestamp: 1 },
+        { id: 'd2', role: 'user', content: 'We are building MySQL replicas for reporting.', timestamp: 2 },
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+    const first = { id: 'tomb_a', supersededContent: 'MySQL', correctedValue: 'Postgres', originalMessageId: 'd1', correctionMessageId: 'x1', reason: 'a', timestamp: 3 };
+    const second = { ...first, id: 'tomb_b', correctedValue: 'SQLite', correctionMessageId: 'x2', reason: 'b', timestamp: 4 };
+    state.tombstones.push(first, second);
+    applyTombstone(state, first);
+    expect(applyTombstone(state, second)).toBe(0);
+    const decision = state.l2_summaries.concat(state.archive!.flatMap((a) => (a.kind === 'summary' ? [a.summary] : [])))
+      .flatMap((s) => s.decisions)
+      .find((d) => d.chosen === 'MySQL')!;
+    expect(decision).toMatchObject({ superseded: true, tombstoneId: 'tomb_a', alsoBy: ['tomb_b'] });
+
+    const archivedBefore = state.archive!.filter((a) => a.reason === 'superseded').length;
+    expect(revertTombstone(state, 'tomb_a')).toBe(true);
+    expect(state.archive!.filter((a) => a.reason === 'superseded')).toHaveLength(archivedBefore);
+    expect(state.archive!.every((a) => a.reason !== 'superseded' || a.by === 'tomb_b')).toBe(true);
+    expect(decision).toMatchObject({ superseded: true, tombstoneId: 'tomb_b' });
+    expect(state.l4_invariants.some((i) => /mysql/i.test(i.value))).toBe(false);
+    expect(state.l3_graph.entities.has('MySQL replicas')).toBe(false);
+    const inv = state.archive!.find((a) => a.kind === 'invariant');
+    expect(inv?.kind === 'invariant' && inv.invariant.displacedBy).toBe('tomb_b');
+
+    // With the second gone too, everything is live again
+    expect(revertTombstone(state, 'tomb_b')).toBe(true);
+    expect(state.archive!.filter((a) => a.reason === 'superseded')).toEqual([]);
+    expect(decision).toMatchObject({ superseded: false, tombstoneId: undefined });
+    expect(state.l4_invariants.some((i) => /mysql/i.test(i.value))).toBe(true);
   });
 });

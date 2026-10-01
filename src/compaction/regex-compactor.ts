@@ -46,7 +46,7 @@ import {
   splitSentences,
 } from '../utils.js';
 import { applyTombstone, sameEdge } from './corrections.js';
-import { isValidCorrectionSubject, normalizeForMatch, tombstoneId, wholeWordRe } from './matching.js';
+import { isValidCorrectionSubject, normalizeForMatch, supersededMatcher, tombstoneId } from './matching.js';
 import { spanRef } from './frame.js';
 
 /** Deep clone a CompactedState, preserving Map types. */
@@ -123,11 +123,14 @@ interface PatternMatch {
 type Pattern = { regex: RegExp; extract: (m: RegExpMatchArray) => PatternMatch };
 
 // Captures are bounded (`.{1,N}?`) so a keyword never rescans a whole
-// window; windows themselves are at most MAX_SENTENCE_CHARS long.
+// window; windows themselves are at most MAX_SENTENCE_CHARS long. A capture
+// ends at sentence punctuation followed by whitespace, or at the window's
+// end (`(?:[.!?]+(?=\s|$)|$)`), never at a dot inside a token: `3.12`,
+// `10.0.0.5` and `config.prod.yaml` stay whole.
 
 const DECISION_PATTERNS: Pattern[] = [
   {
-    regex: /\b(?:let'?s?|we(?:'ll)?|I(?:'ll)?)\s+(?:go with|use|choose|pick|stick with)\s+(.{1,160}?)(?:\.|$)/gi,
+    regex: /\b(?:let'?s?|we(?:'ll)?|I(?:'ll)?)\s+(?:go with|use|choose|pick|stick with)\s+(.{1,160}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'decision',
       content: m[0],
@@ -135,7 +138,7 @@ const DECISION_PATTERNS: Pattern[] = [
     }),
   },
   {
-    regex: /\b(?:chose|decided on|going with|selected|picked)\s+(.{1,160}?)(?:\s+(?:over|instead of|rather than)\s+(.{1,160}?))?(?:\.|$)/gi,
+    regex: /\b(?:chose|decided on|going with|selected|picked)\s+(.{1,160}?)(?:\s+(?:over|instead of|rather than)\s+(.{1,160}?))?(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'decision',
       content: m[0],
@@ -143,7 +146,7 @@ const DECISION_PATTERNS: Pattern[] = [
     }),
   },
   {
-    regex: /\b(?:rejected|ruled out|eliminated|won't use|not going with)\s+(.{1,160}?)(?:\s+because\s+(.{1,240}?))?(?:\.|$)/gi,
+    regex: /\b(?:rejected|ruled out|eliminated|won't use|not going with)\s+(.{1,160}?)(?:\s+because\s+(.{1,240}?))?(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'decision',
       content: m[0],
@@ -172,7 +175,7 @@ const CORRECTION_PATTERNS: Pattern[] = [
     // Whole-word keywords only ("await" and "Factually" are not
     // corrections). A bare "instead" is a keyword; "instead of" is the
     // replacement form handled by the "use X instead of Y" pattern below.
-    regex: /\b(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead(?!\s+of\b)|scratch that|change that to)\b\s*[,:]?\s*(.{1,200}?)(?:\.|$)/gi,
+    regex: /\b(?:actually|wait|correction|no,?\s+(?:let's|we should)|instead(?!\s+of\b)|scratch that|change that to)\b\s*[,:]?\s*(.{1,200}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
@@ -181,7 +184,7 @@ const CORRECTION_PATTERNS: Pattern[] = [
   },
   {
     // "use X instead of Y" with no correction keyword in front
-    regex: /\b(?:use|using|go with|switch to|pick|choose|prefer)\s+(.{1,160}?),?\s+(?:instead of|rather than)\s+(.{1,160}?)(?:\.|$)/gi,
+    regex: /\b(?:use|using|go with|switch to|pick|choose|prefer)\s+(.{1,160}?),?\s+(?:instead of|rather than)\s+(.{1,160}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
@@ -189,7 +192,7 @@ const CORRECTION_PATTERNS: Pattern[] = [
     }),
   },
   {
-    regex: /\b(?:swap|change|switch|replace)\s+(.{1,160}?)\s+(?:to|with|for)\s+(.{1,160}?)(?:\.|$)/gi,
+    regex: /\b(?:swap|change|switch|replace)\s+(.{1,160}?)\s+(?:to|with|for)\s+(.{1,160}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'correction',
       content: m[0],
@@ -200,7 +203,7 @@ const CORRECTION_PATTERNS: Pattern[] = [
 
 const ENTITY_PATTERNS: Pattern[] = [
   {
-    regex: /\b(?:using|implement(?:ing)?|build(?:ing)?|creat(?:e|ing))\s+(?:a\s+)?(.{1,120}?)(?:\s+(?:for|to|with|in)\s+(.{1,240}?))?(?:\.|$)/gi,
+    regex: /\b(?:using|implement(?:ing)?|build(?:ing)?|creat(?:e|ing))\s+(?:a\s+)?(.{1,120}?)(?:\s+(?:for|to|with|in)\s+(.{1,240}?))?(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'entity',
       content: m[0],
@@ -211,7 +214,7 @@ const ENTITY_PATTERNS: Pattern[] = [
 
 const CONSTRAINT_PATTERNS: Pattern[] = [
   {
-    regex: /\b(?:must not|should not|cannot|must|should|need to|required to|has to)\s+(.{1,200}?)(?:\.|$)/gi,
+    regex: /\b(?:must not|should not|cannot|must|should|need to|required to|has to)\s+(.{1,200}?)(?:[.!?]+(?=\s|$)|$)/gi,
     extract: (m) => ({
       type: 'constraint',
       content: m[0],
@@ -517,18 +520,10 @@ export class RegexCompactor implements Compactor {
   }
 
   private findRelatedMessage(from: string, to: string, state: CompactedState): string | undefined {
-    const needle = normalizeForMatch(from);
-    if (!needle) return undefined;
-    const needleRe = wholeWordRe(needle);
-    const corrected = normalizeForMatch(to);
-    const correctedRe = corrected ? wholeWordRe(corrected) : undefined;
-    // Most recent mention of the old value (and not the new one) is the
-    // statement being corrected
+    // Most recent statement of only the old value is the one being corrected
+    const statesOnlyOld = supersededMatcher({ supersededContent: from, correctedValue: to });
     for (let i = state.l1_compacted.length - 1; i >= 0; i--) {
-      const text = normalizeForMatch(state.l1_compacted[i].compacted);
-      if (needleRe.test(text) && !correctedRe?.test(text)) {
-        return state.l1_compacted[i].originalMessageId;
-      }
+      if (statesOnlyOld(state.l1_compacted[i].compacted)) return state.l1_compacted[i].originalMessageId;
     }
     return undefined;
   }

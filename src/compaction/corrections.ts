@@ -14,6 +14,7 @@ import type {
   ArchivedItem,
   CompactedEntry,
   CompactedState,
+  Decision,
   Edge,
   Entity,
   Invariant,
@@ -46,10 +47,18 @@ function insertByTime(entries: CompactedEntry[], entry: CompactedEntry): void {
   else entries.splice(at, 0, entry);
 }
 
+/** Add `id` to an item's `alsoBy` list once. */
+function addAlso(holder: { alsoBy?: string[] }, id: string): void {
+  const list = holder.alsoBy ?? (holder.alsoBy = []);
+  if (!list.includes(id)) list.push(id);
+}
+
 /**
  * Archive everything in `state` that states only the value `tombstone`
  * superseded. Mutates `state`; returns the number of items archived.
  * A tombstone without a superseded value (or without an id) is a no-op.
+ * Items another tombstone already archived that this one supersedes too
+ * are marked (`alsoBy`), so reverting that tombstone leaves them archived.
  */
 export function applyTombstone(
   state: CompactedState,
@@ -63,29 +72,41 @@ export function applyTombstone(
   const archive = archiveOf(state);
   const before = archive.length;
 
-  // L1 — the original statement goes, and so does anything else that
-  // states only the old value. The correction message itself never does.
+  // The original statement goes, and so does anything else that states only
+  // the old value. The correction message itself never does.
+  const l1Stale = (entry: CompactedEntry) =>
+    entry.originalMessageId !== tombstone.correctionMessageId &&
+    eligible(entry.originalMessageId) &&
+    (entry.originalMessageId === tombstone.originalMessageId || statesOnlyOld(entry.compacted));
+  const entityStale = (entity: Entity) => eligible(entity.lastMention) && statesOnlyOld(entity.name);
+  const edgeStale = (edge: Edge) => eligible(edge.sourceMessage) && statesOnlyOld(`${edge.source} ${edge.target}`);
+  const invariantStale = (inv: Invariant) =>
+    !inv.sourceMessage.startsWith(TRUTH_SOURCE_PREFIX) && eligible(inv.sourceMessage) && statesOnlyOld(`${inv.key} ${inv.value}`);
+  /** Decisions that chose the old value are superseded (or, if already, marked as superseded by this one too). */
+  const supersedeDecisions = (summary: TopicSummary) => {
+    for (const decision of summary.decisions) {
+      if (!eligible(decision.messageId) || !statesOnlyOld(decision.chosen)) continue;
+      if (!decision.superseded) {
+        decision.superseded = true;
+        decision.tombstoneId = by;
+      } else if (decision.tombstoneId !== by) {
+        addAlso(decision, by);
+      }
+    }
+  };
+
+  // L1
   const keptL1: CompactedEntry[] = [];
   for (const entry of state.l1_compacted) {
-    const stale =
-      entry.originalMessageId !== tombstone.correctionMessageId &&
-      eligible(entry.originalMessageId) &&
-      (entry.originalMessageId === tombstone.originalMessageId || statesOnlyOld(entry.compacted));
-    if (stale) archive.push({ kind: 'l1', reason: 'superseded', by, entry });
+    if (l1Stale(entry)) archive.push({ kind: 'l1', reason: 'superseded', by, entry });
     else keptL1.push(entry);
   }
   state.l1_compacted = keptL1;
 
-  // L2 — decisions that chose the old value are superseded; a summary goes
-  // to the archive when nothing in it still holds.
+  // L2 — a summary goes to the archive when nothing in it still holds
   const keptL2: TopicSummary[] = [];
   for (const summary of state.l2_summaries) {
-    for (const decision of summary.decisions) {
-      if (!decision.superseded && eligible(decision.messageId) && statesOnlyOld(decision.chosen)) {
-        decision.superseded = true;
-        decision.tombstoneId = by;
-      }
-    }
+    supersedeDecisions(summary);
     const stale =
       summary.decisions.length > 0
         ? summary.decisions.every((d) => d.superseded) && summary.decisions.some((d) => d.tombstoneId === by)
@@ -98,18 +119,46 @@ export function applyTombstone(
   // L3 — entities named by the old value, and every edge touching them
   const removedEntities = new Set<string>();
   for (const [key, entity] of state.l3_graph.entities) {
-    if (eligible(entity.lastMention) && statesOnlyOld(entity.name)) {
+    if (entityStale(entity)) {
       archive.push({ kind: 'entity', reason: 'superseded', by, entity });
       state.l3_graph.entities.delete(key);
       removedEntities.add(entity.name);
     }
   }
+
+  // Items other tombstones archived before: does this one supersede them too?
+  const earlier = archive.slice(0, before).filter((item) => item.reason === 'superseded' && item.by !== by);
+  for (const item of earlier) {
+    switch (item.kind) {
+      case 'l1':
+        if (l1Stale(item.entry)) addAlso(item, by);
+        break;
+      case 'summary':
+        supersedeDecisions(item.summary);
+        if (item.summary.decisions.length === 0 && eligible(item.summary.messageRange.last) && statesOnlyOld(item.summary.summary)) {
+          addAlso(item, by);
+        }
+        break;
+      case 'entity':
+        if (entityStale(item.entity)) {
+          addAlso(item, by);
+          removedEntities.add(item.entity.name);
+        }
+        break;
+      case 'invariant':
+        if (invariantStale(item.invariant)) addAlso(item, by);
+        break;
+    }
+  }
+  for (const item of earlier) {
+    if (item.kind !== 'edge') continue;
+    const { edge } = item;
+    if (removedEntities.has(edge.source) || removedEntities.has(edge.target) || edgeStale(edge)) addAlso(item, by);
+  }
+
   const keptEdges: Edge[] = [];
   for (const edge of state.l3_graph.edges) {
-    const stale =
-      removedEntities.has(edge.source) ||
-      removedEntities.has(edge.target) ||
-      (eligible(edge.sourceMessage) && statesOnlyOld(`${edge.source} ${edge.target}`));
+    const stale = removedEntities.has(edge.source) || removedEntities.has(edge.target) || edgeStale(edge);
     if (stale) archive.push({ kind: 'edge', reason: 'superseded', by, edge });
     else keptEdges.push(edge);
   }
@@ -118,11 +167,7 @@ export function applyTombstone(
   // L4 — invariants whose key and value together state only the old value
   const keptL4: Invariant[] = [];
   for (const inv of state.l4_invariants) {
-    const stale =
-      !inv.sourceMessage.startsWith(TRUTH_SOURCE_PREFIX) &&
-      eligible(inv.sourceMessage) &&
-      statesOnlyOld(`${inv.key} ${inv.value}`);
-    if (stale) archive.push({ kind: 'invariant', reason: 'superseded', by, invariant: { ...inv, displacedBy: by } });
+    if (invariantStale(inv)) archive.push({ kind: 'invariant', reason: 'superseded', by, invariant: { ...inv, displacedBy: by } });
     else keptL4.push(inv);
   }
   state.l4_invariants = keptL4;
@@ -131,26 +176,77 @@ export function applyTombstone(
 }
 
 /**
- * Undo a tombstone: drop it and restore everything archived under its id.
- * Mutates `state`; returns false when no tombstone has that id.
+ * Undo a tombstone: drop it and restore everything archived under its id,
+ * except what another tombstone still present supersedes too — that stays
+ * archived (and decisions superseded), under that tombstone. Mutates
+ * `state`; returns false when no tombstone has that id.
  */
 export function revertTombstone(state: CompactedState, id: string): boolean {
   const index = state.tombstones.findIndex((t) => t.id === id);
   if (index === -1) return false;
   state.tombstones.splice(index, 1);
+  const remaining = new Set(state.tombstones.map((t) => t.id).filter((t): t is string => t !== undefined));
+  const successor = (alsoBy: string[] | undefined) => alsoBy?.find((t) => remaining.has(t));
+  const without = (alsoBy: string[] | undefined, ...ids: string[]) => {
+    const rest = alsoBy?.filter((t) => !ids.includes(t));
+    return rest && rest.length > 0 ? rest : undefined;
+  };
 
-  const archive = state.archive ?? [];
-  const restored = archive.filter((a) => a.by === id && a.reason === 'superseded');
-  state.archive = archive.filter((a) => !(a.by === id && a.reason === 'superseded'));
-
-  for (const summary of state.l2_summaries) {
-    for (const decision of summary.decisions) {
-      if (decision.tombstoneId === id) {
-        decision.superseded = false;
-        decision.tombstoneId = undefined;
-      }
+  /** Hand a decision this tombstone superseded to the next one that supersedes it, or revive it. */
+  const handOver = (decision: Decision) => {
+    if (decision.tombstoneId !== id) {
+      decision.alsoBy = without(decision.alsoBy, id);
+      return;
     }
+    const next = successor(decision.alsoBy);
+    if (next) {
+      decision.tombstoneId = next;
+      decision.alsoBy = without(decision.alsoBy, id, next);
+    } else {
+      decision.superseded = false;
+      decision.tombstoneId = undefined;
+      decision.alsoBy = undefined;
+    }
+  };
+  for (const summary of state.l2_summaries) summary.decisions.forEach(handOver);
+
+  const kept: ArchivedItem[] = [];
+  const restored: ArchivedItem[] = [];
+  for (const item of state.archive ?? []) {
+    if (item.reason !== 'superseded') {
+      kept.push(item);
+      continue;
+    }
+    if (item.kind === 'summary' && item.summary.decisions.length > 0) {
+      item.summary.decisions.forEach(handOver);
+      // A summary stays archived while every decision in it is superseded,
+      // under a tombstone still present that superseded one of them
+      const holders = item.summary.decisions.map((d) => d.tombstoneId).filter((t): t is string => t !== undefined && remaining.has(t));
+      if (item.summary.decisions.every((d) => d.superseded) && holders.length > 0) {
+        if (!holders.includes(item.by)) item.by = holders[0];
+        item.alsoBy = without(item.alsoBy, id, item.by);
+        kept.push(item);
+      } else {
+        restored.push(item);
+      }
+      continue;
+    }
+    if (item.by !== id) {
+      item.alsoBy = without(item.alsoBy, id);
+      kept.push(item);
+      continue;
+    }
+    const next = successor(item.alsoBy);
+    if (!next) {
+      restored.push(item);
+      continue;
+    }
+    item.by = next;
+    item.alsoBy = without(item.alsoBy, id, next);
+    if (item.kind === 'invariant') item.invariant = { ...item.invariant, displacedBy: next };
+    kept.push(item);
   }
+  state.archive = kept;
 
   for (const item of restored) {
     switch (item.kind) {
@@ -158,12 +254,6 @@ export function revertTombstone(state: CompactedState, id: string): boolean {
         insertByTime(state.l1_compacted, item.entry);
         break;
       case 'summary':
-        for (const decision of item.summary.decisions) {
-          if (decision.tombstoneId === id) {
-            decision.superseded = false;
-            decision.tombstoneId = undefined;
-          }
-        }
         state.l2_summaries.push(item.summary);
         break;
       case 'entity':
