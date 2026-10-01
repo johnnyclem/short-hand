@@ -30,7 +30,7 @@ import { isValidCorrectionSubject, normalizeForMatch, supersededMatcher, tombsto
 import { FrameBudget, escapeUntrusted, renderEntry, spanRef } from './frame.js';
 import type { ActiveEngramStore } from '../crdt/active-engram-store.js';
 import type { TruthLedgerEntry, TruthSelection, TruthSyncResult } from '../truth/types.js';
-import { parseWikiLines, selectCurrentTruth } from '../truth/wiki.js';
+import { parseWikiLines, selectCurrentTruth, type TruthReadOptions, type WikiParseResult } from '../truth/wiki.js';
 import { TRUTH_SECTION_HEADING, renderTruthItems } from '../truth/compaction-bridge.js';
 import { displaceStaleInvariants } from '../truth/ledger-sync.js';
 
@@ -303,33 +303,44 @@ export class CompactionEngine {
   }
 
   /**
-   * Sync a truth-ledger snapshot (stenographer TB/UV JSONL export, or
-   * entries already parsed with `parseWikiLines`).
+   * Sync the truth ledger: a stenographer truth stream (JSONL text or
+   * lines, read with `parseWikiLines(input, options)`), a stream or merged
+   * files already read (`parseWikiLines` / `parseWikiFiles`), or entries.
    *
    * The synced selection lives beside the LSM levels, not inside them:
    * recompaction can rewrite L4, but it can never rewrite ledger truth,
    * and a UV must never compact into something that reads as proven.
    * Syncing also displaces any L4 invariant projected from an entry that
-   * is no longer ground truth (overridden, struck, contested, refuted).
+   * is no longer ground truth (overridden, struck, contested, refuted,
+   * inadmissible). A refused stream (a bad hash, identity or chain) syncs
+   * as no truth at all — `result.refused` and `result.errors` say why —
+   * rather than as whatever its readable lines claim.
    */
-  syncTruthLedger(input: string | string[] | TruthLedgerEntry[]): TruthSyncResult {
+  syncTruthLedger(
+    input: string | string[] | TruthLedgerEntry[] | WikiParseResult,
+    options: TruthReadOptions = {},
+  ): TruthSyncResult {
     let entries: TruthLedgerEntry[];
     let errors: TruthSyncResult['errors'] = [];
+    let refused = false;
 
-    if (typeof input === 'string' || typeof input[0] === 'string' || input.length === 0) {
-      const parsed = parseWikiLines(input as string | string[]);
-      entries = parsed.entries;
-      errors = parsed.errors;
-    } else {
+    if (typeof input === 'string' || (Array.isArray(input) && (input.length === 0 || typeof input[0] === 'string'))) {
+      input = parseWikiLines(input as string | string[], options);
+    }
+    if (Array.isArray(input)) {
       entries = input as TruthLedgerEntry[];
+    } else {
+      entries = input.entries;
+      errors = input.errors;
+      refused = input.refused;
     }
 
-    const selection = selectCurrentTruth(entries);
+    const selection = selectCurrentTruth(refused ? [] : entries);
     const { kept, displacedKeys } = displaceStaleInvariants(this.state.l4_invariants, selection);
     this.state.l4_invariants = kept;
     this.truthSelection = selection;
 
-    return { selection, displacedInvariantKeys: displacedKeys, errors };
+    return { selection, displacedInvariantKeys: displacedKeys, errors, refused };
   }
 
   /** The most recently synced truth-ledger selection, if any. */

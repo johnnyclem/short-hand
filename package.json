@@ -62,6 +62,7 @@
     "lint": "tsc --noEmit",
     "benchmark": "npm run build && node dist/benchmark/run.js",
     "benchmark:live": "npm run build && node dist/benchmark/run.js --live",
+    "sync:truth-fixtures": "node scripts/sync-truth-fixtures.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -96,6 +97,8 @@
   "sideEffects": false,
   "devDependencies": {
     "@types/node": "20.19.39",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "fast-check": "^4.10.2",
     "typescript": "^5.8.3",
     "vitest": "^3.1.1"

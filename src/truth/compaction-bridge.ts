@@ -23,7 +23,6 @@
  * compactor cannot sign its own output.
  */
 
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import type {
   CompactedSnapshot,
   SnapshotLevel,
@@ -34,17 +33,19 @@ import { estimateTokens } from '../utils.js';
 import { escapeUntrusted } from '../compaction/frame.js';
 import type {
   CompactedTruth,
-  ProposalLine,
   TruthConfidence,
   TruthSelection,
   TruthTbEntry,
   TruthUvEntry,
   UvProposalLine,
 } from './types.js';
-import { TRUTH_SOURCE_PREFIX, assertAccountableAuthor } from './types.js';
+import { TRUTH_SOURCE_PREFIX } from './types.js';
+import { assertAccountableAuthor } from './identity.js';
 import { uvProposal, type ProposeInvariantsOptions } from './proposal-export.js';
 
 export type { ProposeInvariantsOptions } from './proposal-export.js';
+// The proposals stream writer lives in proposals.ts; these two names have always been exported from here.
+export { appendProposalsFile, serializeProposals } from './proposals.js';
 
 // ---------------------------------------------------------------------------
 // Rendering — the truth section that rides the compacted summary
@@ -146,7 +147,10 @@ export function renderTruthSection(selection: TruthSelection): string {
 /**
  * Attach a truth selection to a compacted snapshot. The section is rebuilt
  * from scratch — any truth text a previous round carried is displaced,
- * which is how overridden TBs and refuted UVs leave the cache.
+ * which is how overridden TBs and refuted UVs leave the cache. The
+ * compacted conversation it sits beside is untrusted text: it goes through
+ * `escapeUntrusted`, so a message or tool output that reproduces a `[TB]`
+ * line or the truth heading can never pass for ledger truth (SH-04).
  */
 export function applyTruthToSnapshot(
   state: CompactedSnapshot,
@@ -172,7 +176,7 @@ export function applyTruthToSnapshot(
   // must survive.
   const baseSummary = stripAppendedTruth(state);
 
-  const summary = `${baseSummary}\n\n${renderTruthSection(selection)}`;
+  const summary = `${escapeUntrusted(baseSummary)}\n\n${renderTruthSection(selection)}`;
 
   return {
     ...state,
@@ -316,7 +320,7 @@ export function proposeInvariants(
             detail: 'confirm the compacted value still holds in the source conversation',
           },
         },
-        { targetRef, detail, sourceMessageId },
+        { targetRef, detail },
         options,
       ),
     );
@@ -324,6 +328,8 @@ export function proposeInvariants(
 
   for (const entity of state.entities) {
     if (entity.type !== 'configuration') continue;
+    // "chose postgres" names a value, not a fact about one: "postgres is postgres." says nothing (SAT-10)
+    if (sameText(String(entity.value), entity.name)) continue;
     const settled =
       entity.corrections.length > 0
         ? ` (settled after ${entity.corrections.length} correction${entity.corrections.length === 1 ? '' : 's'})`
@@ -349,37 +355,7 @@ export function proposeInvariants(
   return proposals;
 }
 
-/** Serialize proposals as JSONL lines. */
-export function serializeProposals(proposals: ProposalLine[]): string[] {
-  return proposals.map((p) => JSON.stringify(p));
-}
-
-/**
- * Append proposals to a JSONL file (created if absent), deduplicating by
- * `targetRef` against lines already present so repeated compaction rounds
- * do not re-propose the same invariant.
- */
-export function appendProposalsFile(
-  path: string,
-  proposals: ProposalLine[],
-): { written: number; skipped: number } {
-  const existingRefs = new Set<string>();
-  if (existsSync(path)) {
-    for (const raw of readFileSync(path, 'utf8').split('\n')) {
-      const trimmed = raw.trim();
-      if (!trimmed) continue;
-      try {
-        const parsed = JSON.parse(trimmed) as { targetRef?: string | null };
-        if (parsed.targetRef) existingRefs.add(parsed.targetRef);
-      } catch {
-        // Foreign or malformed lines never block the append path.
-      }
-    }
-  }
-
-  const fresh = proposals.filter((p) => !p.targetRef || !existingRefs.has(p.targetRef));
-  if (fresh.length > 0) {
-    appendFileSync(path, serializeProposals(fresh).map((l) => l + '\n').join(''));
-  }
-  return { written: fresh.length, skipped: proposals.length - fresh.length };
+function sameText(a: string, b: string): boolean {
+  const key = (s: string) => s.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+  return key(a) === key(b);
 }

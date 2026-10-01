@@ -8,10 +8,12 @@ import {
   tombstonesToProposalDrafts,
 } from './proposal-export.js';
 import { TRUTH_SOURCE_PREFIX, type TruthTbEntry, type WikiEntryLine } from './types.js';
+import { chainTruthLines } from './format.js';
 import { CompactionEngine } from '../compaction/compaction-engine.js';
 import type { CompactedState, Invariant } from '../types.js';
 
-// Line shapes mirror stenographer's exportWikiEntries output.
+// Line shapes mirror stenographer's exportWikiEntries output; `stream`
+// chains them into a truth format v2 stream as stenographer writes it.
 function tb(id: string, status: string, claim: string, signedBy: string | null = 'johnny'): WikiEntryLine {
   return {
     id,
@@ -37,12 +39,21 @@ function uv(id: string, status: string, assertion: string, contests: string | nu
     verifyBy: { kind: 'ask', value: 'johnny' },
     contests,
     status,
-    'x-steno': { origin: 'local', provenance: { kind: 'manual' }, agentSessionId: null, links: [] },
+    'x-steno': {
+      origin: 'local',
+      provenance: { kind: 'manual' },
+      agentSessionId: null,
+      links: contests ? [{ fromId: id, toId: contests, type: 'contests' }] : [],
+    },
   };
 }
 
+function stream(...lines: Array<Record<string, unknown>>): string[] {
+  return chainTruthLines(lines);
+}
+
 function select(lines: WikiEntryLine[]) {
-  const { entries, errors } = parseWikiLines(lines.map((l) => JSON.stringify(l)));
+  const { entries, errors } = parseWikiLines(stream(...lines));
   expect(errors).toEqual([]);
   return selectCurrentTruth(entries);
 }
@@ -71,7 +82,7 @@ describe('parseWikiLines (stenographer export)', () => {
     expect(entries.map((e) => e.id)).toEqual(['01A', '01C']);
     expect(errors).toHaveLength(2);
     expect(errors[0].line).toBe(2);
-    expect(errors[1].error).toContain('unsupported entry type');
+    expect(errors[1].error).toContain('a version 1 line is a TB or UV');
   });
 
   it('is last-line-wins per id (append-only file, statuses evolve)', () => {
@@ -139,8 +150,8 @@ describe('renderTruthLines (frozen suite markers)', () => {
     expect(renderTruthLines(select([tb('T1', 'overridden', 'Old truth.')]))).toEqual([]);
   });
 
-  it('marks an unsigned TB as unsigned', () => {
-    expect(renderTruthLines(select([tb('T1', 'active', 'Backfilled.', null)]))[0]).toContain('(unsigned,');
+  it('renders nothing for an unsigned TB: it is never truth on its own', () => {
+    expect(renderTruthLines(select([tb('T1', 'active', 'Backfilled.', null)]))).toEqual([]);
   });
 });
 
@@ -186,11 +197,11 @@ describe('CompactionEngine.syncTruthLedger', () => {
     const engine = new CompactionEngine({ memtableSize: 10, contextBudget: 4000 });
     await engine.addMessage({ id: 'm1', role: 'user', content: 'hello there', timestamp: Date.now() });
 
-    const result = engine.syncTruthLedger([
-      JSON.stringify(tb('T1', 'active', 'We use PostgreSQL.')),
-      JSON.stringify(uv('U1', 'open', 'The cache TTL is 60 seconds.')),
-    ]);
+    const result = engine.syncTruthLedger(
+      stream(tb('T1', 'active', 'We use PostgreSQL.'), uv('U1', 'open', 'The cache TTL is 60 seconds.')),
+    );
     expect(result.errors).toEqual([]);
+    expect(result.refused).toBe(false);
     expect(result.selection.groundTruth).toHaveLength(1);
 
     const frame = engine.buildContextFrame(2000);
@@ -201,17 +212,27 @@ describe('CompactionEngine.syncTruthLedger', () => {
 
   it('accepts already-parsed entries', () => {
     const engine = new CompactionEngine();
-    const { entries } = parseWikiLines([JSON.stringify(tb('T1', 'active', 'We use PostgreSQL.'))]);
+    const { entries } = parseWikiLines(stream(tb('T1', 'active', 'We use PostgreSQL.')));
     expect(engine.syncTruthLedger(entries).selection.groundTruth.map((e) => e.id)).toEqual(['T1']);
   });
 
   it('a later sync displaces truth the frame previously carried', () => {
     const engine = new CompactionEngine();
-    engine.syncTruthLedger([JSON.stringify(tb('T1', 'active', 'We use PostgreSQL.'))]);
+    const ledger = stream(tb('T1', 'active', 'We use PostgreSQL.'), {
+      id: 'A1:T1',
+      type: 'TRANSITION',
+      ts: '2026-09-19T12:05:00.000Z',
+      author: 'kim',
+      target: 'T1',
+      status: 'overridden',
+      cause: { kind: 'override', ref: 'A1' },
+    });
+    engine.syncTruthLedger(ledger.slice(0, 1));
     const selection = engine.getTruthSelection()!;
     engine.getState().l4_invariants.push(groundTruthToInvariant(selection.groundTruth[0])!);
 
-    const result = engine.syncTruthLedger([JSON.stringify(tb('T1', 'overridden', 'We use PostgreSQL.'))]);
+    // The stream grew by a TRANSITION; the entry line itself is never rewritten
+    const result = engine.syncTruthLedger(ledger);
     expect(result.displacedInvariantKeys).toEqual(['T1']);
     expect(engine.getState().l4_invariants).toHaveLength(0);
     expect(engine.buildContextFrame(2000).sections.every((s) => !s.content.includes('PostgreSQL'))).toBe(true);
@@ -239,7 +260,9 @@ describe('proposal export (write path is proposals only, suite PROPOSAL envelope
     expect(p.draft.assertion).toBe('The invariant "database" holds: PostgreSQL.');
     expect(p.targetRef).toBe('shorthand:invariant:database');
     expect(p.signal.source).toBe('compaction-candidate');
-    expect(p.provenance).toEqual({ kind: 'sourceMessageId', ref: 'msg-3' });
+    // The envelope is exact: the source message travels in the draft, not a top-level provenance field
+    expect('provenance' in p).toBe(false);
+    expect(p.draft.verifyBy.value).toBe('message:msg-3');
   });
 
   it('drafts an unsigned TB proposal per correction with message evidence', () => {
@@ -259,7 +282,8 @@ describe('proposal export (write path is proposals only, suite PROPOSAL envelope
     expect(p.draft.claim).toContain('"We use MySQL" no longer holds');
     expect(p.draft.claim).toContain('superseded by "PostgreSQL"');
     expect(p.draft.evidence).toEqual([{ kind: 'message', ref: 'm5', detail: 'user correction' }]);
-    expect(p.draft.signedBy).toBeNull();
+    // Unsigned by construction: the draft has no signer field at all (spec: claim, evidence, literals?)
+    expect(Object.keys(p.draft).sort()).toEqual(['claim', 'evidence']);
   });
 
   it('rejects anonymous authors — there is no anonymous write path', () => {

@@ -1,0 +1,27 @@
+# Copied by scripts/sync-truth-fixtures.mjs. Do not edit these files by hand: re-run the script.
+repository: https://github.com/johnnyclem/stenographer
+path: spec/truth-format
+commit: 9998a939b0654a652c565788f2e66c206543ba29
+spec-last-changed: 3a70df561b1eacc5f57b9c304b96d0be5265ab66
+uncommitted-changes: no
+files:
+  6ce36c82a494d80b39f244464aa9b4a9eda4627d1e3b69575679ca14389f3e1b  README.md
+  1b0aa09734cf40666d1c903589f4839261fa8b66394d0c7cf87bfe27d6c4c2f4  invalid/chain-fork.jsonl
+  365570d5fbd0c7d11cd307b31f0ef5ba897cc08149cfbc72a70075e2806dab46  invalid/chain-gap.jsonl
+  4a84ad7bc1a8c3aca734f7f35406765224450b135571e62503930156f9e3b31a  invalid/chain.expected.json
+  1779b71809b5315f983cf8ea3e7c2f2d63856282f43d80ad199bc87cb029201a  invalid/codec.expected.json
+  dd95610f4b907f458976f372474be78e10c5c8275aaa6537f7bc48712c17445f  invalid/codec.jsonl
+  154216e20d01a5077d21238679d9ab5feac4612c1bfbb51e24a2b838c6e62b02  invalid/schema.expected.json
+  b04c8a66468b6ba35026b10a691a4c37fdf7122c2088e8f47b24a57545c70cff  invalid/schema.jsonl
+  e8ee0efe8f4ff71bea085ffeb7ab14c5c9fc579bce27069883b80716296c8f76  signers.json
+  c3eb6fcd9cc13e69c3d31f31ba9c17d3288507f483bcbfd0c196fcb92ac98f5f  v1/legacy.expected.json
+  06f3a5eb867d808a1159cdc8a4df9d910a7295fb0b66a1346751a65ef3847740  v1/legacy.jsonl
+  f20cd01e6b5e91aa9a3a039fdca89ea6120774209602bf01588261363eb35aa6  valid/ledger.expected.json
+  7708d5d1001350ce648701c42e118d78d5a0bea9a3fe404251dcbadfda6ac3a5  valid/ledger.jsonl
+  ab750d3bbf72b56a891d331db3dcd82ab45d42a9ab9c548cc6f450dc304ba967  valid/proposals.expected.json
+  e03b8040a2dfb39fe4b3f6a6f15e75555799163a79ca8a3d941e5f5ffe09363c  valid/proposals.jsonl
+  3630bbb120f485810f9e516238957deba2d0d42bdf2095b727efa75ea789da6e  valid/routing.expected.json
+  e0c801f4bee400b23f4783a59945a01e1828957af257d07705f87c91baaf22a7  valid/routing.jsonl
+  c8be9143354e90603587ffd33069eeee25aac9bb1d0f49f854b55572e0d08a4f  valid/unknown.expected.json
+  98b7d0e926ffe41b56b5dbc3e04a2b639487c9ecf0f6d09448ec8147a540535f  valid/unknown.jsonl
+  a99f4ccf2fae1117f47e3ec9dae9d84843aae80df866173e0600749fec56f1a6  wiki-line.v2.schema.json

@@ -15,8 +15,14 @@
 import type { CodeSpan, CompactedEntry, ContextFrame } from '../types.js';
 import { estimateTokens } from '../utils.js';
 
-/** Frozen truth markers, escaped wherever they appear in untrusted text. */
-const FROZEN_MARKER_RE = /\[(?=[ \t]*(?:TB|UV)\b)/g;
+/**
+ * Frozen truth markers, escaped wherever they appear in untrusted text —
+ * including look-alikes a model would read the same way: a full-width
+ * bracket or letters (`［ＴＢ］`), or invisible code points before the
+ * letters. A `[` that is already escaped is left alone, so escaping twice
+ * changes nothing.
+ */
+const FROZEN_MARKER_RE = /(?<!\\)[[［](?=[\s\p{Default_Ignorable_Code_Point}]*(?:TB|UV|ＴＢ|ＵＶ)(?![\p{L}\p{N}_]))/gu;
 
 /** Section markers, escaped when untrusted text puts them at a line start. */
 const LINE_MARKER_RE =
@@ -39,7 +45,7 @@ export interface EscapeOptions {
 
 function escapeProse(text: string): string {
   return text
-    .replace(FROZEN_MARKER_RE, '\\[')
+    .replace(FROZEN_MARKER_RE, '\\$&')
     .replace(LINE_MARKER_RE, '$1\\[')
     .replace(TRUTH_HEADING_RE, '$1\\$2');
 }
@@ -50,7 +56,7 @@ function escapeProse(text: string): string {
  * line start, and a reproduced truth heading. Inside fenced code blocks
  * only the frozen markers are escaped, so code (an INI `[memory]` section,
  * a `# Asserted Truth` comment) keeps its text. Everything else is left
- * byte-for-byte.
+ * byte-for-byte. Idempotent: escaped text passes through unchanged.
  */
 export function escapeUntrusted(text: string, options: EscapeOptions = {}): string {
   if (options.singleLine) {
@@ -60,10 +66,36 @@ export function escapeUntrusted(text: string, options: EscapeOptions = {}): stri
   let last = 0;
   for (const fence of text.matchAll(FENCE_RE)) {
     out += escapeProse(text.slice(last, fence.index));
-    out += fence[0].replace(FROZEN_MARKER_RE, '\\[');
+    out += fence[0].replace(FROZEN_MARKER_RE, '\\$&');
     last = fence.index! + fence[0].length;
   }
   return out + escapeProse(text.slice(last));
+}
+
+/**
+ * Escape untrusted text for a markdown page (the wiki renderer): a `\` goes
+ * before `\`, `[` and `]`, so text can never open a link or an image, and
+ * `<` / `>` become `&lt;` / `&gt;`, so it can never be raw HTML. `inline`
+ * collapses line breaks (a label, a list item); otherwise a line-start `#`
+ * is escaped so text can't open a heading. The frozen truth markers and the
+ * truth heading are escaped as `escapeUntrusted` escapes them.
+ */
+export function escapeMarkdown(text: string, options: { inline?: boolean } = {}): string {
+  let out = String(text)
+    .replace(/[\\[\]]/g, (c) => `\\${c}`)
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  if (!options.inline) out = out.replace(/^([ \t]*)(#{1,6}(?:[ \t]|$))/gm, '$1\\$2');
+  return escapeUntrusted(out, { singleLine: options.inline });
+}
+
+/** A markdown code span holding `text` verbatim (fenced with more backticks than it contains). */
+export function markdownCodeSpan(text: string): string {
+  const flat = String(text).replace(/[\r\n\u2028\u2029]+/g, ' ');
+  const longest = Math.max(0, ...(flat.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = '`'.repeat(longest + 1);
+  const pad = flat.startsWith('`') || flat.endsWith('`') ? ' ' : '';
+  return `${fence}${pad}${flat}${pad}${fence}`;
 }
 
 /** The frame as one string: section contents joined by newlines. */

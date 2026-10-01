@@ -1,79 +1,143 @@
 /**
- * Truth Ledger Interop — JSONL codec and consumption-rule selection
+ * Truth Ledger Interop — reading truth streams, and consumption-rule selection
  *
- * Reads and writes stenographer's append-only wiki JSONL format
- * losslessly. One entry per line; later lines for the same id supersede
- * earlier ones (the ledger is append-only, so a status change arrives as
- * a re-emitted line). Fields this package does not interpret — the
- * namespaced `x-steno` key, unknown top-level keys, unknown status values —
- * are preserved modulo JSON key order, so
- * `serializeWikiEntries(parseWikiLines(lines))` round-trips.
+ * Reads stenographer's truth format v2 (spec/truth-format): one writer's
+ * hash-chained JSONL stream of TB and UV entry lines, the ADDENDUM and
+ * RULING lines that cause status changes, and a TRANSITION line for every
+ * change. Version 1 lines (stenographer 0.x: no chain, a `status` field,
+ * later lines for an id superseding earlier ones) are still read.
  *
- * Fail closed: a line without a status, a TB without a claim or a UV
- * without an assertion is reported as an error, and a status outside the
- * known vocabulary is kept but classified as history — never as truth.
+ * - **Status is a fold.** An entry's current status is the status of the
+ *   highest-seq TRANSITION that targets it, else the entry line's own.
+ * - **Fail closed.** A missing or unknown status means not current truth;
+ *   the line is kept as history and written back verbatim. A v2 stream
+ *   with any refused line (bad hash, identity, structure) or a broken
+ *   chain is refused whole: a dropped TRANSITION must never revive a
+ *   struck TB.
+ * - **Admission.** An unsigned TB is never truth on its own; a v1 TB has no
+ *   hash and is unverifiable (unless the host opts in); with a signer
+ *   registry, unlisted authors and signers are unverifiable; two lines
+ *   giving one id different content are a conflict.
+ * - **Never rewrite.** Unknown fields and values are kept, never coerced,
+ *   and a parsed entry serializes back to the exact line it was read from.
+ * - **Several files** (one per teammate) fold one by one, then each entry
+ *   takes the most advanced status on the lattice TB
+ *   `active < contested < overridden < struck`, UV
+ *   `open < verified < refuted < struck`.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { canonicalize } from './jcs.js';
+import {
+  TRUTH_STATUSES,
+  TruthLineError,
+  checkTruthChain,
+  decodeTruthLine,
+  literalIssue,
+  type DecodedTruthLine,
+  type StreamHead,
+  type TruthLineType,
+} from './format.js';
+import {
+  createSignerRegistry,
+  type TruthSigner,
+  type TruthSignerFile,
+  type TruthSignerRegistry,
+} from './identity.js';
 import type {
   ConsumptionAction,
   TruthEvidence,
+  TruthInadmissible,
   TruthLedgerEntry,
   TruthSelection,
   TruthTbEntry,
   TruthTombstonedLiteral,
+  TruthTransition,
   TruthUvEntry,
   TruthVerifyBy,
   WikiEntryLine,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
+// Options and results
+// ---------------------------------------------------------------------------
+
+export interface TruthReadOptions {
+  /**
+   * Whose entries count, in stenographer's signers.json shape (or a list,
+   * or a registry). With one, a TB is truth only when its author and signer
+   * are listed (as a person or an agent), and a UV only when its author is.
+   * Without one, any identity that passes the identity rules is accepted.
+   */
+  signers?: TruthSignerFile | TruthSigner[] | TruthSignerRegistry | null;
+  /**
+   * Take version 1 TBs as truth. Off by default: a v1 line carries no hash,
+   * so nothing shows it is the line stenographer wrote (stenographer itself
+   * files them for a person to sign). Turn on only to read a 0.x export.
+   */
+  admitV1Tbs?: boolean;
+  /**
+   * The head of the stream as last read (`result.head`). The input must
+   * continue it or still hold it, which is how a reader notices lines
+   * removed from the end or a rewritten stream.
+   */
+  previous?: StreamHead | null;
+}
+
+/** One line of the input, as read. */
+export interface TruthLineRecord {
+  /** 1-based line number (blank lines count). */
+  line: number;
+  /** The line exactly as read. */
+  text: string;
+  version: 1 | 2;
+  type: TruthLineType;
+  id: string;
+  seq: number | null;
+  hash: string | null;
+  file?: string;
+}
+
+export interface WikiParseResult {
+  /**
+   * TB and UV entries in order of first appearance, each with its folded
+   * status. Empty when the stream was refused.
+   */
+  entries: TruthLedgerEntry[];
+  /** Refused lines and chain breaks, by line. With a v2 stream, any of them refuses it. */
+  errors: Array<{ line: number; error: string; id?: string; file?: string }>;
+  /** True when the input was refused: nothing it says is truth. */
+  refused: boolean;
+  /** Every TRANSITION read, in order, including ones whose target is not in the input (a partial stream). */
+  transitions: TruthTransition[];
+  /** Every line read, verbatim — the whole stream, to write back or forward. Empty when refused. */
+  lines: TruthLineRecord[];
+  /** The last v2 line read: keep it and pass it as `previous` next time. */
+  head: StreamHead | null;
+  /** Ids two lines (or two files) gave different content. Those entries are not truth. */
+  conflicts: Array<{ id: string; files: string[] }>;
+}
+
+// ---------------------------------------------------------------------------
 // Line ↔ entry conversion
 // ---------------------------------------------------------------------------
 
-function isDistinctiveIdentifier(value: string): boolean {
-  return value.length >= 4 && /[A-Za-z]/.test(value);
-}
-
 /**
- * Stenographer's write-time rule for a tombstoned literal
- * (`TombstonedLiteralSchema`): every present field is a non-blank string,
- * and a literal without a `subject` must be a distinctive identifier
- * (≥4 chars, contains a letter) — a bare value like "30" can't be matched
- * safely without naming what it's the value of. Returns the reason it's
- * invalid, or null.
+ * Stenographer's rule for a tombstoned literal as a version 1 line states
+ * it: every present field a non-blank string, and without a `subject`,
+ * `dead` must be a distinctive identifier (≥4 chars, contains a letter).
+ * Returns the reason it's invalid, or null. (Version 2 lines also refuse
+ * surrounding whitespace.)
  */
 export function literalValidationError(literal: unknown): string | null {
-  if (!literal || typeof literal !== 'object' || Array.isArray(literal)) return 'a literal must be an object';
-  const { dead, subject, current } = literal as Record<string, unknown>;
-  if (typeof dead !== 'string' || dead.trim().length === 0) return 'a literal needs a dead value';
-  if (subject !== undefined && (typeof subject !== 'string' || subject.trim().length === 0)) {
-    return "a literal's subject must be a non-blank string";
-  }
-  if (current !== undefined && (typeof current !== 'string' || current.trim().length === 0)) {
-    return "a literal's current value must be a non-blank string";
-  }
-  if (subject === undefined && !isDistinctiveIdentifier(dead.trim())) {
-    return 'a literal without a subject must be a distinctive identifier (≥4 chars, contains a letter) — name the subject of bare values';
-  }
-  return null;
-}
-
-/** Rejects the whole line when any literal is invalid, as stenographer's import does. */
-function validLiterals(literals: unknown[], id: string): TruthTombstonedLiteral[] {
-  for (const literal of literals) {
-    const reason = literalValidationError(literal);
-    if (reason) throw new Error(`entry ${id}: invalid literals — ${reason}`);
-  }
-  // Keep the wiki's objects as-is so the round trip stays byte-stable
-  return literals as TruthTombstonedLiteral[];
+  return literalIssue(literal, 1);
 }
 
 /** Keys the codec maps to typed fields; anything else rides in `extra`. */
 const TB_KEYS = new Set(['id', 'type', 'ts', 'author', 'claim', 'evidence', 'signedBy', 'literals', 'status', 'x-steno']);
 const UV_KEYS = new Set(['id', 'type', 'ts', 'author', 'assertion', 'basis', 'verifyBy', 'contests', 'status', 'x-steno']);
 
-function extraKeys(line: WikiEntryLine, known: Set<string>): Record<string, unknown> | undefined {
+function extraKeys(line: Record<string, unknown>, known: Set<string>): Record<string, unknown> | undefined {
   let extra: Record<string, unknown> | undefined;
   for (const [key, value] of Object.entries(line)) {
     if (known.has(key)) continue;
@@ -82,72 +146,111 @@ function extraKeys(line: WikiEntryLine, known: Set<string>): Record<string, unkn
   return extra;
 }
 
-/**
- * Convert one parsed wiki line to a typed entry. Throws on a line that
- * cannot be consumed safely: not an object, no id, an unsupported type,
- * no status, a TB without a claim, a UV without an assertion, or invalid
- * literals. An unknown status is kept verbatim (see `classifyEntry`).
- */
-export function wikiLineToEntry(line: WikiEntryLine): TruthLedgerEntry {
-  if (typeof line !== 'object' || line === null || Array.isArray(line)) {
-    throw new Error('entry is not an object');
-  }
-  if (!line.id || typeof line.id !== 'string') {
-    throw new Error('wiki entry is missing an id');
-  }
-  if (line.type !== 'TB' && line.type !== 'UV') {
-    throw new Error(`unsupported entry type: ${String((line as { type?: unknown }).type)}`);
-  }
-  if (typeof line.status !== 'string' || line.status.length === 0) {
-    throw new Error('missing status');
-  }
+function entryOf(d: DecodedTruthLine, lineNo: number, file?: string): TruthLedgerEntry {
+  const line = d.line;
+  const lineStatus = typeof line.status === 'string' ? line.status : null;
+  const source = {
+    version: d.version,
+    text: d.text,
+    line: lineNo,
+    seq: d.seq,
+    hash: d.hash,
+    lineStatus,
+    ...(file !== undefined ? { file } : {}),
+  };
+  const xSteno = line['x-steno'] as Record<string, unknown> | undefined;
 
-  if (line.type === 'TB') {
-    if (typeof line.claim !== 'string') throw new Error('TB entry missing claim');
+  if (d.type === 'TB') {
+    // Version 1 'command' evidence is read as claimed-command: stenographer never ran it
+    const evidence = (line.evidence as TruthEvidence[]).map((e) =>
+      d.version === 1 && e.kind === 'command' ? { ...e, kind: 'claimed-command' } : e,
+    );
     const entry: TruthTbEntry = {
-      id: line.id,
+      id: line.id as string,
       type: 'TB',
-      ts: line.ts ?? '',
-      author: line.author ?? '',
-      claim: line.claim,
-      evidence: (line.evidence as TruthEvidence[]) ?? [],
-      signedBy: line.signedBy ?? null,
-      status: line.status,
+      ts: line.ts as string,
+      author: line.author as string,
+      claim: line.claim as string,
+      evidence,
+      signedBy: (line.signedBy as string | null | undefined) ?? null,
+      status: lineStatus,
     };
-    if (Array.isArray(line.literals) && line.literals.length > 0) {
-      entry.literals = validLiterals(line.literals, line.id);
-    }
-    if (line['x-steno'] !== undefined) entry.xSteno = line['x-steno'];
+    if (Array.isArray(line.literals) && line.literals.length > 0) entry.literals = line.literals as TruthTombstonedLiteral[];
+    if (xSteno !== undefined) entry.xSteno = xSteno;
     const extra = extraKeys(line, TB_KEYS);
     if (extra) entry.extra = extra;
+    entry.source = source;
     return entry;
   }
 
-  if (typeof line.assertion !== 'string') throw new Error('UV entry missing assertion');
   const entry: TruthUvEntry = {
-    id: line.id,
+    id: line.id as string,
     type: 'UV',
-    ts: line.ts ?? '',
-    author: line.author ?? '',
-    assertion: line.assertion,
-    basis: line.basis ?? '',
-    verifyBy: (line.verifyBy as TruthVerifyBy) ?? { kind: 'ask', value: line.author ?? '' },
-    contests: line.contests ?? null,
-    status: line.status,
+    ts: line.ts as string,
+    author: line.author as string,
+    assertion: line.assertion as string,
+    basis: line.basis as string,
+    verifyBy: line.verifyBy as TruthVerifyBy,
+    contests: (line.contests as string | null | undefined) ?? null,
+    status: lineStatus,
   };
-  if (line['x-steno'] !== undefined) entry.xSteno = line['x-steno'];
+  if (xSteno !== undefined) entry.xSteno = xSteno;
   const extra = extraKeys(line, UV_KEYS);
   if (extra) entry.extra = extra;
+  entry.source = source;
   return entry;
 }
 
-export function entryToWikiLine(entry: TruthLedgerEntry): WikiEntryLine {
-  const base = {
-    id: entry.id,
-    type: entry.type,
-    ts: entry.ts,
-    author: entry.author,
+function transitionOf(d: DecodedTruthLine, lineNo: number, file?: string): TruthTransition {
+  const line = d.line;
+  const cause = line.cause as { kind: string; ref: string | null };
+  return {
+    id: line.id as string,
+    seq: d.seq!,
+    ts: line.ts as string,
+    author: line.author as string,
+    target: line.target as string,
+    status: line.status as string,
+    cause: { kind: cause.kind, ref: cause.ref },
+    line: lineNo,
+    ...(file !== undefined ? { file } : {}),
   };
+}
+
+/** What two copies of one entry must agree on, compared as JCS bytes (key order never matters). */
+function bodyKey(e: TruthLedgerEntry): string {
+  return canonicalize(
+    e.type === 'TB'
+      ? { type: e.type, author: e.author, claim: e.claim, evidence: e.evidence, signedBy: e.signedBy, literals: e.literals ?? null }
+      : { type: e.type, author: e.author, assertion: e.assertion, basis: e.basis, verifyBy: e.verifyBy, contests: e.contests },
+  );
+}
+
+/**
+ * Convert one TB or UV line (an object or its JSON text) to a typed entry,
+ * validating it as `decodeTruthLine` does and applying the admission rules
+ * that need no other line. Throws `TruthLineError` on a line a reader must
+ * refuse, or one that is not a TB or UV.
+ */
+export function wikiLineToEntry(line: WikiEntryLine | string, options: TruthReadOptions = {}): TruthLedgerEntry {
+  const text = typeof line === 'string' ? line : JSON.stringify(line);
+  const d = decodeTruthLine(text);
+  if (d.type !== 'TB' && d.type !== 'UV') throw new TruthLineError(`a ${d.type} line is not an entry (TB or UV)`);
+  const entry = entryOf(d, 1);
+  admit(entry, { conflict: null, verifiable: d.version === 2 }, options, registryOf(options));
+  return entry;
+}
+
+/**
+ * The wire line for an entry. An entry read from a stream gives back the
+ * line it was read from, never a rewrite (its `status` may have been folded
+ * from a later TRANSITION; the line's own does not change). An entry built
+ * by hand is written in the version 1 shape.
+ */
+export function entryToWikiLine(entry: TruthLedgerEntry): WikiEntryLine {
+  if (entry.source) return JSON.parse(entry.source.text) as WikiEntryLine;
+  const base = { id: entry.id, type: entry.type, ts: entry.ts, author: entry.author };
+  const status = entry.status === null ? {} : { status: entry.status };
 
   if (entry.type === 'TB') {
     const line: WikiEntryLine = {
@@ -157,7 +260,7 @@ export function entryToWikiLine(entry: TruthLedgerEntry): WikiEntryLine {
       signedBy: entry.signedBy,
       // Only present when given, so literal-free TBs keep their exact shape
       ...(entry.literals && entry.literals.length > 0 ? { literals: entry.literals } : {}),
-      status: entry.status,
+      ...status,
     };
     if (entry.xSteno !== undefined) line['x-steno'] = entry.xSteno;
     return entry.extra ? { ...entry.extra, ...line } : line;
@@ -169,58 +272,299 @@ export function entryToWikiLine(entry: TruthLedgerEntry): WikiEntryLine {
     basis: entry.basis,
     verifyBy: entry.verifyBy,
     contests: entry.contests,
-    status: entry.status,
+    ...status,
   };
   if (entry.xSteno !== undefined) line['x-steno'] = entry.xSteno;
   return entry.extra ? { ...entry.extra, ...line } : line;
 }
 
 // ---------------------------------------------------------------------------
-// Parsing & serialization
+// Reading a stream
 // ---------------------------------------------------------------------------
 
-export interface WikiParseResult {
-  /** Deduplicated entries — the LAST line for each id wins (append-only ledger). */
-  entries: TruthLedgerEntry[];
-  /** Lines that could not be parsed; the rest of the file is still usable. */
-  errors: Array<{ line: number; error: string }>;
+interface FileRead {
+  entries: Map<string, TruthLedgerEntry>;
+  conflicts: Map<string, string>;
+  transitions: TruthTransition[];
+  errors: WikiParseResult['errors'];
+  refused: boolean;
+  lines: TruthLineRecord[];
+  head: StreamHead | null;
 }
 
-/** Parse raw JSONL lines (or one blob with newlines) into ledger entries. */
-export function parseWikiLines(input: string | string[]): WikiParseResult {
-  const lines = Array.isArray(input) ? input : input.split('\n');
-  const byId = new Map<string, TruthLedgerEntry>();
+function readFile(input: string | string[], options: TruthReadOptions, file?: string): FileRead {
+  const raw = Array.isArray(input) ? input : input.split('\n');
+  const tag = file !== undefined ? { file } : {};
+  const items: Array<{ line: number; d: DecodedTruthLine | null }> = [];
   const errors: WikiParseResult['errors'] = [];
+  let v2 = false;
 
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i].trim();
-    if (raw.length === 0) continue;
+  for (let i = 0; i < raw.length; i++) {
+    const text = raw[i];
+    if (text.trim().length === 0) continue;
     try {
-      const entry = wikiLineToEntry(JSON.parse(raw) as WikiEntryLine);
-      // Later lines supersede earlier ones; re-insert to keep append order.
-      byId.delete(entry.id);
-      byId.set(entry.id, entry);
+      const d = decodeTruthLine(text);
+      if (d.version === 2) v2 = true;
+      if (d.type === 'PROPOSAL') {
+        throw new TruthLineError('a PROPOSAL line belongs in a proposals file (parseProposalLines), not a truth stream');
+      }
+      items.push({ line: i + 1, d });
     } catch (err) {
-      errors.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
+      items.push({ line: i + 1, d: null });
+      const declared = declaredVersion(text);
+      if (declared !== undefined && declared !== 1) v2 = true;
+      errors.push({ line: i + 1, error: err instanceof Error ? err.message : String(err), ...idOf(text), ...tag });
+    }
+  }
+  if (v2) {
+    // One writer's v2 stream holds only v2 lines: a version 1 line in it was not written by that writer
+    for (const item of items) {
+      if (item.d?.version !== 1) continue;
+      errors.push({
+        line: item.line,
+        error: 'a version 1 line inside a version 2 stream: the file is not one writer’s stream',
+        id: item.d.line.id as string,
+        ...tag,
+      });
+      item.d = null;
+    }
+  }
+  for (const { index, error } of checkTruthChain(items.map((i) => i.d), options.previous ?? null)) {
+    errors.push({ line: items[index].line, error, ...(items[index].d ? { id: items[index].d!.line.id as string } : {}), ...tag });
+  }
+  errors.sort((a, b) => a.line - b.line);
+
+  // A v2 stream is one unit: a refused line or a broken chain refuses all of it.
+  // A pure v1 file keeps its old per-line tolerance (it has no chain to break).
+  const refused = errors.length > 0 && v2;
+  const result: FileRead = { entries: new Map(), conflicts: new Map(), transitions: [], errors, refused, lines: [], head: null };
+  if (refused) return result;
+
+  for (const { line, d } of items) {
+    if (!d) continue;
+    result.lines.push({ line, text: d.text, version: d.version, type: d.type, id: d.line.id as string, seq: d.seq, hash: d.hash, ...tag });
+    if (d.version === 2) result.head = { seq: d.seq!, hash: d.hash! };
+    if (d.type === 'TRANSITION') {
+      result.transitions.push(transitionOf(d, line, file));
+      continue;
+    }
+    if (d.type !== 'TB' && d.type !== 'UV') continue; // ADDENDUM / RULING: causes, kept in `lines`; TRANSITIONs carry their effect
+
+    const entry = entryOf(d, line, file);
+    const prior = result.entries.get(entry.id);
+    if (!prior) {
+      result.entries.set(entry.id, entry);
+      continue;
+    }
+    if (bodyKey(prior) !== bodyKey(entry)) {
+      result.conflicts.set(entry.id, `lines ${prior.source!.line} and ${line} give ${entry.id} different content`);
+    }
+    if (d.version === 1) {
+      // Version 1 re-emitted a line to change a status: the later line wins.
+      // (A v2 stream states each entry once; its status changes are TRANSITIONs.)
+      result.entries.delete(entry.id);
+      result.entries.set(entry.id, entry);
     }
   }
 
-  return { entries: Array.from(byId.values()), errors };
+  // The fold: the highest-seq TRANSITION that targets an entry sets its status
+  const latest = new Map<string, TruthTransition>();
+  for (const t of result.transitions) {
+    const seen = latest.get(t.target);
+    if (!seen || t.seq > seen.seq) latest.set(t.target, t);
+  }
+  for (const [target, t] of latest) {
+    const entry = result.entries.get(target);
+    if (!entry) continue;
+    entry.status = t.status;
+    entry.source!.transition = { id: t.id, seq: t.seq, ts: t.ts, author: t.author, cause: t.cause };
+  }
+  return result;
 }
 
-/** Serialize entries back to JSONL lines (no trailing newline handling). */
+function registryOf(options: TruthReadOptions): TruthSignerRegistry | null {
+  return options.signers ? createSignerRegistry(options.signers) : null;
+}
+
+function listed(registry: TruthSignerRegistry, identity: string): boolean {
+  const role = registry.lookup(identity)?.role;
+  return role === 'human' || role === 'agent';
+}
+
+/** Sets `entry.inadmissible` when the reader will not take it as truth whatever its status. */
+function admit(
+  entry: TruthLedgerEntry,
+  facts: { conflict: string | null; verifiable: boolean },
+  options: TruthReadOptions,
+  registry: TruthSignerRegistry | null,
+): void {
+  const refuse = (reason: TruthInadmissible['reason'], detail: string) => {
+    entry.inadmissible = { reason, detail };
+  };
+  if (facts.conflict) return refuse('conflict', facts.conflict);
+  if (entry.type === 'TB') {
+    if (!entry.signedBy) return refuse('unsigned', `TB ${entry.id} has no signer: a backfilled TB is never truth on its own`);
+    if (!facts.verifiable && !options.admitV1Tbs) {
+      return refuse('unverifiable', `TB ${entry.id} is a version 1 line: it carries no hash, so its content can't be checked`);
+    }
+  }
+  if (registry) {
+    if (!listed(registry, entry.author)) return refuse('unverifiable', `${entry.type} ${entry.id}: author '${entry.author}' is not in the signer registry`);
+    if (entry.type === 'TB' && !listed(registry, entry.signedBy!)) {
+      return refuse('unverifiable', `TB ${entry.id}: signer '${entry.signedBy}' is not in the signer registry`);
+    }
+  }
+}
+
+function emptyResult(errors: WikiParseResult['errors']): WikiParseResult {
+  return { entries: [], errors, refused: true, transitions: [], lines: [], head: null, conflicts: [] };
+}
+
+/**
+ * Parse one truth stream (JSONL text, or its lines). Blank lines are
+ * skipped and counted in line numbers. See the module comment for the
+ * fold, fail-closed and admission rules; `result.refused` says the input
+ * was refused as a whole.
+ */
+export function parseWikiLines(input: string | string[], options: TruthReadOptions = {}): WikiParseResult {
+  const read = readFile(input, options);
+  if (read.refused) return emptyResult(read.errors);
+  const registry = registryOf(options);
+  const entries = [...read.entries.values()];
+  for (const entry of entries) {
+    admit(entry, { conflict: read.conflicts.get(entry.id) ?? null, verifiable: entry.source!.version === 2 }, options, registry);
+  }
+  return {
+    entries,
+    errors: read.errors,
+    refused: false,
+    transitions: read.transitions,
+    lines: read.lines,
+    head: read.head,
+    conflicts: [...read.conflicts.keys()].map((id) => ({ id, files: [] })),
+  };
+}
+
+/**
+ * Rank on the status lattice (TRUTH_STATUSES is in lattice order). A
+ * missing or unknown status ranks above every known one: it fails closed.
+ */
+function rank(entry: TruthLedgerEntry): number {
+  if (entry.status === null) return 4;
+  const i = (TRUTH_STATUSES[entry.type] as readonly string[]).indexOf(entry.status);
+  return i === -1 ? 5 : i;
+}
+
+/**
+ * Read several truth streams — one per writer, e.g. `wiki/<handle>.jsonl`
+ * — fold each on its own, then give each entry the most advanced status
+ * any of them reached. An id the files give different content is a
+ * conflict, not truth. If any file is refused, the merge is refused: a
+ * stream that can't be read might hold the strike that matters.
+ */
+export function parseWikiFiles(
+  files: Array<{ name: string; text: string | string[] }>,
+  options: Omit<TruthReadOptions, 'previous'> = {},
+): WikiParseResult {
+  const reads = files.map((f) => ({ name: f.name, read: readFile(f.text, { ...options, previous: null }, f.name) }));
+  const errors = reads.flatMap((r) => r.read.errors);
+  if (reads.some((r) => r.read.refused)) return emptyResult(errors);
+
+  const byId = new Map<string, Array<{ file: string; entry: TruthLedgerEntry; conflict: string | null }>>();
+  for (const { name, read } of reads) {
+    for (const entry of read.entries.values()) {
+      const list = byId.get(entry.id) ?? [];
+      list.push({ file: name, entry, conflict: read.conflicts.get(entry.id) ?? null });
+      byId.set(entry.id, list);
+    }
+  }
+
+  const registry = registryOf(options);
+  const entries: TruthLedgerEntry[] = [];
+  const conflicts: WikiParseResult['conflicts'] = [];
+  for (const [id, copies] of byId) {
+    let winner = copies[0];
+    for (const copy of copies.slice(1)) {
+      const r = rank(copy.entry);
+      const w = rank(winner.entry);
+      if (r > w || (r === w && r === 5 && (copy.entry.status as string) < (winner.entry.status as string))) winner = copy;
+    }
+    const keys = new Set(copies.map((c) => bodyKey(c.entry)));
+    const conflictFiles = [...new Set(copies.map((c) => c.file))];
+    let conflict = copies.find((c) => c.conflict)?.conflict ?? null;
+    if (keys.size > 1) {
+      conflict = `${conflictFiles.join(', ')} give ${id} different content`;
+      conflicts.push({ id, files: conflictFiles });
+    }
+    const entry = winner.entry;
+    admit(entry, { conflict, verifiable: copies.some((c) => c.entry.source!.version === 2) }, options, registry);
+    entries.push(entry);
+  }
+  return {
+    entries,
+    errors,
+    refused: false,
+    transitions: reads.flatMap((r) => r.read.transitions),
+    lines: reads.flatMap((r) => r.read.lines),
+    head: null,
+    conflicts,
+  };
+}
+
+/**
+ * The fold as a table: `{ id: { type, status, current } }` for every
+ * entry — the shape of the truth-format fixtures' `*.expected.json`.
+ */
+export function truthStatusTable(
+  entries: TruthLedgerEntry[],
+): Record<string, { type: 'TB' | 'UV'; status: string | null; current: boolean }> {
+  return Object.fromEntries(
+    entries.map((e) => [e.id, { type: e.type, status: e.status, current: classifyEntry(e) !== 'history' }]),
+  );
+}
+
+/**
+ * Serialize entries back to JSONL lines (no trailing newline). An entry
+ * read from a stream is written back exactly as read; an entry built by
+ * hand in the version 1 shape. A stream's TRANSITION, ADDENDUM and RULING
+ * lines are not entries: to write a whole stream back, use
+ * `result.lines.map((l) => l.text)` (or `writeWikiFile(path, result)`).
+ */
 export function serializeWikiEntries(entries: TruthLedgerEntry[]): string[] {
-  return entries.map((e) => JSON.stringify(entryToWikiLine(e)));
+  return entries.map((e) => (e.source ? e.source.text : JSON.stringify(entryToWikiLine(e))));
 }
 
-/** Read and parse a wiki JSONL file. */
-export function readWikiFile(path: string): WikiParseResult {
-  return parseWikiLines(readFileSync(path, 'utf8'));
+/** Read and parse a truth stream file. */
+export function readWikiFile(path: string, options: TruthReadOptions = {}): WikiParseResult {
+  return parseWikiLines(readFileSync(path, 'utf8'), options);
 }
 
-/** Write entries to a wiki JSONL file (one entry per line). */
-export function writeWikiFile(path: string, entries: TruthLedgerEntry[]): void {
-  writeFileSync(path, serializeWikiEntries(entries).map((l) => l + '\n').join(''));
+/**
+ * Write entries (see `serializeWikiEntries`), or a parsed stream's lines
+ * verbatim, to a file — one line each. Truth streams are stenographer's to
+ * write (one writer per file); this is for copies and fixtures.
+ */
+export function writeWikiFile(path: string, content: TruthLedgerEntry[] | WikiParseResult): void {
+  const lines = Array.isArray(content) ? serializeWikiEntries(content) : content.lines.map((l) => l.text);
+  writeFileSync(path, lines.map((l) => l + '\n').join(''));
+}
+
+function declaredVersion(text: string): unknown {
+  try {
+    const parsed = JSON.parse(text) as { schemaVersion?: unknown } | null;
+    return parsed && typeof parsed === 'object' ? parsed.schemaVersion : undefined;
+  } catch {
+    return undefined; // unreadable: it refuses the file only if the file is a v2 stream
+  }
+}
+
+function idOf(text: string): { id?: string } {
+  try {
+    const id = (JSON.parse(text) as { id?: unknown } | null)?.id;
+    return typeof id === 'string' ? { id } : {};
+  } catch {
+    return {};
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,24 +573,30 @@ export function writeWikiFile(path: string, entries: TruthLedgerEntry[]): void {
 
 /**
  * Classify a single entry per the §7 consumption rules. Fails closed:
- * anything but an active/contested TB or an open UV — including a status
- * this package does not know — is history.
+ * anything but an active/contested, signed, admissible TB or an open,
+ * admissible UV — including a status this package does not know, or none —
+ * is history.
  */
 export function classifyEntry(entry: TruthLedgerEntry): ConsumptionAction {
+  if (entry.inadmissible) return 'history';
   if (entry.type === 'TB') {
+    if (!entry.signedBy) return 'history'; // unsigned: never truth on its own
     if (entry.status === 'active') return 'ground-truth';
     if (entry.status === 'contested') return 'contested';
-    return 'history'; // overridden, struck, or unknown
+    return 'history'; // overridden, struck, unknown or missing
   }
   // UV: open is a flag; verified minted a TB elsewhere, refuted is dead —
-  // both are history here, as is any unknown status.
+  // both are history here, as are struck and any unknown or missing status.
   return entry.status === 'open' ? 'flag' : 'history';
 }
 
 /**
- * Partition ledger entries into the selection compaction consumes.
- * Contested TBs are paired with their live contesting UVs so both carry
- * through compaction — the dispute is never resolved silently.
+ * Partition ledger entries into the selection compaction consumes. An open
+ * UV that contests a TB is attached to that TB whatever the TB's recorded
+ * status: a current TB with an open contest is carried as contested, with
+ * its contesting UVs — the dispute is never resolved silently. A UV
+ * contesting a TB that is not current truth stays in `unverified` (and
+ * renders with `contests <id>`).
  */
 export function selectCurrentTruth(entries: TruthLedgerEntry[]): TruthSelection {
   const selection: TruthSelection = {
@@ -258,7 +608,7 @@ export function selectCurrentTruth(entries: TruthLedgerEntry[]): TruthSelection 
 
   const openContestsByTb = new Map<string, TruthUvEntry[]>();
   for (const entry of entries) {
-    if (entry.type === 'UV' && entry.status === 'open' && entry.contests) {
+    if (entry.type === 'UV' && entry.contests && classifyEntry(entry) === 'flag') {
       const list = openContestsByTb.get(entry.contests) ?? [];
       list.push(entry);
       openContestsByTb.set(entry.contests, list);
@@ -266,7 +616,12 @@ export function selectCurrentTruth(entries: TruthLedgerEntry[]): TruthSelection 
   }
 
   for (const entry of entries) {
-    switch (classifyEntry(entry)) {
+    const action = classifyEntry(entry);
+    if (action === 'ground-truth' && openContestsByTb.has(entry.id)) {
+      selection.contested.push({ tombstone: entry as TruthTbEntry, contestedBy: openContestsByTb.get(entry.id)! });
+      continue;
+    }
+    switch (action) {
       case 'ground-truth':
         selection.groundTruth.push(entry as TruthTbEntry);
         break;
