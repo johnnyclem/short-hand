@@ -96,6 +96,7 @@
   "sideEffects": false,
   "devDependencies": {
     "@types/node": "20.19.39",
+    "fast-check": "^4.10.2",
     "typescript": "^5.8.3",
     "vitest": "^3.1.1"
   }

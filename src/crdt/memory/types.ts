@@ -134,6 +134,8 @@ export type MemoryLayer = 'L0' | 'L1' | 'L2' | 'L3' | 'L4';
 
 /** Complete serialized state of an agent's memory across all layers. */
 export interface AgentMemoryState {
+  /** Wire-format version (absent on pre-1.0 states). */
+  schemaVersion?: number;
   /** Agent that owns this memory state. */
   agentId: AgentId;
   /** Vector clock reflecting this agent's causal knowledge. */
@@ -150,7 +152,8 @@ export interface AgentMemoryState {
   l0: RGAState<L0Message>;
   /**
    * Agential memory entries (interpret before inject). Merged as a union by
-   * engram id. Optional so states written without engrams still load.
+   * engram id minus removal tombstones. Optional so states written without
+   * engrams still load.
    */
   activeEngrams?: SerializedActiveEngramStore;
 }

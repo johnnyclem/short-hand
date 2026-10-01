@@ -431,9 +431,12 @@ export interface ActivationPolicy {
    */
   expiresAt?: number;
   /**
-   * When set, the output of this engram's interpreter shadows (overrides)
-   * the output of the named engram ID. This is the correction mechanism —
-   * a correction is just an ActiveEngram whose policy shadows another.
+   * When set, this engram corrects the named engram: the named engram no
+   * longer surfaces anywhere, and this engram's interpretation takes its
+   * slot whenever either of them would have surfaced. This is the
+   * correction mechanism — a correction is just an ActiveEngram whose policy
+   * shadows another. Only takes effect between engrams of the same
+   * `origin`, and only while this engram has not expired.
    */
   shadowsEngramId?: string;
 }
@@ -472,6 +475,13 @@ export interface ActiveEngram {
   retrievalCount: number;
   /** ID of the engram this was derived from, if any (for provenance chains). */
   derivedFrom?: string;
+  /**
+   * Agent (store) that created this engram. Stamped by the store; a
+   * correction (`shadowsEngramId`) only applies within one origin. Absent
+   * on engrams serialized before 1.0, which take the merging peer's id
+   * (`mergeFrom(state, { from })`) or, on restore, the store's own origin.
+   */
+  origin?: string;
 }
 
 /** The output of an interpret() call — contextualized form ready for injection. */

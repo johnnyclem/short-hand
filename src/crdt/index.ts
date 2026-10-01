@@ -36,8 +36,11 @@ export type {
   CRDT as CRDTInterface,
 } from './types.js';
 
+// Wire format
+export { CRDT_SCHEMA_VERSION } from './wire.js';
+
 // LWW-Register (L4)
-export { LWWRegister } from './lww-register.js';
+export { LWWRegister, compareLWWEntries, isLWWTombstone } from './lww-register.js';
 export type { LWWEntry, LWWRegisterState } from './lww-register.js';
 
 // OR-Set (L3)
@@ -46,7 +49,7 @@ export type { ORSetState } from './or-set.js';
 
 // G-Set (L2)
 export { GSet, defaultMergeFn } from './g-set.js';
-export type { GSetEntry, GSetState, GSetMergeFn } from './g-set.js';
+export type { GSetEntry, GSetState, GSetMergeFn, GSetOptions } from './g-set.js';
 
 // RGA (L0/L1)
 export { RGA } from './rga.js';
@@ -54,6 +57,7 @@ export type { RGANodeId, RGANode, RGAState } from './rga.js';
 
 // Memory layer system
 export { AgentMemory } from './memory/agent-memory.js';
+export type { MemoryLayerChanges } from './memory/agent-memory.js';
 export { MemoryMerge } from './memory/memory-merge.js';
 export type { MergeReport, MergeOptions } from './memory/memory-merge.js';
 export { ConflictDetector, type SemanticConflict, type ConflictSeverity } from './memory/conflict-detector.js';
@@ -74,4 +78,6 @@ export { ActiveEngramStore } from './active-engram-store.js';
 export type {
   SerializedActiveEngramStore,
   ActiveEngramStoreOptions,
+  EngramMergeOptions,
+  EngramMergeReport,
 } from './active-engram-store.js';
