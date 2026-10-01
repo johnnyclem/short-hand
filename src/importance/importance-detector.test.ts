@@ -158,3 +158,25 @@ describe('ImportanceDetector — carried scenarios', () => {
     expect(score.messageId).toBe('iso');
   });
 });
+
+describe('ImportanceDetector cost (SH-29)', () => {
+  // Bound: scoring is linear in the number of messages — 16000 chained
+  // references take under 8x the time of 4000 (measured ~4-5x; the
+  // per-message sort of every reference score made it ~14x and growing).
+  it('scores a long chain of references in near-linear time', () => {
+    const run = (n: number) => {
+      const d = new ImportanceDetector();
+      const start = performance.now();
+      for (let i = 0; i < n; i++) {
+        d.addMessage({ id: `m${i}`, role: 'user', content: `Then \`ent${i}\` follows \`ent${i - 1}\`.`, timestamp: i });
+      }
+      d.recomputeScores();
+      return performance.now() - start;
+    };
+    run(500); // warm up
+    // Best of two runs each, to keep GC pauses out of the ratio
+    const small = Math.min(run(4_000), run(4_000));
+    const large = Math.min(run(16_000), run(16_000));
+    expect(large).toBeLessThan(Math.max(small * 8, 250));
+  });
+});
