@@ -14,7 +14,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { ActiveEngramStore } from './active-engram-store.js';
-import { AgentMemory } from './agent-memory.js';
+import { AgentMemory } from './memory/agent-memory.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -420,7 +420,7 @@ describe('AgentMemory — ActiveEngramStore integration', () => {
     });
 
     const serialized = memory.serialize();
-    const restored = AgentMemory.deserialize(serialized);
+    const restored = AgentMemory.from(serialized);
 
     const engram = restored.activeEngrams.get(id)!;
     expect(engram).toBeDefined();

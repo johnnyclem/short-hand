@@ -22,21 +22,3 @@ export function estimateTokens(text: string): number {
 export function generateId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
 }
-
-/**
- * Monotonically increasing Lamport timestamp.
- */
-let lamportClock = 0;
-
-export function nextLamport(): number {
-  return ++lamportClock;
-}
-
-export function updateLamport(received: number): void {
-  lamportClock = Math.max(lamportClock, received) + 1;
-}
-
-/** Reset for testing. */
-export function resetLamport(): void {
-  lamportClock = 0;
-}

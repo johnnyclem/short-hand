@@ -1,105 +1,383 @@
 /**
- * Truth-ledger interop types (stenographer TB/UV v2, Option B seam).
+ * Truth Ledger Interop — Types
  *
- * Short-hand consumes stenographer's append-only JSONL export and emits
- * candidate invariants back as proposal drafts. Format-level contract only —
- * no code dependency on stenographer, no shared schema module.
+ * Consumer-side types for stenographer's TB/UV asserted-truth ledger.
+ * @shorthand/core interoperates at the JSONL seam: signed TB/UV entries
+ * arrive as append-only JSONL wiki lines, and compaction may emit
+ * candidate invariants back as PROPOSAL lines — never as signed truth.
+ * Format-level contract only — no code dependency on stenographer.
  *
- * The one rule that must survive any refactor here: every consumed entry
- * carries two axes — provenance (where it came from) and confidence type
- * (TB = provable, UV = believed-but-unverified). Collapsing both into a
- * single "invariant" bucket is a regression, not a simplification.
+ * The design principle that must survive any refactor: TWO AXES, NOT ONE.
+ * Every entry carries provenance (where did this come from) and confidence
+ * type (how much should you trust it). Collapsing TB and UV back into a
+ * single "invariant" bucket is a regression.
+ *
+ * Fail closed: a status this package does not know is kept verbatim (it
+ * round-trips) but never counts as current truth.
  */
 
 // ---------------------------------------------------------------------------
-// Wire format — one line of stenographer's exported JSONL
+// Confidence types & statuses
 // ---------------------------------------------------------------------------
 
-/** Confidence type: the second axis. */
-export type TruthConfidence = 'TB' | 'UV';
+/**
+ * The confidence axis: TB (asserted tombstone, evidence-backed) vs UV
+ * (unverified assertion — "there be dragons").
+ */
+export type TruthConfidence = 'tb' | 'uv';
 
-export type TbStatus = 'active' | 'contested' | 'overridden';
+/** TB statuses this package understands. `struck` = ruled inadmissible. */
+export type TbStatus = 'active' | 'contested' | 'overridden' | 'struck';
 export type UvStatus = 'open' | 'verified' | 'refuted';
 
 /**
- * Structural mirror of stenographer's `WikiEntryLine`. Fields short-hand
- * does not consume (embeddings, links) travel under `x-steno` and are
- * carried through untouched.
+ * A status string outside the known vocabulary (a newer stenographer, a
+ * typo, a hand edit). Kept verbatim so the line round-trips; always
+ * classified as history (excluded from current truth).
  */
-export interface TruthLedgerLine {
+export type UnknownStatus = string & { readonly __unknownStatus?: never };
+
+// ---------------------------------------------------------------------------
+// Evidence & verification hints (mirrors stenographer src/truth/types.ts)
+// ---------------------------------------------------------------------------
+
+/** A piece of evidence attached to a TB. */
+export interface TruthEvidence {
+  kind: 'commit' | 'file' | 'test' | 'command' | 'wiki' | 'message';
+  /** Commit sha, file/line, test name, command line, wiki entry id, or message id. */
+  ref: string;
+  /** What the evidence shows (e.g. captured command output). */
+  detail?: string;
+}
+
+/**
+ * A dead literal a tombstone declares (§12) — what a real-time objection can
+ * cite. `subject` names the identifier a bare value belongs to; `current` is
+ * the replacement, if any. Mirrors stenographer's `TombstonedLiteralSchema`.
+ */
+export interface TruthTombstonedLiteral {
+  /** The dead value or identifier, e.g. "30" or "legacyRateLimit". */
+  dead: string;
+  /** The identifier the value belongs to, e.g. "LOG_BUDGET". */
+  subject?: string;
+  /** What replaced it, if anything. */
+  current?: string;
+}
+
+/** Machine-actionable verification hint carried by every UV. */
+export interface TruthVerifyBy {
+  kind: 'command' | 'inspect' | 'ask' | 'observe';
+  /** The command to run, file/symbol to read, person to ask, or condition to observe. */
+  value: string;
+  /** For `inspect`: what to look for. */
+  detail?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Wiki JSONL line — the wire format (one entry per line)
+// ---------------------------------------------------------------------------
+
+/**
+ * One line of the append-only JSONL truth ledger, exactly as stenographer's
+ * `export_wiki_entries` emits it. Stenographer-specific fields travel under
+ * the namespaced `x-steno` key, which short-hand preserves opaquely so the
+ * round-trip invariant `serialize(parse(line)) == line` holds field-for-field.
+ */
+export interface WikiEntryLine {
+  /** Any other key (e.g. v2 chain fields) — carried through verbatim. */
+  [key: string]: unknown;
   id: string;
-  type: TruthConfidence;
+  type: 'TB' | 'UV';
   ts: string;
   author: string;
-  status: string;
   // TB fields
   claim?: string;
   evidence?: unknown[];
   signedBy?: string | null;
+  /** Matchable dead literals (§12). Absent when the TB declares none. */
+  literals?: unknown[];
   // UV fields
   assertion?: string;
   basis?: string;
   verifyBy?: unknown;
   contests?: string | null;
-  /** Stenographer-namespaced extras; opaque to short-hand. */
+  status: string;
+  /** Stenographer-namespaced extras; preserved opaquely, never interpreted. */
   'x-steno'?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
-// Consumption view — the §7 rules, made structural
+// Parsed entries — the consumer view
 // ---------------------------------------------------------------------------
 
-/** An entry short-hand may cite as ground truth (active or contested TB). */
-export interface CitableTruth {
-  entry: TruthLedgerLine;
-  /** Open UVs disputing this TB. Non-empty exactly when status is contested.
-   *  Both sides ride through compaction together — never resolve silently. */
-  contestedBy: TruthLedgerLine[];
+/** A signed, evidence-backed tombstone: ground truth once active. */
+export interface TruthTbEntry {
+  id: string;
+  type: 'TB';
+  /** ISO timestamp the entry was asserted. */
+  ts: string;
+  author: string;
+  /** What is dead and what replaces it (if anything). */
+  claim: string;
+  evidence: TruthEvidence[];
+  /** The asserting author (distinct from `author` when an agent drafted and a human signed). Null = unsigned. */
+  signedBy: string | null;
+  /** Known status, or an unknown one kept verbatim (never current truth). */
+  status: TbStatus | UnknownStatus;
+  /** Matchable dead literals (§12). Only present when the TB declares some. */
+  literals?: TruthTombstonedLiteral[];
+  /** Opaque stenographer namespace, preserved for round-tripping. */
+  xSteno?: Record<string, unknown>;
+  /** Top-level keys this package does not interpret, preserved for round-tripping. */
+  extra?: Record<string, unknown>;
 }
 
-/** The consumption-rule buckets for one synced ledger snapshot. */
-export interface TruthLedgerView {
-  /** Active + contested TBs, in ledger order. Ground truth (with asterisks). */
-  citable: CitableTruth[];
-  /** Open UVs not attached to a contested TB. Flag, don't block — these must
-   *  never render as proven. */
-  flags: TruthLedgerLine[];
-  /** Overridden TBs, refuted UVs, verified UVs (superseded by their minted
-   *  TB). History: excluded from current truth, never citable. */
-  displaced: TruthLedgerLine[];
+/** An unverified assertion: believed true, stated before verification exists. */
+export interface TruthUvEntry {
+  id: string;
+  type: 'UV';
+  ts: string;
+  author: string;
+  /** The belief, in full sentences. */
+  assertion: string;
+  /** Why the author believes it. */
+  basis: string;
+  verifyBy: TruthVerifyBy;
+  /** Id of a TB this UV disputes — puts that TB into `contested`. */
+  contests: string | null;
+  /** Known status, or an unknown one kept verbatim (never current truth). */
+  status: UvStatus | UnknownStatus;
+  xSteno?: Record<string, unknown>;
+  /** Top-level keys this package does not interpret, preserved for round-tripping. */
+  extra?: Record<string, unknown>;
 }
 
+export type TruthLedgerEntry = TruthTbEntry | TruthUvEntry;
+
+// ---------------------------------------------------------------------------
+// Consumption rules (§7) — the contract downstream consumers must not break
+// ---------------------------------------------------------------------------
+
+/** How a consumer (compaction included) must treat an entry. */
+export type ConsumptionAction =
+  /** Active TB — ground truth. Compact it, rely on it, cite it. */
+  | 'ground-truth'
+  /** Contested TB — ground truth with a visible asterisk: carry the TB and its contesting UVs. */
+  | 'contested'
+  /** Open UV — flag, don't block. Never let it read as proven. */
+  | 'flag'
+  /** Refuted or verified UV, overridden or struck TB, or any unknown status — history, never citable. */
+  | 'history';
+
+/** Shipped verbatim from stenographer so consumers inherit identical rules. */
+export const CONSUMPTION_RULES = `Consumption rules by confidence type:
+- Active TB: treat as ground truth. A reviewer may block on it; a code agent may rely on it.
+- Contested TB: ground truth with a visible asterisk — cite both the TB and the contesting UV.
+- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task would settle the UV cheaply, do so via resolve_uv.
+- Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
+
+/**
+ * Current truth partitioned by consumption action. This is what compaction
+ * consumes: `groundTruth` and `contested` survive every compaction level,
+ * `unverified` survives with the dragon marker attached, `history` never
+ * enters the compacted state (and displaces any cached copy on sync).
+ */
+export interface TruthSelection {
+  /** Active TBs — ground truth. */
+  groundTruth: TruthTbEntry[];
+  /** Contested TBs paired with their live contesting UVs — carry both. */
+  contested: Array<{ tombstone: TruthTbEntry; contestedBy: TruthUvEntry[] }>;
+  /**
+   * Open UVs — flagged, never presented as proven. Contesting UVs appear
+   * here as well as beside their contested TB; renderers show each open UV
+   * once (beside its TB when the TB is in `contested`, standalone otherwise).
+   */
+  unverified: TruthUvEntry[];
+  /** Overridden/struck TBs, refuted/verified UVs, unknown statuses — excluded from current truth. */
+  history: TruthLedgerEntry[];
+}
+
+// ---------------------------------------------------------------------------
+// Compacted truth — how a selection rides a CompactedState
+// ---------------------------------------------------------------------------
+
+/**
+ * The truth section attached to a compacted state. It is rebuilt from the
+ * current ledger selection on every compaction round — never carried
+ * forward as text — so an entry that was overridden or refuted since the
+ * last sync is displaced instead of surviving as a stale cache.
+ */
+export interface CompactedTruth {
+  /** ISO timestamp of the sync that produced this section. */
+  syncedAt: string;
+  /** Active TBs — compacted as ground truth. */
+  groundTruth: TruthTbEntry[];
+  /** Contested TBs with their contesting UVs — both carried, dispute visible. */
+  contested: Array<{ tombstone: TruthTbEntry; contestedBy: TruthUvEntry[] }>;
+  /** Open UVs — carried with the unverified marker, never as proven fact. */
+  unverified: TruthUvEntry[];
+  /** How many ledger entries were considered (including excluded history). */
+  sourceEntryCount: number;
+}
+
+/** What `CompactionEngine.syncTruthLedger` returns. */
 export interface TruthSyncResult {
-  view: TruthLedgerView;
-  /** L4 invariants removed because their backing ledger entry was displaced. */
+  /** The current-truth selection the engine now renders first in every frame. */
+  selection: TruthSelection;
+  /** L4 invariants removed because their backing ledger entry is no longer ground truth. */
   displacedInvariantKeys: string[];
   /** Lines that failed to parse; the rest of the sync proceeds. */
   errors: Array<{ line: number; error: string }>;
 }
 
 // ---------------------------------------------------------------------------
-// Export direction — candidate invariants as proposal drafts
+// Authorship — no anonymous write path
 // ---------------------------------------------------------------------------
 
 /**
- * One line of the proposal-draft JSONL short-hand emits for stenographer.
- * Stenographer files each as a PROPOSAL — short-hand has no write path to
- * truth itself, and drafts never carry an author (the intake supplies its
- * own detector identity; a proposal nobody signs stays a proposal forever).
+ * Identities that cannot stand behind anything. Proposal emission carrying
+ * one is rejected at the schema level — mirrors stenographer's floor.
  */
-export interface ProposalDraftLine {
-  kind: 'tombstone' | 'uv';
-  /** The full TB or UV body being proposed, per stenographer's schema. */
-  draft: Record<string, unknown>;
+const ANONYMOUS_IDENTITIES = new Set([
+  '',
+  'system',
+  'assistant',
+  'agent',
+  'ai',
+  'bot',
+  'anonymous',
+  'unknown',
+  'user',
+  'human',
+  'admin',
+  'null',
+  'none',
+  'me',
+]);
+
+export function isAnonymousIdentity(identity: string): boolean {
+  return ANONYMOUS_IDENTITIES.has(identity.trim().toLowerCase());
+}
+
+/** Throws unless `author` is a specific, accountable identity. */
+export function assertAccountableAuthor(author: string): void {
+  if (isAnonymousIdentity(author)) {
+    throw new Error(
+      `anonymous or generic identities cannot write toward the truth ledger ` +
+        `(got ${JSON.stringify(author)}) — use a registered human handle or agent identity`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// L4 projection marker
+// ---------------------------------------------------------------------------
+
+/**
+ * Prefix marking an invariant as projected from a ledger entry
+ * (`Invariant.sourceMessage` / `TruthInvariantRecord.key`). It is the
+ * displacement hook: a projected invariant whose entry is no longer ground
+ * truth is removed on the next sync, and proposal export skips it.
+ */
+export const TRUTH_SOURCE_PREFIX = 'truth:';
+
+// ---------------------------------------------------------------------------
+// Outbound PROPOSAL lines — the only write path @shorthand/core has
+// ---------------------------------------------------------------------------
+
+/** What triggered a proposal (suite PROPOSAL envelope, `signal.source`). */
+export type ProposalSignalSource = 'compaction-candidate' | 'agent' | `detector:${string}`;
+
+/** Fields every PROPOSAL line carries (suite PROPOSAL envelope, schemaVersion 2). */
+interface ProposalEnvelope {
+  schemaVersion: 2;
+  type: 'PROPOSAL';
+  /** ULID — sortable, unique. */
+  id: string;
+  ts: string;
+  /** Accountable author — anonymous identities are rejected. */
+  author: string;
+  /** Dedupe key — the entity, invariant or message this proposal targets. */
+  targetRef: string | null;
+  /** What triggered the proposal. */
   signal: {
-    source: 'compaction-candidate';
+    source: ProposalSignalSource;
     detail?: string;
   };
-  /** Dedupe key so re-exports don't pile up duplicate open proposals. */
-  targetRef?: string;
-  /** Where the candidate came from, when short-hand knows. */
+  /** Agent session lineage, for provenance-independence checks downstream. */
+  agentSessionId?: string | null;
+  /** The message the candidate came from, when known. */
   provenance?: { kind: 'sourceMessageId'; ref: string };
 }
 
-/** Prefix marking an L4 invariant as projected from a ledger entry. */
-export const TRUTH_SOURCE_PREFIX = 'truth:';
+/** The UV body a `kind: 'uv'` proposal drafts. */
+export interface UvProposalDraft {
+  assertion: string;
+  basis: string;
+  verifyBy: TruthVerifyBy;
+}
+
+/** The TB body a `kind: 'tb'` proposal drafts — always unsigned. */
+export interface TbProposalDraft {
+  claim: string;
+  evidence: TruthEvidence[];
+  signedBy: null;
+}
+
+/** A candidate unverified assertion. */
+export interface UvProposalLine extends ProposalEnvelope {
+  kind: 'uv';
+  draft: UvProposalDraft;
+}
+
+/** A candidate tombstone. Nothing becomes truth until a named person signs it. */
+export interface TbProposalLine extends ProposalEnvelope {
+  kind: 'tb';
+  draft: TbProposalDraft;
+}
+
+/**
+ * One PROPOSAL line, in the suite's single envelope. Stenographer files it
+ * as a PROPOSAL; nothing becomes truth until a named author signs it on
+ * the stenographer side.
+ */
+export type ProposalLine = UvProposalLine | TbProposalLine;
+
+/** @deprecated Use `UvProposalLine` (or `ProposalLine`). Kept for smallchat's re-export. */
+export type InvariantProposalLine = UvProposalLine;
+
+// ---------------------------------------------------------------------------
+// ULID (Crockford base32, time-prefixed) — no new dependency
+// ---------------------------------------------------------------------------
+
+const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+let lastTime = 0;
+let lastRandom: number[] = [];
+
+export function ulid(now: number = Date.now()): string {
+  let time = '';
+  let t = now;
+  for (let i = 0; i < 10; i++) {
+    time = B32[t % 32] + time;
+    t = Math.floor(t / 32);
+  }
+
+  let rand: number[];
+  if (now === lastTime) {
+    // Monotonic within the same millisecond: increment the random part
+    rand = [...lastRandom];
+    for (let i = rand.length - 1; i >= 0; i--) {
+      if (rand[i] < 31) {
+        rand[i]++;
+        break;
+      }
+      rand[i] = 0;
+    }
+  } else {
+    rand = Array.from({ length: 16 }, () => Math.floor(Math.random() * 32));
+  }
+  lastTime = now;
+  lastRandom = rand;
+
+  return time + rand.map((v) => B32[v]).join('');
+}

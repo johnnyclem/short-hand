@@ -1,8 +1,14 @@
 /**
- * short-hand
+ * @shorthand/core
  *
  * Progressive context compaction for LLMs.
  * Old computer science for new constraints.
+ *
+ * The root barrel re-exports every runtime module. Each module is also
+ * importable on its own subpath: `@shorthand/core/compaction`, `/crdt`,
+ * `/importance`, `/truth`, `/wiki`, `/ingestion`, `/interpreter`,
+ * `/verification`. The context-shift benchmark is a dev tool and lives
+ * only on `@shorthand/core/benchmark`.
  */
 
 // Core types
@@ -10,7 +16,6 @@ export type {
   ConversationMessage,
   MessageRole,
   CompactedState,
-  CompactionLevel,
   CompactionConfig,
   Compactor,
   CompactorTier,
@@ -25,8 +30,6 @@ export type {
   Decision,
   TopicSummary,
   Invariant,
-  ImportanceScore,
-  ImportanceWeights,
   VerificationResult,
   AgentProfile,
   Source,
@@ -40,120 +43,117 @@ export type {
 } from './types.js';
 
 export {
-  CompactionLevel as CompactionLevelEnum,
+  CompactionLevel,
   DEFAULT_COMPACTION_CONFIG,
-  DEFAULT_IMPORTANCE_WEIGHTS,
   DEFAULT_INGESTION_CONFIG,
   DEFAULT_WIKI_RENDER_CONFIG,
+  normalizeTimestamp,
 } from './types.js';
 
-// Compaction engine
-export { CompactionEngine } from './compaction/compaction-engine.js';
-export { RegexCompactor } from './compaction/regex-compactor.js';
-
-// Importance detection
-export { ImportanceDetector } from './importance/importance-detector.js';
-
-// CRDT primitives
-export { LWWRegister } from './crdt/lww-register.js';
-export { ORSet } from './crdt/or-set.js';
-export { GSet } from './crdt/g-set.js';
-export { AgentMemory } from './crdt/agent-memory.js';
-export type { SerializedAgentMemory } from './crdt/agent-memory.js';
-export { ActiveEngramStore } from './crdt/active-engram-store.js';
+// Compaction — LSM pipeline (CompactionEngine, RegexCompactor) and
+// snapshot pipeline (DefaultCompactor + verification strategies)
+export {
+  CompactionEngine,
+  RegexCompactor,
+  DefaultCompactor,
+  estimateConversationTokens,
+  extractEntities,
+  extractDecisions,
+  detectTombstones,
+  DefaultQuizGenerator,
+  DefaultQuizEvaluator,
+  tokenOverlapScore,
+  runRecallTest,
+  correctionPropagation,
+  entityProvenance,
+  decisionCompleteness,
+  tombstoneConsistency,
+  temporalOrdering,
+  BUILTIN_INVARIANTS,
+  checkInvariants,
+  tokenize,
+  shannonEntropy,
+  totalInformationBits,
+  computeEntropyMetrics,
+  computeRateDistortion,
+  measureEntityRetention,
+  analyzeInformationTheoretic,
+  VerificationHarness,
+  DEFAULT_VERIFICATION_CONFIG,
+} from './compaction/index.js';
 export type {
-  SerializedActiveEngramStore,
-  ActiveEngramStoreOptions,
-} from './crdt/active-engram-store.js';
+  CompactedSnapshot,
+  CompactionInvariant,
+  BuiltinInvariantCategory,
+  SnapshotLevel,
+  CompactionVerificationConfig,
+  SnapshotCompactor,
+  ConversationHistory,
+  SnapshotDecision,
+  EntityCorrection,
+  EntityRetention,
+  EntropyMetrics,
+  ExtractedEntity,
+  InformationTheoreticResult,
+  InvariantCheckResult,
+  InvariantViolation,
+  QuizEvaluator,
+  QuizGenerator,
+  RateDistortionMetrics,
+  RecallAnswer,
+  RecallQuestion,
+  RecallTestResult,
+  SnapshotVerificationResult,
+} from './compaction/index.js';
+
+// CRDTs + agential memory
+export * from './crdt/index.js';
+
+// Importance detection — compaction's extractEntities keeps the bare name;
+// the importance extractor is re-exported as extractImportanceEntities.
+export {
+  ImportanceDetector,
+  EntityGraph,
+  computeStateDelta,
+  extractEntities as extractImportanceEntities,
+  extractRelations,
+  TrajectoryTracker,
+  RunningStats,
+  cosineSimilarity,
+  cosineDistance,
+  ReferenceGraph,
+  DEFAULT_IMPORTANCE_CONFIG,
+} from './importance/index.js';
+export type {
+  EntityNode,
+  EntityRelation,
+  StateDelta,
+  MessageReference,
+  ReferenceScore,
+  TrajectoryPoint,
+  ImportanceScore,
+  ImportanceDetectorConfig,
+  SignalWeights,
+} from './importance/index.js';
+
+// Truth-ledger interop (stenographer TB/UV, JSONL seam)
+export * from './truth/index.js';
 
 // Interpreter (bounded LM step at retrieval time)
-export type {
-  Interpreter,
-  InterpreterTier,
-  InterpretInput,
-  InterpretOptions,
-  InterpreterLogger,
-  InterpreterBudgetReason,
-} from './interpreter/index.js';
-export {
-  InterpreterBudgetError,
-  InterpreterUnavailableError,
-  silentLogger,
-  isFallbackEligible,
-  RegexInterpreter,
-  resolveTemplate,
-  HostInterpreter,
-  LocalInterpreter,
-  withFallback,
-} from './interpreter/index.js';
-export type {
-  HostInterpreterOptions,
-  AnthropicLikeClient,
-  AnthropicMessageRequest,
-  AnthropicMessageResponse,
-  LocalInterpreterOptions,
-  WithFallbackOptions,
-} from './interpreter/index.js';
+export * from './interpreter/index.js';
 
-// Context-shift benchmark
-export {
-  ContextShiftBenchmark,
-  echoAnswerer,
-  wilson95,
-  KeywordJudge,
-  LMJudge,
-  STARTER_FIXTURES,
-} from './benchmark/index.js';
-export type {
-  BenchmarkFixture,
-  ShiftType,
-  ArmResult,
-  FixtureResult,
-  BenchmarkAggregate,
-  BenchmarkReport,
-  Answerer,
-  AnswererArgs,
-  ContextShiftBenchmarkOptions,
-  RunOptions,
-  Judge,
-  JudgeArgs,
-  LMJudgeOptions,
-} from './benchmark/index.js';
-
-// Verification
-export { InvariantChecker } from './verification/invariant-checker.js';
-export { RecallTester } from './verification/recall-tester.js';
+// Verification of LSM compacted state
+export * from './verification/index.js';
 
 // Embedding (stub)
 export { StubEmbedder } from './embedding/index.js';
 export type { Embedder, EmbeddingResult } from './embedding/index.js';
 
 // Source ingestion
-export { SourceIngester } from './ingestion/source-ingester.js';
+export * from './ingestion/index.js';
 
 // Wiki rendering
-export { WikiRenderer } from './wiki/wiki-renderer.js';
-
-// Truth-ledger interop (stenographer TB/UV v2, JSONL seam)
-export type {
-  TruthConfidence,
-  TruthLedgerLine,
-  CitableTruth,
-  TruthLedgerView,
-  TruthSyncResult,
-  ProposalDraftLine,
-} from './truth/index.js';
-export {
-  TRUTH_SOURCE_PREFIX,
-  parseTruthLedgerJsonl,
-  buildTruthLedgerView,
-  renderTruthSection,
-  citableToInvariant,
-  displaceStaleInvariants,
-  invariantsToProposalDrafts,
-  tombstonesToProposalDrafts,
-  exportProposalDrafts,
-} from './truth/index.js';
+export * from './wiki/index.js';
 
 // Utilities
 export { estimateTokens, generateId } from './utils.js';

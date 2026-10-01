@@ -211,4 +211,17 @@ describe('RegexCompactor', () => {
     expect(state.tombstones.some((t) => t.supersededContent === '')).toBe(true);
     expect(state.l1_compacted.map((e) => e.originalMessageId)).toEqual(['1', '2']);
   });
+
+  it('accepts ISO 8601 message timestamps and stores epoch milliseconds', async () => {
+    const state = await compactor.compact(
+      [
+        { id: '1', role: 'user', content: "Let's use PostgreSQL.", timestamp: '2026-03-01T10:00:00.000Z' },
+        { id: '2', role: 'user', content: 'Actually, switch PostgreSQL to SQLite.', timestamp: '2026-03-01T10:05:00.000Z' },
+      ],
+      CompactionLevel.L1_COMPACTED,
+    );
+
+    const tombstone = state.tombstones.find((t) => t.correctedValue === 'SQLite');
+    expect(tombstone?.timestamp).toBe(Date.parse('2026-03-01T10:05:00.000Z'));
+  });
 });

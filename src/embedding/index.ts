@@ -1,10 +1,10 @@
 /**
  * Embedding module placeholder.
  *
- * In v0.1.0, embedding is not yet implemented. The importance detector
- * uses lexical (Jaccard) approximations instead of real embeddings.
- *
- * Future versions will integrate ONNX Runtime with a vendored embedding model.
+ * @shorthand/core ships no embedding model (it has no runtime
+ * dependencies). Hosts compute embeddings themselves and set
+ * `ConversationMessage.embedding`; the importance detector's trajectory
+ * and semantic-reference signals use it when present.
  */
 
 export interface EmbeddingResult {

@@ -3,19 +3,49 @@
  * Progressive context compaction for LLMs.
  */
 
+import type { SignalWeights } from './importance/types.js';
+
 // ---------------------------------------------------------------------------
 // Conversation primitives
 // ---------------------------------------------------------------------------
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
+/**
+ * A single message in a conversation — the one message type every module
+ * (compaction, importance, CRDT memory, truth bridge) consumes.
+ */
 export interface ConversationMessage {
   id: string;
   role: MessageRole;
   content: string;
-  timestamp: number;
+  /**
+   * Epoch milliseconds, or an ISO 8601 string as serialized transcripts
+   * carry it. Use `normalizeTimestamp` before doing arithmetic on it.
+   */
+  timestamp: number | string;
   /** Optional metadata attached by the host application. */
   metadata?: Record<string, unknown>;
+  /** Pre-computed embedding vector (optional — populated by the host's embedding layer). */
+  embedding?: Float32Array;
+  /** Tool call metadata, for `role: 'tool'` messages and assistant tool calls. */
+  toolCall?: {
+    name: string;
+    input: Record<string, unknown>;
+    result?: unknown;
+    isError?: boolean;
+  };
+  /** Id of a prior message this one corrects/supersedes. */
+  supersedes?: string;
+}
+
+/**
+ * Normalize a message timestamp to epoch milliseconds.
+ * Accepts epoch numbers and ISO 8601 strings; an unparseable string
+ * yields NaN rather than throwing.
+ */
+export function normalizeTimestamp(ts: number | string): number {
+  return typeof ts === 'string' ? new Date(ts).getTime() : ts;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,33 +233,6 @@ export interface ContextSection {
 }
 
 // ---------------------------------------------------------------------------
-// Importance scoring
-// ---------------------------------------------------------------------------
-
-export interface ImportanceScore {
-  /** Overall importance (0.0 to 1.0). */
-  overall: number;
-  /** Signal 1: State delta — how much this message mutates the entity graph. */
-  stateDelta: number;
-  /** Signal 2: Reference frequency — how often later messages reference this one. */
-  referenceFrequency: number;
-  /** Signal 3: Trajectory discontinuity — semantic direction change. */
-  trajectoryDiscontinuity: number;
-}
-
-export interface ImportanceWeights {
-  stateDelta: number;
-  referenceFrequency: number;
-  trajectoryDiscontinuity: number;
-}
-
-export const DEFAULT_IMPORTANCE_WEIGHTS: ImportanceWeights = {
-  stateDelta: 0.45,
-  referenceFrequency: 0.25,
-  trajectoryDiscontinuity: 0.30,
-};
-
-// ---------------------------------------------------------------------------
 // Compactor interface (tiered: regex, local LM, host LLM)
 // ---------------------------------------------------------------------------
 
@@ -392,8 +395,8 @@ export interface AgentProfile {
   agentId: string;
   /** Entity types this agent cares about. */
   entityTypes: EntityType[];
-  /** Custom importance weights. */
-  importanceWeights: ImportanceWeights;
+  /** Custom importance signal weights (see `ImportanceDetector`). */
+  importanceWeights: SignalWeights;
   /** Regex patterns that boost importance. */
   boostPatterns: RegExp[];
   /** Regex patterns that demote importance. */

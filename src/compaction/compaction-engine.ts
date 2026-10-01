@@ -18,13 +18,10 @@ import { CompactionLevel as CL, DEFAULT_COMPACTION_CONFIG } from '../types.js';
 import { estimateTokens } from '../utils.js';
 import { RegexCompactor } from './regex-compactor.js';
 import type { ActiveEngramStore } from '../crdt/active-engram-store.js';
-import type { TruthLedgerLine, TruthLedgerView, TruthSyncResult } from '../truth/types.js';
-import {
-  buildTruthLedgerView,
-  displaceStaleInvariants,
-  parseTruthLedgerJsonl,
-  renderTruthSection,
-} from '../truth/ledger-sync.js';
+import type { TruthLedgerEntry, TruthSelection, TruthSyncResult } from '../truth/types.js';
+import { parseWikiLines, selectCurrentTruth } from '../truth/wiki.js';
+import { renderTruthLines, renderTruthSection } from '../truth/compaction-bridge.js';
+import { displaceStaleInvariants } from '../truth/ledger-sync.js';
 
 /**
  * Share of the context budget held back for the most recent raw (L0)
@@ -37,7 +34,7 @@ export class CompactionEngine {
   private compactor: Compactor;
   private state: CompactedState;
   private activeEngramStore?: ActiveEngramStore;
-  private truthView?: TruthLedgerView;
+  private truthSelection?: TruthSelection;
 
   constructor(config: Partial<CompactionConfig> = {}) {
     this.config = { ...DEFAULT_COMPACTION_CONFIG, ...config };
@@ -88,37 +85,38 @@ export class CompactionEngine {
   }
 
   /**
-   * Sync a truth-ledger snapshot (stenographer TB/UV v2 JSONL export).
+   * Sync a truth-ledger snapshot (stenographer TB/UV JSONL export, or
+   * entries already parsed with `parseWikiLines`).
    *
-   * The synced view lives beside the LSM levels, not inside them:
+   * The synced selection lives beside the LSM levels, not inside them:
    * recompaction can rewrite L4, but it can never rewrite ledger truth,
    * and a UV must never compact into something that reads as proven.
    * Syncing also displaces any L4 invariant projected from an entry that
-   * has since been overridden, refuted, or contested.
+   * is no longer ground truth (overridden, struck, contested, refuted).
    */
-  syncTruthLedger(input: string | string[] | TruthLedgerLine[]): TruthSyncResult {
-    let entries: TruthLedgerLine[];
+  syncTruthLedger(input: string | string[] | TruthLedgerEntry[]): TruthSyncResult {
+    let entries: TruthLedgerEntry[];
     let errors: TruthSyncResult['errors'] = [];
 
     if (typeof input === 'string' || typeof input[0] === 'string' || input.length === 0) {
-      const parsed = parseTruthLedgerJsonl(input as string | string[]);
+      const parsed = parseWikiLines(input as string | string[]);
       entries = parsed.entries;
       errors = parsed.errors;
     } else {
-      entries = input as TruthLedgerLine[];
+      entries = input as TruthLedgerEntry[];
     }
 
-    const view = buildTruthLedgerView(entries);
-    const { kept, displacedKeys } = displaceStaleInvariants(this.state.l4_invariants, view);
+    const selection = selectCurrentTruth(entries);
+    const { kept, displacedKeys } = displaceStaleInvariants(this.state.l4_invariants, selection);
     this.state.l4_invariants = kept;
-    this.truthView = view;
+    this.truthSelection = selection;
 
-    return { view, displacedInvariantKeys: displacedKeys, errors };
+    return { selection, displacedInvariantKeys: displacedKeys, errors };
   }
 
-  /** The most recently synced truth-ledger view, if any. */
-  getTruthView(): TruthLedgerView | undefined {
-    return this.truthView;
+  /** The most recently synced truth-ledger selection, if any. */
+  getTruthSelection(): TruthSelection | undefined {
+    return this.truthSelection;
   }
 
   /** Build a context frame within the token budget. */
@@ -129,10 +127,9 @@ export class CompactionEngine {
 
     // Truth ledger: asserted truth outranks everything derived — it takes
     // budget first, and contested entries always carry both sides.
-    if (this.truthView) {
-      const truthLines = renderTruthSection(this.truthView);
-      if (truthLines.length > 0) {
-        const content = truthLines.join('\n');
+    if (this.truthSelection) {
+      if (renderTruthLines(this.truthSelection).length > 0) {
+        const content = renderTruthSection(this.truthSelection);
         const tokens = estimateTokens(content);
         if (used + tokens <= budget) {
           sections.push({ level: CL.L4_INVARIANTS, content, tokenEstimate: tokens });

@@ -17,6 +17,7 @@ import type {
   TopicSummary,
   Invariant,
 } from '../types.js';
+import { normalizeTimestamp } from '../types.js';
 import { estimateTokens, generateId } from '../utils.js';
 
 /** Deep clone a CompactedState, preserving Map types. */
@@ -293,7 +294,7 @@ export class RegexCompactor implements Compactor {
         originalMessageId: this.findRelatedMessage(match, state) ?? msg.id,
         correctionMessageId: msg.id,
         reason: match.content,
-        timestamp: msg.timestamp,
+        timestamp: normalizeTimestamp(msg.timestamp),
         key: match.details.from,
         correctedValue: match.details.to ?? match.details.correctedTo,
       };
@@ -355,7 +356,7 @@ export class RegexCompactor implements Compactor {
         key: match.details.constraint.slice(0, 50),
         value: match.content,
         sourceMessage: msg.id,
-        timestamp: msg.timestamp,
+        timestamp: normalizeTimestamp(msg.timestamp),
       };
       state.l4_invariants.push(invariant);
     }

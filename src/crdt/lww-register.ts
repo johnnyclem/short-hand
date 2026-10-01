@@ -1,70 +1,122 @@
 /**
- * Last-Writer-Wins Register (LWW-Register)
+ * LWW-Register (Last Writer Wins Register) — a CRDT where concurrent
+ * writes are resolved by Lamport timestamp ordering.
  *
- * Used for L4 core invariants and L3 graph edge properties.
- * Merge semantics: latest Lamport timestamp wins.
+ * Used for L4 (core invariants) where the most recent update should win.
+ * Each key-value pair carries a Lamport timestamp; on merge, the entry
+ * with the higher timestamp takes precedence. Ties are broken by agentId.
+ *
+ * Reference: Shapiro et al., "A comprehensive study of CRDTs" (2011)
  */
 
-export interface LWWEntry<T> {
-  value: T;
-  timestamp: number;
-  agentId: string;
+import type { AgentId, LamportTimestamp, CRDT } from './types.js';
+import { LamportClock, compareLamport } from './clock.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** A single timestamped entry in the register map. */
+export interface LWWEntry<V> {
+  value: V;
+  timestamp: LamportTimestamp;
 }
 
-export class LWWRegister<T> {
-  private entries = new Map<string, LWWEntry<T>>();
+/** Serialized form of the full LWW register map. */
+export interface LWWRegisterState<V> {
+  entries: Record<string, LWWEntry<V>>;
+}
 
-  constructor(private agentId: string) {}
+// ---------------------------------------------------------------------------
+// Implementation
+// ---------------------------------------------------------------------------
 
-  set(key: string, value: T, timestamp: number): void {
-    const existing = this.entries.get(key);
-    if (!existing || timestamp > existing.timestamp) {
-      this.entries.set(key, { value, timestamp, agentId: this.agentId });
-    }
+export class LWWRegister<V> implements CRDT<Map<string, V>, LWWRegisterState<V>> {
+  private entries: Map<string, LWWEntry<V>> = new Map();
+  private clock: LamportClock;
+
+  constructor(agentId: AgentId) {
+    this.clock = new LamportClock(agentId);
   }
 
-  get(key: string): T | undefined {
+  /** Set a key to a value, stamping it with a new Lamport timestamp. */
+  set(key: string, value: V): LamportTimestamp {
+    const ts = this.clock.tick();
+    this.entries.set(key, { value, timestamp: ts });
+    return ts;
+  }
+
+  /** Get the current value for a key, or undefined. */
+  get(key: string): V | undefined {
     return this.entries.get(key)?.value;
   }
 
-  getEntry(key: string): LWWEntry<T> | undefined {
+  /** Get the full entry (value + timestamp) for a key. */
+  getEntry(key: string): LWWEntry<V> | undefined {
     return this.entries.get(key);
   }
 
+  /** Check if a key exists. */
   has(key: string): boolean {
     return this.entries.has(key);
   }
 
-  keys(): string[] {
-    return Array.from(this.entries.keys());
+  /** Delete a key by writing a tombstone (value = undefined). */
+  delete(key: string): void {
+    const ts = this.clock.tick();
+    // We store the tombstone as a special entry; consumers check via get()
+    this.entries.set(key, { value: undefined as unknown as V, timestamp: ts });
   }
 
-  values(): Array<{ key: string; value: T; timestamp: number }> {
-    return Array.from(this.entries.entries()).map(([key, entry]) => ({
-      key,
-      value: entry.value,
-      timestamp: entry.timestamp,
-    }));
-  }
-
-  merge(other: LWWRegister<T>): void {
-    for (const [key, otherEntry] of other.entries) {
-      const existing = this.entries.get(key);
-      if (!existing || otherEntry.timestamp > existing.timestamp) {
-        this.entries.set(key, { ...otherEntry });
+  /** Return all current key-value pairs (excluding tombstones). */
+  value(): Map<string, V> {
+    const result = new Map<string, V>();
+    for (const [key, entry] of this.entries) {
+      if (entry.value !== undefined) {
+        result.set(key, entry.value);
       }
     }
+    return result;
   }
 
-  serialize(): Array<[string, LWWEntry<T>]> {
-    return Array.from(this.entries.entries());
+  /** All keys including tombstoned ones. */
+  keys(): string[] {
+    return [...this.entries.keys()];
   }
 
-  static deserialize<T>(agentId: string, data: Array<[string, LWWEntry<T>]>): LWWRegister<T> {
-    const register = new LWWRegister<T>(agentId);
-    for (const [key, entry] of data) {
-      register.entries.set(key, entry);
+  /** Serialize to a JSON-safe representation. */
+  serialize(): LWWRegisterState<V> {
+    const entries: Record<string, LWWEntry<V>> = {};
+    for (const [key, entry] of this.entries) {
+      entries[key] = entry;
     }
-    return register;
+    return { entries };
+  }
+
+  /**
+   * Merge with a remote replica. For each key, the entry with the higher
+   * Lamport timestamp wins. Returns true if any local state changed.
+   */
+  merge(remote: LWWRegisterState<V>): boolean {
+    let changed = false;
+
+    for (const [key, remoteEntry] of Object.entries(remote.entries)) {
+      const localEntry = this.entries.get(key);
+
+      if (!localEntry || compareLamport(remoteEntry.timestamp, localEntry.timestamp) > 0) {
+        this.entries.set(key, remoteEntry);
+        this.clock.receive(remoteEntry.timestamp);
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  /** Create from a serialized state. */
+  static from<V>(agentId: AgentId, state: LWWRegisterState<V>): LWWRegister<V> {
+    const reg = new LWWRegister<V>(agentId);
+    reg.merge(state);
+    return reg;
   }
 }
