@@ -143,7 +143,9 @@ export class ProposalStream {
 
   /**
    * Chain one proposal into the stream; returns the line as written. Throws
-   * when the stream already gave its id a different envelope.
+   * when the stream already gave its id a different envelope. The same
+   * envelope again is written again as a new line (stenographer's intake
+   * files it once); `appendProposalsFile` is the writer that skips it.
    */
   append(proposal: ProposalLine): WrittenProposalLine {
     assertAccountableAuthor(proposal.author);

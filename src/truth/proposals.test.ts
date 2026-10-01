@@ -171,6 +171,28 @@ describe('appendProposalsFile: one writer’s chained stream, deduped by (target
     expect(resumed.head?.seq).toBe(1);
   });
 
+  it('a stream writes the same envelope again as a new line; only appendProposalsFile skips it (SH-SYNC-R1)', () => {
+    const a = uvProposal(uvDraft('A.'), { targetRef: 'a', detail: 'd' }, { author: 'johnny' });
+    // ProposalStream.append and serializeProposals chain it again under its id, with the next seq
+    const lines = serializeProposals([a, a]);
+    expect(lines.map((l) => JSON.parse(l))).toMatchObject([
+      { seq: 1, id: a.id },
+      { seq: 2, id: a.id },
+    ]);
+    const third = ProposalStream.resume(lines).append(a);
+    expect(third).toMatchObject({ seq: 3, id: a.id });
+    // which readers take as one valid stream (stenographer's intake files the id once)
+    const read = parseProposalLines([...lines, JSON.stringify(third)]);
+    expect(read).toMatchObject({ errors: [], refused: false });
+    expect(read.proposals.map((p) => p.id)).toEqual([a.id, a.id, a.id]);
+
+    // appendProposalsFile skips it, from the file or within the batch
+    const path = join(dir, 'proposals.jsonl');
+    expect(appendProposalsFile(path, [a, a])).toMatchObject({ written: 1, skipped: 1 });
+    expect(appendProposalsFile(path, [a])).toMatchObject({ written: 0, skipped: 1 });
+    expect(readFileSync(path, 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+
   it('ProposalStream.resume continues the file it read', () => {
     const lines = serializeProposals([uvProposal(uvDraft('A.'), { targetRef: 'a', detail: 'd' }, { author: 'johnny' })]);
     const stream = ProposalStream.resume(lines);
