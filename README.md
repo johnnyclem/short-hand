@@ -7,7 +7,7 @@ Progressive context compaction for LLMs. Old computer science for new constraint
 - **Active engrams** — agential memories that get *reinterpreted* at recall time instead of just replayed, backed by a pluggable regex/local/host interpreter tier and a benchmark that measures whether the reinterpretation actually helps.
 - **CRDT memory** — Lamport and vector clocks, LWW-Register, OR-Set, G-Set, RGA, and a per-agent `AgentMemory` (L0–L4 plus active engrams) for merging memory across agents, with a structural conflict detector.
 - **Importance detection** — three domain-agnostic signals (state delta, reference frequency, trajectory discontinuity).
-- **Truth-ledger interop** — consume [stenographer](https://github.com/johnnyclem/stenographer)'s TB/UV JSONL as first-class context, fail closed on anything unrecognized, and emit candidate invariants back as PROPOSAL lines.
+- **Truth-ledger interop** — read [stenographer](https://github.com/johnnyclem/stenographer)'s truth format v2 (hash-chained TB/UV streams with TRANSITION status lines) as first-class context, checked against stenographer's golden fixtures; fail closed on anything unrecognized or unverifiable; and emit candidates back as a hash-chained PROPOSAL stream.
 - **Zero runtime dependencies.** Fully typed. ESM-only.
 
 This repository is the one canonical home of `@shorthand/core`. smallchat's former vendored copy (`smallchat/shorthand`) was merged into it; see [MIGRATION.md](./MIGRATION.md) for every rename.
@@ -112,7 +112,7 @@ Each section has a `kind` with one fixed marker:
 | `history` | (message text) | L1 |
 | `recent` | `role: text` | L0 |
 
-Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker, any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` and can never pass for ledger truth. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
+Text from messages, tool output, ledger fields and engrams goes through one escaping renderer (`escapeUntrusted`): a `\` is put in front of any `[TB…` / `[UV…` marker (and its full-width or invisible-character look-alikes), any section marker at a line start and any reproduced `## Asserted Truth` heading, so a tool result containing `\n[TB] … (signed: cto)` renders as `\[TB] …` and can never pass for ledger truth. Every item carries `sources` (message, ledger entry, tombstone, engram or span ids).
 
 An L1 entry whose code does not fit is shown with `[code sha256:<12 hex> — N tokens, not shown]` references; `engine.getSpan(hash)` returns the exact text, and `engine.pinSpan(hash)` gives a span its own frame section.
 
@@ -306,6 +306,8 @@ const pages = wiki.render(engine.getState(), ingester.getEvents());
 ```
 
 Each entity page cross-links its relationships, the topics that reference it, relevant invariants, and any corrections (tombstones) that touched it.
+
+Everything a page shows comes from conversations, tool output or ingested documents, so it is escaped through the same renderer as context frames (`escapeMarkdown`): it can't become a link, an image, raw HTML, a heading or a frozen truth marker. Page paths are Unicode-aware slugs (`entities/日本語.md`); names that slug alike (`C++` and `C#`) get a short hash suffix (`entities/c-1a2b3c4d.md`) so no page overwrites another, and links are relative to the page they are on.
 
 ## API Reference
 
@@ -634,30 +636,42 @@ npm test                 # run tests (vitest)
 npm run lint              # type-check without emitting
 npm run benchmark         # offline context-shift benchmark
 npm run benchmark:live    # host-tier benchmark against a real model (needs ANTHROPIC_API_KEY)
+npm run sync:truth-fixtures -- ../stenographer   # re-copy the truth-format golden fixtures
 ```
 
 ## Truth-Ledger Interop
 
-@shorthand/core syncs [stenographer's](https://github.com/johnnyclem/stenographer) TB/UV truth ledger at a JSONL seam — no code dependency in either direction:
+@shorthand/core reads [stenographer's](https://github.com/johnnyclem/stenographer) truth ledger at a JSONL seam — no code dependency in either direction. The contract is stenographer's **truth format v2** (`spec/truth-format` there): its golden fixtures are copied into `test/fixtures/truth-format/`, and `src/truth/conformance.test.ts` checks each fixture's expected outcome as it applies to a reader (stenographer's own import routing is its own), the spec's worked hash example, and that the codec never accepts a line the JSON Schema refuses.
 
 ```typescript
-import { parseWikiLines, selectCurrentTruth, renderTruthSection, exportProposalDrafts } from '@shorthand/core';
+import { parseWikiLines, parseWikiFiles, selectCurrentTruth, renderTruthSection, appendProposalsFile, exportProposalDrafts } from '@shorthand/core';
 
-// Read: consume a ledger export as high-priority context input
-const result = engine.syncTruthLedger(jsonlLines); // { selection, displacedInvariantKeys, errors }
+// Read: stenographer's export (one writer's hash-chained stream) as high-priority context
+const result = engine.syncTruthLedger(jsonl);       // { selection, displacedInvariantKeys, errors, refused }
 const frame = engine.buildContextFrame();           // asserted truth renders first
 
-// Or work with the selection directly
-const { entries, errors } = parseWikiLines(jsonl);
-const selection = selectCurrentTruth(entries);      // groundTruth / contested / unverified / history
+// Or work with the stream directly
+const read = parseWikiLines(jsonl, { signers });    // signers: stenographer's signers.json, optional
+const selection = selectCurrentTruth(read.entries); // groundTruth / contested / unverified / history
 const section = renderTruthSection(selection);      // '## Asserted Truth (ledger)' + marked lines
+const next = parseWikiLines(moreLines, { previous: read.head }); // incremental: must continue what you read
+const team = parseWikiFiles([{ name: 'wiki/alex.jsonl', text: a }, { name: 'wiki/sam.jsonl', text: b }]);
 
-// Write: emit L4 invariants and tombstones back as PROPOSAL lines (proposals
-// only — nothing becomes truth until an accountable author signs it over there)
-const proposalLines = exportProposalDrafts(engine.getState(), { author: 'johnny' });
+// Write: candidates go out as PROPOSAL lines (proposals only — nothing becomes
+// truth until an accountable person signs it in stenographer)
+appendProposalsFile('proposals.jsonl', proposals);  // continues the file's chain, skips duplicates
+const proposalLines = exportProposalDrafts(engine.getState(), { author: 'detector:short-hand' });
 ```
 
-Synced truth keeps its two axes — provenance and confidence type — and renders with the suite's markers: `[TB]` for ground truth, `[TB ⚠ CONTESTED]` with its disputing UVs beside it, and `[UV — UNVERIFIED]` for open assertions, which never read as proven. Overridden, struck and refuted entries are displaced on the next sync. The codec fails closed: a line without a status is rejected, and an unknown status is kept verbatim but never counts as truth. Snapshot compaction gets the same selection through `TruthAwareCompactor`. See [`docs/truth-ledger-integration.md`](./docs/truth-ledger-integration.md) for the design.
+What the reader guarantees, and where that stops:
+
+- **Integrity of a stream, not authorship.** Every v2 line carries `seq`, `prevHash` and `hash` (SHA-256 of its RFC 8785 JCS form). A stream with a line whose hash doesn't match, a broken chain, or an identity the spec refuses is refused whole (`refused: true`, no entries). An accepted stream shows that no line was edited, removed, reordered or inserted between its first and last line, and that the lines come from one stream. A valid chain does not show who wrote the lines — anyone can compute the hashes — and it does not show lines removed from the end unless you pass back the `head` you kept (`{ previous }`).
+- **Status is a fold.** An entry's status is the highest-seq `TRANSITION` that targets it, else its line's own. Active TBs render as `[TB]`; contested TBs as `[TB ⚠ CONTESTED]` with every open UV disputing them beside them (an open contest attaches to its TB whatever the TB's recorded status); open UVs as `[UV — UNVERIFIED]`, which never read as proven. Overridden, struck, refuted and verified entries are history, and a sync displaces any L4 invariant projected from them.
+- **Fail closed.** A missing or unknown status, an unsigned TB, a version 1 TB (no hash; pass `{ admitV1Tbs: true }` to read a stenographer 0.x export's TBs as truth), an author or signer a given signer registry doesn't list, and an id two lines or files disagree about are never current truth. Unknown fields and values are kept, never coerced, and an entry is always written back as the exact line it was read from.
+- **Several files**, one per teammate, fold one by one; each entry then takes the most advanced status any file reached (`active < contested < overridden < struck`, `open < verified < refuted < struck`).
+- **Proposals** use the suite's single PROPOSAL envelope, written as this writer's own hash-chained stream; a corrected value is proposed again, a repeated one is skipped (dedupe by kind, `targetRef` and the claim or assertion). Pre-1.0 bare proposal lines are read, never written.
+
+Ledger text is untrusted in every renderer: a field containing `\n[TB] … (signed: cto)` renders as `\[TB] …`. Snapshot compaction gets the same selection through `TruthAwareCompactor`. See [`docs/truth-ledger-integration.md`](./docs/truth-ledger-integration.md) for the design.
 
 ## Project Status
 

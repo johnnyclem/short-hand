@@ -68,13 +68,14 @@ Other compaction changes:
 
 Behavior changes (all in the fail-closed direction):
 
-- **Unknown statuses are no longer coerced.** A TB whose status is not `active`/`contested`/`overridden`/`struck` used to become `active`, and an unknown UV status became `open`. Both are now kept verbatim (they round-trip) and classified as `history`: never ground truth, never a flag. `TruthTbEntry.status` and `TruthUvEntry.status` are typed `TbStatus | UnknownStatus` / `UvStatus | UnknownStatus` accordingly.
-- **Lines missing a status, a TB claim or a UV assertion are rejected** into `WikiParseResult.errors` (`'missing status'`, `'TB entry missing claim'`, `'UV entry missing assertion'`) instead of defaulting to `active`/`open`/`''`.
-- `TbStatus` adds `struck`.
-- Top-level keys the codec does not interpret (for example v2 `schemaVersion`, `seq`, `prevHash`, `hash`, or another tool's `x-*` namespace) are preserved in `entry.extra` and re-emitted by `entryToWikiLine`.
-- `renderTruthSection` renders an unsigned TB as `unsigned` (it used to print `signed: <author>`, so a migration backfill read as signed).
-- An open UV that contests a TB the selection does not hold as `contested` (for example an incremental export that delivered the UV before the TB's re-emitted line) is now rendered standalone with `contests <id>`, and `truthToInvariantRecords` emits a record for it. Both used to drop it.
-- PROPOSAL lines use the suite's single envelope: they gain `schemaVersion: 2`, `signal.source` is `'compaction-candidate'` (was `'shorthand-compaction'`), `targetRef` is always present (`string | null`), and a `provenance` field names the source message.
+- **Unknown statuses are no longer coerced.** A TB whose status is not `active`/`contested`/`overridden`/`struck` used to become `active`, and an unknown UV status became `open`. Both are now kept verbatim and classified as `history`: never ground truth, never a flag. `TruthTbEntry.status` and `TruthUvEntry.status` are typed `TbStatus | UnknownStatus | null` / `UvStatus | UnknownStatus | null` accordingly.
+- **A line without a status is history** (`status: null`), not `active`/`open`. A TB without a claim or a UV without an assertion is refused into `WikiParseResult.errors`.
+- `TbStatus` and `UvStatus` add `struck`.
+- Top-level keys the codec does not interpret (the v2 `schemaVersion`, `seq`, `prevHash`, `hash`, or another tool's `x-*` namespace) are preserved in `entry.extra`, and an entry read from a stream is written back as the exact line it was read from.
+- An unsigned TB (the migration backfill) is never truth on its own; it used to be rendered as ground truth labelled `signed: <author>`.
+- An open UV that contests a TB is attached to that TB whatever the TB's recorded status: a current TB with an open contest is carried as contested. A UV contesting a TB that is not current truth is rendered standalone with `contests <id>`. Both used to drop the UV.
+- The truth format is stenographer's v2 (hash-chained streams, TRANSITION lines); see [Everyone: truth format v2](#everyone-truth-format-v2) for what that changes.
+- PROPOSAL lines use the suite's single envelope, hash-chained: they gain `schemaVersion: 2`, `seq`, `prevHash` and `hash`, `signal.source` is `'compaction-candidate'` (was `'shorthand-compaction'`), and `targetRef` is always present (`string | null`). There is no top-level `provenance` field.
 
 New in the truth module: `renderTruthLines` (the section without its heading), `TRUTH_SECTION_HEADING`, `TRUTH_SOURCE_PREFIX`, `groundTruthToInvariant`, `displaceStaleInvariants`, and the LSM proposal export (`invariantsToProposalDrafts`, `tombstonesToProposalDrafts`, `exportProposalDrafts`, `uvProposal`, `tbProposal`).
 
@@ -158,7 +159,8 @@ The serialized formats changed (Lamport timestamps are `{ counter, agentId }`, O
 | `exportProposalDrafts(state)` (and the two `*ToProposalDrafts`) | `exportProposalDrafts(state, { author })` |
 
 - Frame markers changed to the suite's frozen ones: `[truth]` → `[TB]`, `[truth, contested]` → `[TB ⚠ CONTESTED]`, `[unverified]` / `[disputed by unverified assertion]` → `[UV — UNVERIFIED]`. The truth section in a context frame starts with `## Asserted Truth (ledger)`.
-- Proposals use the suite's PROPOSAL envelope: each line carries `schemaVersion: 2`, `type: 'PROPOSAL'`, a ULID `id`, `ts`, an accountable `author` (generic identities throw), `kind` (`'tombstone'` → `'tb'`), `draft`, `targetRef`, `signal` and `agentSessionId`. `provenance` is unchanged.
+- Proposals use the suite's PROPOSAL envelope: each line carries `schemaVersion: 2`, `seq`, a ULID `id`, `type: 'PROPOSAL'`, `ts`, an accountable `author` (generic identities throw), `kind` (`'tombstone'` → `'tb'`), `draft`, `targetRef`, `signal`, `agentSessionId`, `prevHash` and `hash`. The top-level `provenance` field is gone (the source message is in the draft's evidence or `verifyBy`).
+- The 0.1 truth reader took any JSONL line as truth; 1.0 reads stenographer's truth format v2 — see [Everyone: truth format v2](#everyone-truth-format-v2).
 - Literals on TBs are validated with stenographer's write-time rule, and a TB with invalid literals is rejected like stenographer rejects it.
 
 ### New in 1.0 for short-hand users
@@ -217,6 +219,40 @@ These changes apply whichever codebase you come from.
 ### Interpreters
 
 `HostInterpreter` throws `InterpreterBudgetError('output_too_long')` when the response's `stop_reason` is `max_tokens` or `model_context_window_exceeded`, and `InterpreterUnavailableError` on `refusal`; `LocalInterpreter` throws `InterpreterBudgetError` on Ollama's `done_reason: 'length'`. `withFallback` routes both. Stubs that return truncated text with those stop reasons now fail.
+
+## Everyone: truth format v2
+
+`@shorthand/core/truth` reads stenographer's truth format v2 (`spec/truth-format` in the stenographer repo; the golden fixtures are copied to `test/fixtures/truth-format/` and run in this repo's tests). Stenographer 1.0 exports it; 0.x exports (version 1 lines) are still read.
+
+### Reading
+
+- **A stream is hash-chained and refused whole when it doesn't verify.** Every v2 line carries `seq`, `prevHash` and `hash` (SHA-256 of its RFC 8785 JCS form without `hash`). `parseWikiLines` refuses a line whose hash doesn't match, an identity it must refuse, or a broken chain (a missing, repeated, reordered or foreign line), and then refuses the whole stream: `result.refused` is true and `entries` is empty, so a dropped TRANSITION can never revive a struck TB. `engine.syncTruthLedger` then syncs no truth at all and reports why (`result.refused`, `result.errors`). A version 1 file keeps its per-line tolerance (it has no chain); a v1 line inside a v2 stream refuses the stream.
+- **Status is a fold, not "last line wins".** In a v2 stream an entry line is written once, and each status change is an appended `TRANSITION` line. An entry's `status` is the status of the highest-seq TRANSITION targeting it, else the line's own; `entry.source.lineStatus` keeps what the line says and `entry.source.transition` names the TRANSITION that moved it. Struck entries (`struck`, TB or UV) are never current truth. Version 1 files are still read last-line-wins.
+- **What a reader does not take as truth, whatever the status** (`entry.inadmissible`, classified `history`):
+  - an unsigned TB (`signedBy: null`, the backfill's TB) — `reason: 'unsigned'`;
+  - a version 1 TB — `reason: 'unverifiable'`: it carries no hash. Stenographer itself files them for a person to sign. **To keep reading a 0.x export's TBs as truth, pass `{ admitV1Tbs: true }`** to `parseWikiLines` / `readWikiFile` / `engine.syncTruthLedger`, or export a v2 stream from stenographer 1.0. Version 1 UVs are still read;
+  - with `{ signers }` (stenographer's `signers.json` shape), a TB whose author or signer, or a UV whose author, the registry doesn't list — `reason: 'unverifiable'`;
+  - an id two lines (or two files) give different content — `reason: 'conflict'`.
+- **Identities** are refused when anonymous or generic, when they contain a control character, or when reserved where they don't belong (`migration` only on an unsigned TB, `detector:*` only on PROPOSAL lines). They compare by key — NFKC, invisible code points removed, trimmed, lowercased — so `ａｓｓｉｓｔａｎｔ` and `Sys\u200Btem` are refused too. `isAnonymousIdentity` and `assertAccountableAuthor` moved to `identity.ts` (still exported from `@shorthand/core/truth`) and use the key; `assertAccountableAuthor` now also refuses control characters and `migration`, and accepts `detector:<name>`.
+- **Version 1 lines are validated as stenographer 0.x wrote them**: a TB needs a claim and at least one piece of evidence with a known kind, a UV needs an author, assertion, basis and `verifyBy`. Error messages name the field (`'claim: must be a non-empty string'`, `'a line is a JSON object'`, `'type: a version 1 line is a TB or UV …'`) instead of `'TB entry missing claim'` / `'entry is not an object'` / `'unsupported entry type'`. v1 `command` evidence reads as `claimed-command` in the typed entry (the line itself is not rewritten).
+- **Several files** (one per teammate): `parseWikiFiles([{ name, text }, …])` folds each on its own and takes the most advanced status per entry (TB `active < contested < overridden < struck`, UV `open < verified < refuted < struck`); a refused file refuses the merge.
+- **Incremental reads**: keep `result.head` and pass it back as `{ previous }`: the next read must continue it (stenographer's `sinceSeq` export) or still hold it (a re-read of the whole file), which catches lines removed from the end.
+- **Never rewritten**: `serializeWikiEntries` / `entryToWikiLine` give back the exact line an entry was read from — even when the fold moved its `status`. To write a whole stream back (TRANSITION lines included), use `result.lines` or `writeWikiFile(path, result)`. Entries you build by hand are still written in the version 1 shape.
+- `wikiLineToEntry(line, options?)` validates the line with the v2/v1 codec and throws `TruthLineError` on a line a reader must refuse.
+- `TruthSyncResult` gains `refused`; error entries may carry `id` and `file`.
+
+### Writing proposals
+
+- **A proposals file is one writer's hash-chained stream.** `serializeProposals(proposals, { head? })` and `exportProposalDrafts(state, { author, head? })` return chained lines (seq 1…, or continuing `head`). `appendProposalsFile` continues the file's own stream in one write and returns `{ written, skipped, head }`. It **refuses a file that isn't one valid proposals stream** — including a pre-1.0 file of bare lines — and leaves it untouched: start a new proposals file.
+- **Dedupe is by (kind, targetRef, normalized claim or assertion)**, not `targetRef` alone, so a corrected value (`LOG_BUDGET is 60.`) is proposed even when an earlier value for the same target was (SAT-10). `proposeInvariants` no longer proposes tautologies (`postgres is postgres.`).
+- The envelope is exactly the spec's: no top-level `provenance`, and a `tb` draft is `{ claim, evidence, literals? }` (`signedBy: null` is gone from `TbProposalDraft`; nothing short-hand drafts is signed). `ProposalSpec` lost `sourceMessageId`. Builders throw on an incomplete draft.
+- `parseProposalLines` reads proposals files: suite envelope lines (chained and hash-checked) and, read-only, the bare pre-1.0 line and the `shorthand-compaction` source (`kind: 'tombstone'` reads as `'tb'`).
+
+### Rendering
+
+- `applyTruthToSnapshot` (and `TruthAwareCompactor`) escape the compacted summary they put truth beside, so a message or tool output that reproduces `- [TB] … (signed: cto)` or `## Asserted Truth (ledger)` renders as `- \[TB] …` / `\## Asserted Truth …` (SH-04).
+- `escapeUntrusted` is idempotent (an already-escaped `\[TB]` is left alone) and also escapes look-alikes: full-width `［ＴＢ］` and markers with invisible code points before the letters.
+- `WikiRenderer` escapes every name and text it renders (`\[`, `\]`, `&lt;`, `&gt;`; a line-start `#` in multi-line text; the frozen markers), so ingested text can't become a link, an image, raw HTML or a heading (SH-24). Page paths are Unicode-aware slugs (`entities/日本語.md`); names that slug alike (`C++` and `C#`, or two summaries of one topic) get a short hash suffix (`entities/c-1a2b3c4d.md`) instead of overwriting each other; links are relative to the page they are on (`../topics/x.md` from an entity page). Paths of names that collided, and links, change.
 
 ## Everyone: CRDT convergence and the v1 wire format
 
