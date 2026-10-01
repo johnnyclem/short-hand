@@ -83,7 +83,7 @@ New in the truth module: `renderTruthLines` (the section without its heading), `
 The API is the vendored one. Wire-format and behavior changes:
 
 - **OR-Set removes propagate.** `ORSetState` gains `removed` (tombstoned tags). A remove used to delete locally only, so the element came back on the next merge with any replica that had seen it. States without `removed` still load. `ORSet.from` advances the tag clock past every tag in the state, so a restored replica never reissues a tag.
-- **G-Set entries without a `dedupeKey` are keyed by content** (`__content:<JSON of value>`) instead of a per-replica counter (`__auto_<n>`), so keyless entries from different agents no longer overwrite each other on merge, and identical keyless values collapse. Entries in old serialized states keep the `__auto_<n>` key they were stamped with.
+- **G-Set entries without a `dedupeKey` get a replica-scoped id** (`__id:<replicaId>:<counter>`) instead of a per-replica counter (`__auto_<n>`), so keyless entries from different agents no longer overwrite each other on merge. Entries in old serialized states keep the `__auto_<n>` key they were stamped with. See [CRDT convergence](#everyone-crdt-convergence-and-the-v1-wire-format) for the rest of the G-Set changes.
 - `AgentMemory` carries an `ActiveEngramStore` (`memory.activeEngrams`), serialized as the optional `AgentMemoryState.activeEngrams` and merged as a union by engram id. New `hasEntity(name)`. `appendMessage` and `L0Message.role` accept `'tool'`.
 
 ### Importance
@@ -138,7 +138,7 @@ The trajectory-discontinuity and semantic-reference signals now use `message.emb
 | `memory.addSummary(summary: TopicSummary)` | `memory.addSummary(topic, content, isDirectParticipant)` |
 | `SerializedAgentMemory` | `AgentMemoryState` |
 
-The serialized formats changed (Lamport timestamps are `{ counter, agentId }`, OR-Set state is `{ elements, removed }`, G-Set state is `{ entries }`), so 0.1 `AgentMemory` snapshots do not load in 1.0. `memory.activeEngrams` and the `ActiveEngramStore` API are unchanged.
+The serialized formats changed (Lamport timestamps are `{ counter, agentId }`, OR-Set state is `{ elements, removed }`, G-Set state is `{ entries }`), so 0.1 `AgentMemory` snapshots do not load in 1.0. `memory.activeEngrams` keeps the `ActiveEngramStore` API, with the replication changes listed under [CRDT convergence](#everyone-crdt-convergence-and-the-v1-wire-format).
 
 ### Truth
 
@@ -217,3 +217,49 @@ These changes apply whichever codebase you come from.
 ### Interpreters
 
 `HostInterpreter` throws `InterpreterBudgetError('output_too_long')` when the response's `stop_reason` is `max_tokens` or `model_context_window_exceeded`, and `InterpreterUnavailableError` on `refusal`; `LocalInterpreter` throws `InterpreterBudgetError` on Ollama's `done_reason: 'length'`. `withFallback` routes both. Stubs that return truncated text with those stop reasons now fail.
+
+## Everyone: CRDT convergence and the v1 wire format
+
+The CRDT layer now converges under concurrent writes (property-tested; see [docs/crdt-format.md](./docs/crdt-format.md) for the exact guarantees and their preconditions). That changed some behavior and the serialized format.
+
+### Wire format
+
+- Every state carries `schemaVersion: 1` and `clock` (the replica's Lamport counter); `from` restores the clock. LWW states also carry `vc` (observed vector clock), and each LWW entry carries the writer's `vc`; a tombstone is `{ timestamp, deleted: true }` without a value. States without `schemaVersion` still load; a state with another version is rejected.
+- `merge` validates the whole state first and throws `TypeError` on anything malformed (non-integer or negative counters, wrong types, a newer version), without changing the replica. Code that merged hand-built states must make them well formed: G-Set entries need `dedupeKey`, RGA nodes need `timestamp` equal to `id`, `deleted` booleans, and parents that exist.
+- Serialized collections are sorted (keys, tags, tombstones, entries by key, engrams by id). Do not depend on insertion order in `serialize()`, `value()` or `keys()`.
+
+### Restart a replica from its saved state
+
+Every live replica needs its own agent id. A process that restarts must restore before it writes, or its new writes reuse old ids:
+
+```diff
+- const memory = new AgentMemory('coder');
++ const memory = saved ? AgentMemory.from(saved) : new AgentMemory('coder');
+```
+
+An RGA merge now throws `TypeError: … differs between replicas: two writers share replica id "coder"` when that happens, instead of leaving replicas diverged.
+
+### API changes
+
+| Before | 1.0 |
+|---|---|
+| `lww.has(key)` true for a deleted key | false; `keys()` still lists tombstoned keys |
+| `lww.set(key, undefined)` wrote a tombstone-like entry | throws; use `delete(key)` |
+| `LWWEntry.value: V` | `value?: V` (absent on tombstones) plus `deleted?: true` and `vc?` |
+| `new GSet(mergeFn)` | still accepted; also `new GSet({ replicaId, mergeFn })` |
+| `gset.add(entry)` → `void`; keyless entries with equal values collapsed | → the entry's key; each keyless add is its own entry (`__id:<replicaId>:<counter>`) |
+| `defaultMergeFn` kept the local entry on an equal-length tie | keeps the entry whose canonical JSON sorts last (same on every replica) |
+| `rga.insertAfter(value, unknownId)` appended at the end | throws `RangeError` |
+| `ConflictDetector` flagged every differing L4 value as `critical` | flags only concurrent writes; sequential updates are not conflicts |
+| `store.get(id)` / `store.all()` returned live objects | frozen copies (`Readonly<ActiveEngram>`); use `setImportance` to change a score |
+| `store.mergeFrom(state)` → `void` | `mergeFrom(state, { from? })` → `{ added, removed, rejected }` |
+| `store.remove(id)` deleted locally only | also records a tombstone, so merges never bring the engram back |
+| `retrievalCount` converged on the max across replicas | per replica: a merged engram starts at 0 |
+| `MemoryMerge` `layerChanges` | gains `engrams` |
+
+### Active engram corrections
+
+- `shadowsEngramId` now hides the corrected engram everywhere: the correction speaks in its slot whenever either would have surfaced, and the corrected text never surfaces while an unexpired correction exists (it used to surface wherever the correction's own topics did not match). If an async correction fails to interpret, the slot is dropped.
+- A correction applies only between engrams of the same `origin`. Engrams created by a store get its `origin` (`AgentMemory` uses its agent id; a standalone store uses `'local'` unless you pass `{ origin }`). To correct another agent's memory, `remove` it and `add` your own.
+- `add` and `setImportance` throw `TypeError` on a non-finite score (finite scores are still clamped to [0, 1]). Engram ids are `crypto.randomUUID()` unless you pass `generateId`.
+

@@ -29,6 +29,14 @@ All notable changes to `@shorthand/core` are documented here. See [MIGRATION.md]
 - **Active engrams**: the default interpreter template no longer interpolates `{{context}}`; frames count a retrieval only for memories they include. (SH-23)
 - **Interpreters** throw `InterpreterBudgetError('output_too_long')` on `stop_reason: 'max_tokens'` / `'model_context_window_exceeded'` and Ollama `done_reason: 'length'`, and `InterpreterUnavailableError` on `refusal`. (SH-17)
 - **Extraction reads at most 16 KB of prose per message** (RegexCompactor and the importance state delta), in sentence windows of at most 400 characters. (SH-21, SAT-13)
+- **CRDT wire format v1**: every serialized state carries `schemaVersion: 1` and its replica's Lamport `clock` (restored by `from`); LWW entries carry the writer's vector clock (`vc`) and tombstones are `{ deleted: true }` without a value. `merge` throws `TypeError` before changing anything on a malformed state or a newer `schemaVersion`. Pre-1.0 states still load. See [docs/crdt-format.md](./docs/crdt-format.md). (SH-09, SAT-05)
+- **LWW-Register**: entries with the same `(counter, agentId)` — two writers sharing an id — are ordered tombstone first, then by canonical JSON, so they converge (the analogue of smallchat-swift SC-SW-29); `has(key)` is false for a deleted key; `set(key, undefined)` throws; `LWWEntry.value` is optional; `getEntry` returns a copy; `value()` / `keys()` / `serialize()` are ordered by key. (SAT-05)
+- **OR-Set** elements are identified by canonical JSON (an object's key order no longer makes it a different element); `value()` and `serialize()` are sorted.
+- **G-Set entries have explicit ids**: a keyless `add` issues `__id:<replicaId>:<counter>` (was a content key), so two keyless adds of the same value are two entries; `add` returns the key; the constructor takes `{ replicaId?, mergeFn? }` (a bare merge function still works); `defaultMergeFn` breaks equal-length ties by canonical JSON instead of keeping the local entry; merged entries without a `dedupeKey` are rejected; `value()` is ordered by key. (SAT-04)
+- **RGA**: `insertAfter` throws `RangeError` for an unknown reference node (it used to park the node at the end, where replicas disagreed); `merge` throws `TypeError` on a node that is not causally after its predecessor, a predecessor in neither replica, or a node id with different content on the two sides (a replica id reused without restoring). (SAT-02)
+- **ConflictDetector** reports an L4 or L3 conflict only for concurrent writes; an update made after seeing the old value (directly or relayed) is no longer reported, and deleted edges are skipped. (SAT-06)
+- **ActiveEngramStore**: `get()` / `all()` return frozen copies (typed `Readonly<ActiveEngram>`); `mergeFrom(state, { from })` validates each engram, clamps importance to [0, 1], starts peer engrams at `retrievalCount` 0, never rewrites an engram it holds and returns an `EngramMergeReport` (was `void`); `remove` records a tombstone (`removed` in the serialized state) so merges never bring the engram back; a correction (`shadowsEngramId`) applies only between engrams of the same `origin` and hides the corrected engram in every context; `retrieveAsync` interprets one engram per slot and drops a slot whose correction fails; `add` / `setImportance` throw on a non-finite score; engram ids are random UUIDs; results with equal importance are ordered by `createdAt`, then id. (SH-11, SH-12)
+- **AgentMemory**: `from` restores engrams with their retrieval counts; `mergeFrom` merges engrams with the remote `agentId` as the peer origin. `MemoryMerge` reports `layerChanges.engrams` and orders agents by code units (was `localeCompare`).
 
 ### Added
 
@@ -41,6 +49,7 @@ All notable changes to `@shorthand/core` are documented here. See [MIGRATION.md]
 - Importance: `EntityGraph`, `ReferenceGraph`, `TrajectoryTracker`, `RunningStats`, `cosineSimilarity`, `cosineDistance`.
 - Truth: tombstoned-literal validation and lossless `x-steno` / unknown-key round-trip, `TruthAwareCompactor`, `applyTruthToSnapshot`, `truthToInvariantRecords`, `proposeInvariants`, `appendProposalsFile`, `TbStatus` `struck`.
 - `ConversationMessage` optional `embedding`, `toolCall` and `supersedes`; `normalizeTimestamp`.
+- CRDT: `CRDT_SCHEMA_VERSION`, `LamportClock.observe`, `compareLWWEntries`, `isLWWTombstone`, `GSetOptions`, `AgentMemory.mergeLayersFrom` (`MemoryLayerChanges`), `ActiveEngram.origin`, `ActiveEngramStoreOptions.origin` / `generateId`, `ActiveEngramStore.deserialize(data, options)`, `EngramMergeOptions`, `EngramMergeReport`; [docs/crdt-format.md](./docs/crdt-format.md) (wire format, merge rules, engram trust model); fast-check property tests for every CRDT (convergence, commutativity, associativity, idempotence, restore-and-continue).
 
 ### Fixed
 
@@ -59,6 +68,13 @@ All notable changes to `@shorthand/core` are documented here. See [MIGRATION.md]
 - LWW-Register replicas converge on concurrent writes with equal counters (tie broken by agent id); `AgentMemory` no longer stamps writes from one process-global counter.
 - G-Set entries without a `dedupeKey` from different replicas no longer overwrite each other on merge.
 - Open UVs contesting a TB the ledger has not (yet) marked contested are rendered and projected instead of dropped; unsigned TBs render as `unsigned` instead of `signed: <author>`.
+- RGA replicas converge on concurrent inserts at the head of the sequence (the first append of every fresh log): another agent's message is no longer interleaved between a message and its reply. (SAT-02)
+- Two G-Set replicas holding equal-length summaries for one topic converge. (SAT-04)
+- A restored LWW-Register, OR-Set, G-Set or RGA continues from its saved clock, so its new writes are ordered after the ones it saved and no tag or id is reissued. (SH-09, SH-10, SAT-05)
+- A sequential update of an invariant is no longer flagged as a `critical` conflict. (SAT-06)
+- A corrected engram no longer resurfaces with its stale text in contexts the correction's topics do not match, and the README example now retrieves. (SH-11)
+- A peer's engram state can no longer set an arbitrary or NaN importance, a negative retrieval count, rewrite or shadow another agent's memory, or bring back a removed engram; `get()` results can no longer be mutated to change the store. (SH-12)
+- Rehydrating or merging a long RGA log is linear (50k nodes: about 57 s before, well under a second now), and `MemoryMerge` tracks changed layers from the merge results instead of stringifying every layer twice per remote. (SAT-30)
 
 ### Deprecated
 

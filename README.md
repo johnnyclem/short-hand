@@ -157,7 +157,7 @@ const id = store.add(
   {
     interpreterTemplate:
       'Given that we are now discussing {{context}}, the earlier note "{{payload}}" means: ',
-    activationPolicy: { surfaceWhenTopics: ['billing', 'upgrade', 'rate limit'] },
+    activationPolicy: { surfaceWhenTopics: ['billing', 'plan', 'rate limit'] },
     importanceScore: 0.8,
   },
 );
@@ -167,17 +167,21 @@ const results = store.retrieve('the user is asking about upgrading their plan');
 // [{ engramId, interpreted, payload, importanceScore }]
 
 // A correction is just another engram whose policy shadows the original —
-// same recall slot, new interpretation.
+// same recall slot, new interpretation. The original never surfaces again:
+// wherever it would have matched ('rate limit', 'plan', 'billing'), the
+// correction speaks in its place.
 store.add('The user upgraded to Pro yesterday — the rate limit no longer applies.', {
   activationPolicy: { surfaceWhenTopics: ['billing'], shadowsEngramId: id },
 });
+store.retrieve('why am I hitting the rate limit again?');
+// [{ engramId: id, shadows: <correction id>, interpreted: '…upgraded to Pro…', … }]
 ```
 
 Three rules are enforced structurally, not by convention:
 
 1. **Interpret before inject** — the raw payload never reaches a context frame directly.
 2. **Declarative activation** — `ActivationPolicy` (topics, `maxRetrievals`, `expiresAt`, `shadowsEngramId`) is evaluated by the store; the engram itself has no code path to influence it.
-3. **Safety boundary** — `importanceScore` can only change via `store.setImportance(id, score)`. The interpreter only ever sees `{ template, payload, context }` — never the score, policy, id, or retrieval count.
+3. **Safety boundary** — `importanceScore` can only change via `store.setImportance(id, score)` (clamped to [0, 1]); `get()` and `all()` hand out frozen copies. The interpreter only ever sees `{ template, payload, context }` — never the score, policy, id, or retrieval count.
 
 For LM-backed restatement, use the async path with a configured [Interpreter](#interpreter-tiers):
 
@@ -397,7 +401,7 @@ The trajectory signal and semantic references need `message.embedding` (a `Float
 
 ### CRDT Primitives
 
-State-based CRDTs for multi-agent memory: each replica serializes its state, and `merge` accepts any other replica's state in any order. Each primitive owns a Lamport clock; equal counters are ordered by agent id.
+State-based CRDTs for multi-agent memory: each replica serializes its state, and `merge` accepts any other replica's state in any order. Each primitive owns a Lamport clock (no API takes a caller-supplied timestamp); equal counters are ordered by agent id, and the clock is part of the serialized state, so `from` restores it.
 
 ```typescript
 import { AgentMemory, MemoryMerge, LWWRegister, ORSet, GSet, RGA } from '@shorthand/core';
@@ -427,14 +431,17 @@ const orset = new ORSet<string>('agent-1'); // add-wins; removes travel as tombs
 orset.add('React');
 orset.remove('React');
 
-const gset = new GSet<string>();            // grow-only; entries dedupe by dedupeKey or content
+const gset = new GSet<string>({ replicaId: 'agent-1' }); // grow-only; one entry per dedupeKey
 gset.add({ value: 'Session covered auth flow', sourceAgent: 'agent-1', isDirectParticipant: true });
+// → '__id:agent-1:1' (keyless entries get an issued id, never a content key)
 
 const log = new RGA<string>('agent-1');     // replicated sequence
 log.append('first');
 ```
 
-The CRDT layer is experimental: known convergence gaps (concurrent inserts at the head of an RGA, equal-length G-Set ties, conflict severity that ignores causality) are tracked for a follow-up release, so don't rely on it as a convergence guarantee yet.
+What merges guarantee, exactly (property-tested with fast-check in `src/crdt/crdt-properties.test.ts`): replicas that have merged the same states hold the same replicated state in any merge order — including equal-counter ties, concurrent inserts at the same RGA position (the head included) and LWW writers that share an agent id — `merge` is commutative, associative and idempotent, and a replica restored with `from` continues exactly like the original. Malformed states (and a newer `schemaVersion`) are rejected with a `TypeError` before anything changes. `ConflictDetector` reports an invariant or edge only when the two writes were concurrent; an update made after seeing the old value is not a conflict. The wire format, merge rules and the active-engram trust model are in [`docs/crdt-format.md`](./docs/crdt-format.md).
+
+The CRDT surface is still **experimental** because these hold only under preconditions it cannot check: every live writer has its own agent id (a restarted agent restores with `from` before writing — otherwise an LWW write can lose to an older one and an OR-Set tag can collide; an RGA merge throws on the collision), peers are honest (nothing is signed: a peer can win any LWW key with a large counter, delete any element or engram, and claim any engram origin), and a custom `GSet` merge function picks the greater entry under a total order. Tombstones are never garbage-collected, and engram retrieval counts and importance scores are per replica.
 
 ### ActiveEngramStore
 
@@ -461,7 +468,13 @@ const interpreted = await lmStore.retrieveAsync('designing the settings interfac
 
 // Plug into the engine so engrams surface in context frames
 engine.attachActiveEngrams(store);
+
+// Replicate between agents: union by id minus removal tombstones
+const peer = new ActiveEngramStore({ origin: 'agent-b' });
+const report = peer.mergeFrom(store.serialize(), { from: 'local' }); // { added, removed, rejected }
 ```
+
+Merging is a trust boundary: a peer's state can add memories (schema-validated, importance clamped to [0, 1], retrieval count reset) and delete any memory (`remove` leaves a tombstone, so a deletion is never undone by the next sync), but it cannot rewrite a memory the store already holds, change its importance, or correct (`shadowsEngramId`) a memory of another origin. Origins are asserted, not authenticated — see [`docs/crdt-format.md`](./docs/crdt-format.md#activeengramstore).
 
 ### Interpreters
 
@@ -652,7 +665,7 @@ Synced truth keeps its two axes — provenance and confidence type — and rende
 
 What's still aspirational:
 
-- **CRDT convergence** — the CRDT layer is experimental; see [CRDT Primitives](#crdt-primitives) for the known gaps.
+- **CRDT layer** — convergence and the merge laws are property-tested, but the surface stays experimental: they rely on unique replica ids and honest peers, and tombstones are never collected; see [CRDT Primitives](#crdt-primitives).
 - **Compactor tiers** — `local`/`host` for L0→L1 write-time compaction accept configuration but currently fall back to `regex` (see [Compactor Tiers](#compactor-tiers)).
 - **Embeddings** — no embedding model ships with this package (it stays zero-dependency). `ImportanceDetector` uses `message.embedding` when the host supplies one; `StubEmbedder` is an explicit placeholder returning zero vectors.
 
