@@ -47,14 +47,43 @@ export type UnknownStatus = string & { readonly __unknownStatus?: never };
 // ---------------------------------------------------------------------------
 
 /**
+ * The evidence kinds this version knows (spec/truth-format, "Evidence
+ * classes"). `wiki` is the id of an entry in a truth ledger, this one or a
+ * teammate's; a team wiki page is a `doc`. `chat` is a chat message or
+ * thread (Slack, Teams, Discord), `ticket` an issue or ticket (Jira,
+ * Linear, GitHub issues), `doc` a document or page outside the truth
+ * ledger (a design doc, a team wiki page, a README). `command` appears only
+ * on entries recorded before stenographer 1.0.
+ */
+export const EVIDENCE_KINDS = ['commit', 'file', 'test', 'command', 'claimed-command', 'wiki', 'message', 'chat', 'ticket', 'doc'] as const;
+
+/**
+ * Evidence that points at something a reader can check against the code or
+ * a ledger. Every other kind (`message`, `chat`, `ticket`, `doc`, pre-1.0
+ * `command`) is question-class: it reports what someone said or wrote down,
+ * which can prompt a check but isn't one. In 1.0 the classes bind agents
+ * only (an agent quorum's members each cite settling evidence); a person
+ * may sign on evidence of any class.
+ */
+export const SETTLING_EVIDENCE_KINDS = ['commit', 'file', 'test', 'claimed-command', 'wiki'] as const;
+
+/** An evidence kind's class (spec/truth-format, "Evidence classes"). */
+export type TruthEvidenceClass = 'settling' | 'question';
+
+/** An evidence kind's class. A kind this version doesn't know is question-class: it fails closed. */
+export function evidenceClass(kind: string): TruthEvidenceClass {
+  return (SETTLING_EVIDENCE_KINDS as readonly string[]).includes(kind) ? 'settling' : 'question';
+}
+
+/**
  * A piece of evidence attached to a TB. `command` appears only on entries
  * recorded before stenographer 1.0 (version 1 lines read it as
  * `claimed-command`); a newer writer may send kinds this version does not
  * know, which are kept as written.
  */
 export interface TruthEvidence {
-  kind: 'commit' | 'file' | 'test' | 'command' | 'claimed-command' | 'wiki' | 'message' | (string & {});
-  /** Commit sha, file/line, test name, command line, wiki entry id, or message id. */
+  kind: (typeof EVIDENCE_KINDS)[number] | (string & {});
+  /** Commit sha, file/line, test name, command line, truth entry id, message id, chat message or thread, ticket, or document. */
   ref: string;
   /** What the evidence shows (e.g. captured command output). */
   detail?: string;
@@ -72,6 +101,22 @@ export interface TruthTombstonedLiteral {
   subject?: string;
   /** What replaced it, if anything. */
   current?: string;
+}
+
+/**
+ * One agent session in a quorum (spec/truth-format, "Agent quorum"): who,
+ * which session, when, and the evidence it brought. Agents settle a claim
+ * only together: a TB an agent signs, or an ADDENDUM by which agents verify
+ * or refute a UV, carries one member per agreeing session.
+ */
+export interface TruthQuorumMember {
+  author: string;
+  /** Distinct sessions are distinct witnesses, so two members may share an identity. */
+  agentSessionId: string;
+  ts: string;
+  evidence: TruthEvidence[];
+  /** ADDENDUM members: the verdict the session filed. */
+  verdict?: 'verified' | 'refuted';
 }
 
 /** Machine-actionable verification hint carried by every UV. */
@@ -108,6 +153,8 @@ export interface WikiEntryLine {
   signedBy?: string | null;
   /** Matchable dead literals (§12). Absent when the TB declares none. */
   literals?: unknown[];
+  /** The agent sessions that settled it together, when agents signed it. */
+  quorum?: unknown[];
   // UV fields
   assertion?: string;
   basis?: string;
@@ -143,6 +190,12 @@ export interface TruthTbEntry {
   status: TbStatus | UnknownStatus | null;
   /** Matchable dead literals (§12). Only present when the TB declares some. */
   literals?: TruthTombstonedLiteral[];
+  /**
+   * The agent sessions that settled it together (spec/truth-format, "Agent
+   * quorum"): present when agents signed it. A TB an agent signs is truth
+   * only with a quorum of agents; the codec has checked its rules.
+   */
+  quorum?: TruthQuorumMember[];
   /** Opaque stenographer namespace, preserved for round-tripping. */
   xSteno?: Record<string, unknown>;
   /** Top-level keys this package does not interpret, preserved for round-tripping. */
@@ -203,10 +256,14 @@ export interface TruthEntrySource {
  * - `unsigned`: a TB with no signer (the backfill's second-class TB).
  * - `unverifiable`: a version 1 TB (no hash), or, with a signer registry,
  *   an author or signer the registry does not list.
+ * - `agent-without-quorum`: a TB an agent signed without a quorum whose
+ *   members are all agents. Agents settle a claim only as two or more agent
+ *   sessions agreeing from different angles within 15 minutes; otherwise a
+ *   person signs it (spec/truth-format, "Agent quorum").
  * - `conflict`: two lines (or two files) give the same id different content.
  */
 export interface TruthInadmissible {
-  reason: 'unsigned' | 'unverifiable' | 'conflict';
+  reason: 'unsigned' | 'unverifiable' | 'agent-without-quorum' | 'conflict';
   detail: string;
 }
 
@@ -247,7 +304,7 @@ export type ConsumptionAction =
 export const CONSUMPTION_RULES = `Consumption rules by confidence type:
 - Active TB: treat as ground truth. A reviewer may block on it; a code agent may rely on it.
 - Contested TB: ground truth with a visible asterisk — cite both the TB and the contesting UV.
-- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task would settle the UV cheaply, do so via resolve_uv.
+- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, file your verdict and evidence with resolve_uv: it settles only when another agent session agrees from a different angle (other evidence, another kind) within 15 minutes, or when a person rules.
 - Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
 
 /**

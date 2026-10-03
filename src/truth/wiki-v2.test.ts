@@ -527,7 +527,7 @@ describe('a TRANSITION cannot bring back what is final, or come from someone the
     const tb = read.entries.find((e) => e.id === OVERRIDDEN_TB)!;
     expect(tb.status).toBe('overridden');
     expect(selectCurrentTruth(read.entries).groundTruth.map((t) => t.id)).not.toContain(OVERRIDDEN_TB);
-    expect(read.held).toMatchObject([{ line: 16, id: 'revive-mallory', reason: expect.stringMatching(/mallory.*signer registry/) }]);
+    expect(read.held).toMatchObject([{ line: ledgerLines.length + 1, id: 'revive-mallory', reason: expect.stringMatching(/mallory.*signer registry/) }]);
   });
 
   it('a listed author cannot either: overridden and struck never change again', () => {
@@ -578,7 +578,7 @@ describe('a TRANSITION cannot bring back what is final, or come from someone the
       appended({ id: 'ghost', type: 'TRANSITION', ts: T(30), author: 'kim', target: OPEN_UV, status: 'verified', cause: { kind: 'verify', ref: 'AD-NOWHERE' } }),
     );
     expect(read.refused).toBe(true);
-    expect(read.errors).toMatchObject([{ line: 16, id: 'ghost', error: expect.stringMatching(/cause AD-NOWHERE.*not an earlier line/) }]);
+    expect(read.errors).toMatchObject([{ line: ledgerLines.length + 1, id: 'ghost', error: expect.stringMatching(/cause AD-NOWHERE.*not an earlier line/) }]);
   });
 });
 
@@ -600,7 +600,7 @@ describe('incremental reads fold the increment into what was read before (SH-R2,
   });
 
   it('chunk by chunk gives the whole-file fold, whatever the cut', () => {
-    for (const cut of [1, 3, 4, 6, 10, 11, 14]) {
+    for (const cut of [1, 3, 4, 6, 10, 11, 14, 16, 17, 18]) {
       const first = parseWikiLines(ledgerLines.slice(0, cut));
       const next = parseWikiLines(ledgerLines.slice(cut), { base: first });
       expect(truthStatusTable(next.entries), `cut at ${cut}`).toEqual(ledgerExpected);
@@ -625,7 +625,8 @@ describe('incremental reads fold the increment into what was read before (SH-R2,
     expect(first.selection.groundTruth.map((t) => t.id)).toEqual([ACTIVE_TB, STRUCK_TB]);
     const second = engine.syncTruthLedger(ledgerLines.slice(9), { base: first.read! });
     expect(second.refused).toBe(false);
-    expect(second.selection.groundTruth.map((t) => t.id)).toEqual([ACTIVE_TB, '01M1E6JK8BVGAAP733SN0VCW9W']);
+    // The last is the TB two agent sessions' drafts minted by quorum
+    expect(second.selection.groundTruth.map((t) => t.id)).toEqual([ACTIVE_TB, '01M1E6JK8BVGAAP733SN0VCW9W', '01M1E6JK8KR7Z4VAZ1GM8KFSQT']);
     const frame = renderContextFrame(engine.buildContextFrame(4000));
     expect(frame).not.toContain('The cron box is decommissioned.');
     expect(frame).toContain('fetchV1 is superseded by fetchV2.');
@@ -647,7 +648,7 @@ describe('a previous head needs the stream it names (SH-R9)', () => {
   it('an empty input is not a continuation of the stream read before', () => {
     const read = parseWikiLines('', { previous: head() });
     expect(read.refused).toBe(true);
-    expect(read.errors).toMatchObject([{ line: 0, error: expect.stringMatching(/holds no line of the stream.*seq 15/) }]);
+    expect(read.errors).toMatchObject([{ line: 0, error: expect.stringMatching(/holds no line of the stream.*seq 19/) }]);
   });
 
   it('a stream rewritten as version 1 lines is refused, and its UVs are not heads-ups', () => {

@@ -23,8 +23,10 @@
  *   struck TB.
  * - **Admission.** An unsigned TB is never truth on its own; a v1 TB has no
  *   hash and is unverifiable (unless the host opts in); with a signer
- *   registry, unlisted authors and signers are unverifiable; two lines
- *   giving one id different content are a conflict.
+ *   registry, unlisted authors and signers are unverifiable; a TB an agent
+ *   signed is truth only with a quorum whose members are all agents (the
+ *   codec has checked the quorum's rules); two lines giving one id
+ *   different content are a conflict.
  * - **Never rewrite.** Unknown fields and values are kept, never coerced,
  *   and a parsed entry serializes back to the exact line it was read from.
  * - **Several files** (one per teammate) fold one by one, then each entry
@@ -51,11 +53,13 @@ import {
   type TruthSignerFile,
   type TruthSignerRegistry,
 } from './identity.js';
+import { AGENT_PREFIX, hasAgentPrefix } from './quorum.js';
 import type {
   ConsumptionAction,
   TruthEvidence,
   TruthInadmissible,
   TruthLedgerEntry,
+  TruthQuorumMember,
   TruthSelection,
   TruthTbEntry,
   TruthTombstonedLiteral,
@@ -73,8 +77,11 @@ export interface TruthReadOptions {
   /**
    * Whose entries count, in stenographer's signers.json shape (or a list,
    * or a registry). With one, a TB is truth only when its author and signer
-   * are listed (as a person or an agent), and a UV only when its author is.
-   * Without one, any identity that passes the identity rules is accepted.
+   * are listed (as a person or an agent), and a UV only when its author is;
+   * an agent is an identity it lists with role `agent`. Without one, any
+   * identity that passes the identity rules is accepted, and an agent is an
+   * identity whose key starts with `agent:`. Either way, a TB an agent
+   * signed is truth only with a quorum whose members are all agents.
    */
   signers?: TruthSignerFile | TruthSigner[] | TruthSignerRegistry | null;
   /**
@@ -166,7 +173,7 @@ export function literalValidationError(literal: unknown): string | null {
 }
 
 /** Keys the codec maps to typed fields; anything else rides in `extra`. */
-const TB_KEYS = new Set(['id', 'type', 'ts', 'author', 'claim', 'evidence', 'signedBy', 'literals', 'status', 'x-steno']);
+const TB_KEYS = new Set(['id', 'type', 'ts', 'author', 'claim', 'evidence', 'signedBy', 'literals', 'quorum', 'status', 'x-steno']);
 const UV_KEYS = new Set(['id', 'type', 'ts', 'author', 'assertion', 'basis', 'verifyBy', 'contests', 'status', 'x-steno']);
 
 function extraKeys(line: Record<string, unknown>, known: Set<string>): Record<string, unknown> | undefined {
@@ -208,6 +215,7 @@ function entryOf(d: DecodedTruthLine, lineNo: number, file?: string): TruthLedge
       status: lineStatus,
     };
     if (Array.isArray(line.literals) && line.literals.length > 0) entry.literals = line.literals as TruthTombstonedLiteral[];
+    if (Array.isArray(line.quorum)) entry.quorum = line.quorum as TruthQuorumMember[];
     if (xSteno !== undefined) entry.xSteno = xSteno;
     const extra = extraKeys(line, TB_KEYS);
     if (extra) entry.extra = extra;
@@ -253,7 +261,7 @@ function transitionOf(d: DecodedTruthLine, lineNo: number, file?: string): Truth
 function bodyKey(e: TruthLedgerEntry): string {
   return canonicalize(
     e.type === 'TB'
-      ? { type: e.type, author: e.author, claim: e.claim, evidence: e.evidence, signedBy: e.signedBy, literals: e.literals ?? null }
+      ? { type: e.type, author: e.author, claim: e.claim, evidence: e.evidence, signedBy: e.signedBy, literals: e.literals ?? null, quorum: e.quorum ?? null }
       : { type: e.type, author: e.author, assertion: e.assertion, basis: e.basis, verifyBy: e.verifyBy, contests: e.contests },
   );
 }
@@ -292,6 +300,7 @@ export function entryToWikiLine(entry: TruthLedgerEntry): WikiEntryLine {
       signedBy: entry.signedBy,
       // Only present when given, so literal-free TBs keep their exact shape
       ...(entry.literals && entry.literals.length > 0 ? { literals: entry.literals } : {}),
+      ...(entry.quorum ? { quorum: entry.quorum } : {}),
       ...status,
     };
     if (entry.xSteno !== undefined) line['x-steno'] = entry.xSteno;
@@ -494,6 +503,40 @@ function listed(registry: TruthSignerRegistry, identity: string): boolean {
   return role === 'human' || role === 'agent';
 }
 
+/**
+ * Who is an agent (spec/truth-format, "Agent quorum"): with a signer
+ * registry, an identity it lists with role `agent` (its role decides, not
+ * its name); without one, an identity whose key starts with `agent:`.
+ */
+function isAgent(identity: string, registry: TruthSignerRegistry | null): boolean {
+  return registry ? registry.lookup(identity)?.role === 'agent' : hasAgentPrefix(identity);
+}
+
+/**
+ * Why a TB an agent signed can't be truth, or null: agents settle a claim
+ * only together, so it needs a quorum (whose rules the codec checked) whose
+ * members are all agents. With a registry, an unlisted `agent:` name is no
+ * witness.
+ */
+function agentWithoutQuorum(entry: TruthTbEntry, registry: TruthSignerRegistry | null): string | null {
+  if (!entry.signedBy || !isAgent(entry.signedBy, registry)) return null;
+  const outsider = entry.quorum?.find((m) => !isAgent(m.author, registry));
+  if (entry.quorum && !outsider) return null;
+  const why = outsider ? `a quorum that isn't all agents (quorum member ${outsider.author} is not an agent: ${notAnAgent(outsider.author, registry)})` : 'no quorum';
+  return (
+    `TB ${entry.id} is signed by agent ${entry.signedBy} with ${why}: agents settle a claim only as two or more agent sessions ` +
+    'agreeing from different angles within 15 minutes, or a person signs it'
+  );
+}
+
+/** Why `identity`, which `isAgent` says is not an agent, isn't one. */
+function notAnAgent(identity: string, registry: TruthSignerRegistry | null): string {
+  if (!registry) return `its name doesn't start with '${AGENT_PREFIX}'`;
+  const role = registry.lookup(identity)?.role;
+  if (!role) return "the signer registry doesn't list it";
+  return `the signer registry lists it as ${role === 'human' ? 'a person' : `a ${role}`}`;
+}
+
 /** Sets `entry.inadmissible` when the reader will not take it as truth whatever its status. */
 function admit(
   entry: TruthLedgerEntry,
@@ -516,6 +559,11 @@ function admit(
     if (entry.type === 'TB' && !listed(registry, entry.signedBy!)) {
       return refuse('unverifiable', `TB ${entry.id}: signer '${entry.signedBy}' is not in the signer registry`);
     }
+  }
+  // Agents settle only together: an agent's TB is truth only with a quorum of agents
+  if (entry.type === 'TB') {
+    const why = agentWithoutQuorum(entry, registry);
+    if (why) return refuse('agent-without-quorum', why);
   }
 }
 
