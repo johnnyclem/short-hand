@@ -70,7 +70,16 @@ export const SETTLING_EVIDENCE_KINDS = ['commit', 'file', 'test', 'claimed-comma
 /** An evidence kind's class (spec/truth-format, "Evidence classes"). */
 export type TruthEvidenceClass = 'settling' | 'question';
 
-/** An evidence kind's class. A kind this version doesn't know is question-class: it fails closed. */
+/**
+ * An evidence kind's class. A kind this version doesn't know is
+ * question-class: it fails closed (the quorum rules don't refuse a line
+ * over one, so the reader refuses an agent's TB that cites one).
+ *
+ * Classify what a line says by the kind it wrote. A version 1 entry's typed
+ * evidence reads pre-1.0 `command` as `claimed-command`, as stenographer
+ * 1.0 reads it, but the line's `command` is question-class: on an entry
+ * whose `source.version` is 1, take the kind from `source.text`.
+ */
 export function evidenceClass(kind: string): TruthEvidenceClass {
   return (SETTLING_EVIDENCE_KINDS as readonly string[]).includes(kind) ? 'settling' : 'question';
 }
@@ -78,8 +87,9 @@ export function evidenceClass(kind: string): TruthEvidenceClass {
 /**
  * A piece of evidence attached to a TB. `command` appears only on entries
  * recorded before stenographer 1.0 (version 1 lines read it as
- * `claimed-command`); a newer writer may send kinds this version does not
- * know, which are kept as written.
+ * `claimed-command`, so that kind on a version 1 entry may be a pre-1.0
+ * `command`, which is question-class: see `evidenceClass`); a newer writer
+ * may send kinds this version does not know, which are kept as written.
  */
 export interface TruthEvidence {
   kind: (typeof EVIDENCE_KINDS)[number] | (string & {});
@@ -193,7 +203,9 @@ export interface TruthTbEntry {
   /**
    * The agent sessions that settled it together (spec/truth-format, "Agent
    * quorum"): present when agents signed it. A TB an agent signs is truth
-   * only with a quorum of agents; the codec has checked its rules.
+   * only with a quorum of agents. On an entry read from a stream, the codec
+   * checked its rules; only a version 2 line carries one, so an entry built
+   * by hand with a quorum can't be written (`entryToWikiLine` throws).
    */
   quorum?: TruthQuorumMember[];
   /** Opaque stenographer namespace, preserved for round-tripping. */
@@ -260,10 +272,21 @@ export interface TruthEntrySource {
  *   members are all agents. Agents settle a claim only as two or more agent
  *   sessions agreeing from different angles within 15 minutes; otherwise a
  *   person signs it (spec/truth-format, "Agent quorum").
- * - `conflict`: two lines (or two files) give the same id different content.
+ * - `unknown-value`: a TB an agent signed that cites an evidence kind this
+ *   version doesn't know, on its line or in its quorum. The quorum rules
+ *   don't refuse a line over such a kind, so this reader can't tell that the
+ *   members agree from different angles, and fails closed (spec/truth-format,
+ *   "Unknown values", "Evidence classes"). A person's TB may cite any kind.
+ * - `conflict`: two lines (or two files) give the same id different content:
+ *   its fields compared as JCS, unknown fields included, the chain fields
+ *   (`schemaVersion`, `seq`, `prevHash`, `hash`) and `x-steno` aside.
+ *
+ * The names are stenographer's reconciliation reasons (its import files
+ * such lines as proposals for a person, and is stricter: it files any line
+ * with a value it doesn't know).
  */
 export interface TruthInadmissible {
-  reason: 'unsigned' | 'unverifiable' | 'agent-without-quorum' | 'conflict';
+  reason: 'unsigned' | 'unverifiable' | 'agent-without-quorum' | 'unknown-value' | 'conflict';
   detail: string;
 }
 

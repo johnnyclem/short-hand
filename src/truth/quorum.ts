@@ -33,6 +33,8 @@
  * an identity a signer registry lists with role `agent`, else one whose
  * key starts with `agent:` — is the reader's admission rule (wiki.ts): a TB
  * an agent signs is truth only with a quorum whose members are all agents.
+ * The reader also fails closed where these rules can't: an agent's TB that
+ * cites an evidence kind it doesn't know is never truth (`unknown-value`).
  * The reference is stenographer's src/truth/quorum.ts; the golden fixtures
  * pin this one to it.
  */
@@ -156,12 +158,17 @@ function linksOf(subject: TruthQuorumSubject): ReadonlyArray<{ type: string }> |
 }
 
 /**
- * The rules a line carrying a `quorum` breaks, each as one message naming
- * its rule; empty when it keeps them all. Line-local: a reader needs
- * nothing but the line. That a TB's members drafted the literals it
- * carries (rule 5) is the writer's obligation, not checked here; that it
- * carries some is. `decodeTruthLine` refuses a line for which this returns
- * anything.
+ * For a line that carries a `quorum`, the rules it breaks, each as one
+ * message naming its rule; empty when it keeps them all. A member that
+ * isn't shaped as the schema says is reported first, mostly without a
+ * rule number. Call it only on such a line: on a TB or ADDENDUM without a
+ * `quorum` it reports that a quorum is an array of members, and on any
+ * other line that a quorum doesn't belong there, though neither line
+ * breaks a rule. Line-local: a reader needs nothing but the line. That a
+ * TB's members drafted the literals it carries (rule 5) is the writer's
+ * obligation, not checked here; that it carries some is. `decodeTruthLine`
+ * calls it only on a line with a `quorum`, and refuses that line when this
+ * returns anything.
  */
 export function checkQuorum(subject: TruthQuorumSubject): string[] {
   if (subject.type !== 'TB' && subject.type !== 'ADDENDUM') {

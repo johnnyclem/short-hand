@@ -11,7 +11,9 @@
  * checked against each other as well as against the golden fixtures.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { chainTruthLines } from './format.js';
 import {
@@ -20,13 +22,17 @@ import {
   QUORUM_MIN_MEMBERS,
   QUORUM_WINDOW_MS,
   SETTLING_EVIDENCE_KINDS,
+  TruthLineError,
   checkQuorum,
   classifyEntry,
   createSignerRegistry,
   decodeTruthLine,
+  entryToWikiLine,
   evidenceClass,
   parseWikiLines,
   serializeWikiEntries,
+  wikiLineToEntry,
+  writeWikiFile,
   type TruthQuorumMember,
   type TruthTbEntry,
 } from './index.js';
@@ -60,6 +66,16 @@ describe('evidence classes (spec: Evidence classes)', () => {
       JSON.stringify({ id: 'TB1', type: 'TB', ts: at(0), author: 'kim', claim: 'x is dead', evidence: [{ kind, ref: 'r1' }], signedBy: 'kim' });
     for (const kind of ['chat', 'ticket', 'doc']) expect(decodeTruthLine(v1(kind)).version, kind).toBe(1);
     expect(() => decodeTruthLine(v1('screenshot'))).toThrow(/not an evidence kind a version 1 line could carry/);
+  });
+
+  it("classes a version 1 line's command evidence by the line's own kind: the typed entry reads it as claimed-command", () => {
+    // Stenographer 1.0 reads v1 command evidence as claimed-command (spec: Version 1 lines), and so does the
+    // typed entry; the class of what the line says is pre-1.0 command, which is question-class
+    const v1 = JSON.stringify({ id: 'TB1', type: 'TB', ts: at(0), author: 'kim', claim: 'x is dead', evidence: [{ kind: 'command', ref: 'grep -r x' }], signedBy: 'kim' });
+    const entry = parseWikiLines([v1], { admitV1Tbs: true }).entries[0] as TruthTbEntry;
+    expect(entry.evidence.map((e) => e.kind)).toEqual(['claimed-command']);
+    const asWritten = (JSON.parse(entry.source!.text) as { evidence: Array<{ kind: string }> }).evidence;
+    expect(asWritten.map((e) => [e.kind, evidenceClass(e.kind)])).toEqual([['command', 'question']]);
   });
 });
 
@@ -398,6 +414,33 @@ describe('reader admission: an agent signs a TB only together with other agent s
     expect(read(bot, registry as never).inadmissible).toMatchObject({ reason: 'agent-without-quorum' });
   });
 
+  it('a quorum citing an evidence kind this version does not know fails closed: it cannot show two settling angles', () => {
+    // The codec keeps these lines (an unknown kind breaks no rule), so the reader, which admits truth, refuses them
+    const [a, b] = quorumTb().quorum;
+    const BENCH = { kind: 'benchmark', ref: 'bench/retry-budget' };
+    const SHOT = { kind: 'screenshot', ref: 'shot.png' };
+    const shapes: Array<[string, TruthQuorumMember[], string]> = [
+      ['member 2 cites only an unknown kind', [a, { ...b, evidence: [BENCH] }], 'benchmark'],
+      ['no member cites a known settling kind', [{ ...a, evidence: [SHOT] }, { ...b, evidence: [BENCH] }], 'screenshot'],
+      ['one settling kind, and an unknown item clears rule 3', [a, { ...b, evidence: [{ kind: 'commit', ref: '9a8b7c6' }, { kind: 'vibes', ref: 'v' }] }], 'vibes'],
+      ['a known question kind plus an invented one', [a, { ...b, evidence: [{ kind: 'message', ref: 'msg_1' }, BENCH] }], 'benchmark'],
+    ];
+    for (const [name, quorum, kind] of shapes) {
+      const body = quorumTb({ quorum, evidence: quorum.flatMap((m) => m.evidence) });
+      expect(checkQuorum(body), name).toEqual([]);
+      for (const signers of [null, REGISTRY]) {
+        const entry = read(body, signers);
+        expect(entry.inadmissible, name).toMatchObject({ reason: 'unknown-value' });
+        expect(entry.inadmissible!.detail, name).toContain(`evidence kind '${kind}'`);
+        expect(classifyEntry(entry), name).toBe('history');
+      }
+      expect(wikiLineToEntry(chainTruthLines([body])[0]).inadmissible, name).toMatchObject({ reason: 'unknown-value' });
+    }
+    // The classes bind agents only: a person may sign on evidence of any class, a kind this version doesn't know included
+    const { quorum: _q, ...person } = quorumTb({ author: 'kim', signedBy: 'kim', evidence: [SHOT] });
+    expect(classifyEntry(read(person, REGISTRY))).toBe('ground-truth');
+  });
+
   it('a TB a person signs needs no quorum, and an agent may still draft what a person signs', () => {
     expect(classifyEntry(read({ ...alone(), author: 'kim', signedBy: 'kim' }))).toBe('ground-truth');
     expect(classifyEntry(read({ ...alone(), author: AGENT, signedBy: 'kim' }, REGISTRY))).toBe('ground-truth');
@@ -415,6 +458,35 @@ describe('reader admission: an agent signs a TB only together with other agent s
     expect(entry.quorum).toEqual(quorumTb().quorum);
     expect(entry.extra).not.toHaveProperty('quorum');
     expect(serializeWikiEntries([entry])).toEqual(lines);
+  });
+
+  it('will not write an entry built by hand that carries a quorum: it would be a version 1 line, which never carries one', () => {
+    const read = parseWikiLines(chainTruthLines([quorumTb()])).entries[0] as TruthTbEntry;
+    const { source: _s, inadmissible: _i, extra: _e, ...handBuilt } = read;
+    expect(() => entryToWikiLine(handBuilt)).toThrow(TruthLineError);
+    expect(() => entryToWikiLine(handBuilt)).toThrow(/^quorum: .*TB TBQ1.*version 1 line/);
+    expect(() => serializeWikiEntries([handBuilt])).toThrow(TruthLineError);
+    // A copy or fixture file is not written at all, rather than written with a line its reader drops
+    const dir = mkdtempSync(join(tmpdir(), 'quorum-write-'));
+    try {
+      const path = join(dir, 'copy.jsonl');
+      expect(() => writeWikiFile(path, [handBuilt])).toThrow(TruthLineError);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // Nor as a field this package does not interpret, on a TB or a UV
+    const { quorum, ...noQuorum } = handBuilt;
+    expect(() => entryToWikiLine({ ...noQuorum, extra: { quorum } })).toThrow(TruthLineError);
+    const uvEntry = { id: 'UV1', type: 'UV' as const, ts: at(0), author: 'sam', assertion: 'x', basis: 'y', verifyBy: { kind: 'ask', value: 'ops' }, contests: null, status: 'open' };
+    expect(() => entryToWikiLine({ ...uvEntry, extra: { quorum } })).toThrow(TruthLineError);
+    // Without one, an entry built by hand is written as a version 1 line its reader reads back
+    const written = parseWikiLines(serializeWikiEntries([noQuorum, uvEntry]));
+    expect(written.errors).toEqual([]);
+    expect(written.entries.map((e) => [e.id, e.source?.version])).toEqual([
+      ['TBQ1', 1],
+      ['UV1', 1],
+    ]);
   });
 
   it('the fixtures: an agent quorum TB folds as ground truth, and an agent TB without one is filed', () => {

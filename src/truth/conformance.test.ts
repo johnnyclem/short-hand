@@ -195,7 +195,8 @@ describe('valid/unknown.jsonl: what a newer writer may send', () => {
 
   it("reads stenographer's import outcomes as a reader: unknown statuses never become truth", () => {
     // 'inserted' and 'unknown-value' lines are read and current (a reader
-    // folds statuses; evidence and verifyBy kinds are not its to judge);
+    // folds statuses; the evidence and verifyBy kinds of a person's entries
+    // are not its to judge, unlike those an agent's TB cites, quorum.test.ts);
     // 'unknown-status' lines are history; the 'held' TRANSITION is kept
     // and moves its target to a status no one knows, which fails closed.
     const result = parseWikiLines(read(file));
