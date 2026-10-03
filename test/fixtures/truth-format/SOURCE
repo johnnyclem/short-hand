@@ -1,11 +1,11 @@
 # Copied by scripts/sync-truth-fixtures.mjs. Do not edit these files by hand: re-run the script.
 repository: https://github.com/johnnyclem/stenographer
 path: spec/truth-format
-commit: 6e3edbcb67b8397a06e9acc63b2325966fbc296d
-spec-last-changed: 6e3edbcb67b8397a06e9acc63b2325966fbc296d
+commit: bffa86b2e06a6202bbd31e88f19ed7e536613046
+spec-last-changed: bffa86b2e06a6202bbd31e88f19ed7e536613046
 uncommitted-changes: no
 files:
-  d80b1c532d9b3714dfee6f1b1d7f35f08639cef1d09e6a739bb0bc48d135e527  README.md
+  9e4bbb586728987ad4838b9a4086fc818468c27c4718d894afb8999b65285bac  README.md
   1b0aa09734cf40666d1c903589f4839261fa8b66394d0c7cf87bfe27d6c4c2f4  invalid/chain-fork.jsonl
   365570d5fbd0c7d11cd307b31f0ef5ba897cc08149cfbc72a70075e2806dab46  invalid/chain-gap.jsonl
   4a84ad7bc1a8c3aca734f7f35406765224450b135571e62503930156f9e3b31a  invalid/chain.expected.json
@@ -20,8 +20,8 @@ files:
   7b2283cc2c4f988e38af9293c4a589eb67badc513b4d3422ab7348a2933d8d83  valid/ledger.jsonl
   3c99d97a7402e9cb8fff68b0b08ce505af6fd194ff451d3217eb469d53b95398  valid/proposals.expected.json
   34c11e5c80fa04b947850de0d73e53a0a859d780d320eb9a59a4823bcc42f541  valid/proposals.jsonl
-  b9702f9da60eb3a960c30f8bb7761de860314628b7e0d37db66e3fba5ac88477  valid/routing.expected.json
-  0d026efdf6e6e727a04eaf5efae19e6a15574a2e3015a86cb2d4de1ad765e4df  valid/routing.jsonl
+  8170f378954ea1385a092606917a5f538c2b0b596bb7523e37aca2df759df939  valid/routing.expected.json
+  08d131c56bedec93ef1f204ead34acf546b88401fd3c5a2b5b148912a0f4ed2f  valid/routing.jsonl
   f0ae027285db844c17c63e8c87630f9fe82c1683af76b8d891d8d7b2d89debd7  valid/unknown.expected.json
   98b7d0e926ffe41b56b5dbc3e04a2b639487c9ecf0f6d09448ec8147a540535f  valid/unknown.jsonl
   16b77007483b93a07047e3fff9ef017eee8f448177d396763e3f1fcdea484dbd  wiki-line.v2.schema.json
