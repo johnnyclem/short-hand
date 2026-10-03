@@ -20,7 +20,7 @@ Why B first:
 
 ### Read direction: `CompactionEngine.syncTruthLedger(jsonl)`
 
-`parseWikiLines` (`src/truth/wiki.ts`) reads stenographer's `export_wiki_entries` stream: one writer's JSONL where every line carries `seq`, `prevHash` and `hash` (SHA-256 of its RFC 8785 JCS form, `src/truth/jcs.ts`). The codec (`src/truth/format.ts`) checks each line's structure, hash, identities and links, and the chain across lines; a stream that fails any check is refused whole (`refused: true`), because a reader that skipped a refused TRANSITION would revive what it struck. Entry lines are written once; each status change is an appended `TRANSITION` line, and an entry's status is the highest-seq TRANSITION's, else its line's own. (Version 1 files from stenographer 0.x — no chain, status on the line, last line wins — are still read; their TBs carry no hash and are not truth unless the host passes `admitV1Tbs`.) `selectCurrentTruth` buckets entries per the §7 consumption rules, and `renderTruthSection` (`src/truth/compaction-bridge.ts`) renders the selection with the suite's frozen markers:
+`parseWikiLines` (`src/truth/wiki.ts`) reads stenographer's `export_wiki_entries` stream: one writer's JSONL where every line carries `seq`, `prevHash` and `hash` (SHA-256 of its RFC 8785 JCS form, `src/truth/jcs.ts`). The codec (`src/truth/format.ts`) checks each line's structure, hash, identities, links and agent quorum (`src/truth/quorum.ts`), and the chain across lines; a stream that fails any check is refused whole (`refused: true`), because a reader that skipped a refused TRANSITION would revive what it struck. Entry lines are written once; each status change is an appended `TRANSITION` line, and an entry's status is the highest-seq TRANSITION's, else its line's own. (Version 1 files from stenographer 0.x — no chain, status on the line, last line wins — are still read; their TBs carry no hash and are not truth unless the host passes `admitV1Tbs`.) `selectCurrentTruth` buckets entries per the §7 consumption rules, and `renderTruthSection` (`src/truth/compaction-bridge.ts`) renders the selection with the suite's frozen markers:
 
 | Ledger state | Selection bucket | Rendered as |
 |---|---|---|
@@ -29,7 +29,7 @@ Why B first:
 | Open `UV` | `unverified` | `[UV — UNVERIFIED] …` — flag, don't block; never reads as proven. A UV contesting a TB that is not current truth renders standalone with `contests <id>`, so it is never dropped |
 | Overridden or struck `TB`, refuted/verified/struck `UV` | `history` | Not rendered; cached projections are evicted on sync |
 | Missing or unknown status | `history` | Kept verbatim but never counts as truth |
-| Unsigned `TB`, version 1 `TB`, an author or signer a given signer registry doesn't list, an id two lines or files disagree about | `history` (`entry.inadmissible`) | Not truth whatever its status |
+| Unsigned `TB`, version 1 `TB`, an author or signer a given signer registry doesn't list, a `TB` an agent signed without a quorum of agents, or citing an evidence kind or carrying a link type (in `x-steno.links`) this version doesn't know, an id two lines or files disagree about (unknown fields included) | `history` (`entry.inadmissible`) | Not truth whatever its status |
 
 Several files (one per teammate) are read with `parseWikiFiles`: each folds on its own, then every entry takes the most advanced status on the lattice (TB `active < contested < overridden < struck`, UV `open < verified < refuted < struck`). A reader that syncs incrementally passes its last read as `base` (`parseWikiLines(moreLines, { base: read })`, `engine.syncTruthLedger(moreLines, { base: sync.read })`): the result is the whole stream so far, so an increment's TRANSITIONs apply to the entries read before, and the new lines must continue the base's head, so lines removed from the end of a stream it already read are noticed. (`{ previous: head }` alone checks that a chunk continues the stream; its entries are the chunk's only, and the engine refuses a part-way stream without its base.) The fold honours only what a stenographer stream can say: final statuses (overridden, struck, verified, refuted) never move back down, a TRANSITION must name a cause earlier in the stream, and with a signer registry a TRANSITION by an unlisted author is held, not applied.
 
@@ -52,10 +52,10 @@ L4 invariants (drafted as **UVs** — an invariant is usually tribal knowledge t
 
 - The sync cadence becomes a real problem (stale truth between syncs causing bad compactions).
 - Signed truth measurably beats derived invariants in the context-shift benchmark, making the signing workflow worth embedding in the compaction loop.
-- Stenographer resolves its open signer question (§13 #2) in a way that lets a compactor's promotions be signed without a human in every loop.
+- Stenographer's signer rules (§13 #2) change so that a compactor's promotions can be signed without a human in every loop. In 1.0 they can't: a person signs, or an agent quorum mints from agents' own drafts.
 
 ## Open items inherited from stenographer's §13 (affect this seam)
 
 1. **UV TTL** — open UVs never expire; the `unverified` bucket can grow without bound. If frames get noisy, cap or age-weight flags on this side.
-2. **Signer rules** — today every short-hand candidate needs a human (or independent `command` evidence) to become truth. Fine at current volume; revisit if the proposal queue backs up.
+2. **Signer rules** — decided for 1.0: a person signs alone, and agents settle a claim only together, as an agent quorum (two or more agent sessions agreeing from different angles within 15 minutes, spec "Agent quorum"). Nothing signs for itself: `command` evidence is unchecked output, question-class. A compactor is neither: every short-hand candidate is a PROPOSAL a person notarizes (a quorum mints only from agents' own drafts). Revisit if the proposal queue backs up.
 3. **Contested-TB posture** — currently authoritative-with-asterisk, and short-hand renders it that way. If stenographer downgrades contested TBs to UV-grade trust, `renderTruthSection` and `selectCurrentTruth` are the two places to change.
